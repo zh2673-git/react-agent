@@ -2,6 +2,30 @@
 
 use std::path::PathBuf;
 
+/// bash 沙箱策略解析结果（BASH_SANDBOX，05 §2.1 宿主层 fail-closed）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BashSandbox {
+    /// 走 sandbox-run 助手（受限令牌，fail-closed）
+    Sandboxed { helper: PathBuf },
+    /// 显式 BASH_SANDBOX=off：无沙箱直跑（诚实声明）
+    ExplicitOff,
+    /// fail-closed：bash 移出 TOOLS_ENABLED，拒绝执行
+    Denied(String),
+}
+
+/// 解析 BASH_SANDBOX 策略。`helper` 为宿主进程旁的 sandbox-run 候选路径。
+/// fail-closed 铁律：默认要求沙箱可用；助手缺失/取值非法一律 Denied，绝不静默降级为无沙箱直跑。
+pub fn resolve_bash_sandbox(mode: &str, helper: Option<PathBuf>) -> BashSandbox {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "off" => BashSandbox::ExplicitOff,
+        "on" | "" => match helper {
+            Some(h) => BashSandbox::Sandboxed { helper: h },
+            None => BashSandbox::Denied("sandbox-run 助手未找到（应与宿主二进制同目录）".into()),
+        },
+        other => BashSandbox::Denied(format!("BASH_SANDBOX={other} 非法（合法值: on, off）")),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     /// mock | openai | anthropic | ollama
@@ -80,5 +104,65 @@ impl HostConfig {
             env.push(("MOCK_SCRIPT".into(), k.to_string_lossy().into()));
         }
         env
+    }
+
+    /// 从父进程透传给 guest 的可选环境变量（存在才传；guest 内部各自读缺省）。
+    pub fn passthrough_env(&self) -> Vec<(String, String)> {
+        const KEYS: &[&str] = &[
+            // tools：工作区边界 / scope / 搜索链
+            "WORKSPACE_ROOT",
+            "TOOLS_ENABLED",
+            "SEARCH_REGION",
+            "SEARCH_BACKEND",
+            "BOCHA_API_KEY",
+            "BAIDU_API_KEY",
+            "TAVILY_API_KEY",
+            // assets：资产目录
+            "SKILLS_DIR",
+            "PROMPTS_DIR",
+            // agent-loop（InProcess 自读，但 WSL/远程场景下保持子进程一致）
+            "AGENT_SYSTEM_PROMPT",
+            "PROMPT",
+            "HISTORY_LIMIT",
+        ];
+        KEYS
+            .iter()
+            .filter_map(|k| std::env::var_os(k).map(|v| (k.to_string(), v.to_string_lossy().into_owned())))
+            .collect()
+    }
+}
+
+/// WORKSPACE_ROOT：未设置时取宿主进程 cwd（tools 文件工具的越界拦截根）。
+pub fn workspace_root() -> String {
+    std::env::var("WORKSPACE_ROOT").unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().to_string_lossy().into_owned())
+}
+
+/// 工具全集名（与 plugins/tools/tools_plugin.py 的 ALL_TOOLS 保持同步）。
+pub const ALL_TOOL_NAMES: [&str; 7] = ["read_file", "write_file", "edit_file", "list_dir", "bash", "web_search", "web_read"];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bash_sandbox_default_on_requires_helper() {
+        // 缺省=on：有助手 → 沙箱；无助手 → Denied（fail-closed，不静默直跑）
+        assert!(matches!(
+            resolve_bash_sandbox("", Some(PathBuf::from("x/sandbox-run.exe"))),
+            BashSandbox::Sandboxed { .. }
+        ));
+        assert!(matches!(resolve_bash_sandbox("on", None), BashSandbox::Denied(_)));
+        assert!(matches!(resolve_bash_sandbox("", None), BashSandbox::Denied(_)));
+    }
+
+    #[test]
+    fn bash_sandbox_explicit_off_is_exemption() {
+        assert_eq!(resolve_bash_sandbox("off", None), BashSandbox::ExplicitOff);
+        assert_eq!(resolve_bash_sandbox(" OFF ", None), BashSandbox::ExplicitOff);
+    }
+
+    #[test]
+    fn bash_sandbox_illegal_value_denied() {
+        assert!(matches!(resolve_bash_sandbox("strict", None), BashSandbox::Denied(m) if m.contains("strict")));
     }
 }

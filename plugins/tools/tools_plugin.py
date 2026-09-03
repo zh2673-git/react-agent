@@ -1,95 +1,55 @@
-"""tools guest 插件（Python，Process 域 gRPC）。纯 stdlib。
+"""tools guest 插件（Python，Process 域 gRPC）——瘦分派层 + scope 装配。
 
-线契约：
+线契约（03 §2.3）：
   {"op":"list"} → {"ok":true,"tools":[{"name","description","parameters"}]}
-  {"op":"call","name":str,"args":object} → {"ok":true,"result":any} | {"ok":false,"error":{"message"}}
+  {"op":"call","name":str,"args":object} → {"ok":true,"result":any} | {"ok":false,"error":{"code","message","field"?}}
 
-内置工具：
-  calculator   — AST 白名单求值（禁 eval）
-  current_time — ISO-8601（可选时区）
-  http_get     — urllib，scheme 白名单 http/https，10s 超时
+工具实现位于 tools/ 包（files / bash / web，按运行时关注点分文件）；
+本文件只做：init 装配 scope → list 过滤 → call 校验分发 → ToolError 转字段级错误。
+
+scope：TOOLS_ENABLED=read_file,bash（白名单；未列出的工具 Schema 与实现双不可见）。
+保留名 load_skill 不在本注册表（归 agent-loop 路由，见 03 §3）。
 """
 
-import ast
-import operator
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+import os
 
 from agent_kernel.guest import serve
 
+from tools import ToolError
+from tools import bash as bash_mod
+from tools import files as files_mod
+from tools import web as web_mod
 
-def _err(message: str) -> dict:
-    return {"ok": False, "error": {"message": message}}
-
-
-# ---- calculator：AST 白名单求值（禁 eval/exec） -----------------------------
-
-_BIN_OPS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
-}
-_UNARY_OPS = {ast.USub: operator.neg, ast.UAdd: operator.pos}
+ALL_TOOLS: dict = {**files_mod.TOOLS, **bash_mod.TOOLS, **web_mod.TOOLS}
+_ENABLED: set[str] = set()
 
 
-def _calc(node) -> float:
-    if isinstance(node, ast.Expression):
-        return _calc(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
-        return _BIN_OPS[type(node.op)](_calc(node.left), _calc(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
-        return _UNARY_OPS[type(node.op)](_calc(node.operand))
-    raise ValueError(f"unsupported expression element: {type(node).__name__}")
+def _parse_enabled() -> set[str]:
+    raw = (os.environ.get("TOOLS_ENABLED") or "").strip()
+    if not raw:
+        return set(ALL_TOOLS)
+    names = {n.strip() for n in raw.split(",") if n.strip()}
+    unknown = names - set(ALL_TOOLS)
+    if unknown:
+        raise SystemExit(f"TOOLS_ENABLED 含未知工具: {sorted(unknown)}（合法值: {sorted(ALL_TOOLS)}）")
+    return names
 
 
-# ---- 工具实现 ---------------------------------------------------------------
-
-TOOLS = {
-    "calculator": {
-        "description": "Evaluate an arithmetic expression. Supports + - * / // % ** and parentheses.",
-        "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}, "required": ["expr"]},
-        "run": lambda args: _calc(ast.parse(args["expr"], mode="eval")),
-    },
-    "current_time": {
-        "description": "Current time in ISO-8601. Optional tz (IANA name, default UTC).",
-        "parameters": {"type": "object", "properties": {"tz": {"type": "string"}}, "required": []},
-        "run": lambda args: (
-            datetime.now(ZoneInfo(args["tz"])).isoformat()
-            if args.get("tz")
-            else datetime.now(timezone.utc).isoformat()
-        ),
-    },
-    "http_get": {
-        "description": "HTTP GET a URL (http/https only, 10s timeout, first 64KB).",
-        "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
-        "run": lambda args: _http_get(args["url"]),
-    },
-}
-
-
-def _http_get(url: str) -> dict:
-    scheme = urllib.parse.urlsplit(url).scheme
-    if scheme not in ("http", "https"):
-        raise ValueError(f"scheme '{scheme}' not allowed (http/https only)")
-    with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310 - scheme 已白名单
-        body = resp.read(64 * 1024)
-        return {"status": resp.status, "body": body.decode("utf-8", errors="replace")}
+def _err(message: str, code: str = "TOOL_ERROR", field: str | None = None) -> dict:
+    error: dict = {"code": code, "message": message}
+    if field:
+        error["field"] = field
+    return {"ok": False, "error": error}
 
 
 class ToolsPlugin:
     def manifest(self) -> dict:
-        return {"id": "tools", "version": "0.1.0", "api_version": "0.1"}
+        return {"id": "tools", "version": "0.2.0", "api_version": "0.1"}
 
     def init(self, config) -> None:
-        pass
+        global _ENABLED
+        _ENABLED = _parse_enabled()
+        os.environ.setdefault("WORKSPACE_ROOT", os.getcwd())
 
     def on_event(self, envelope: dict) -> dict:
         payload = envelope.get("payload") or {}
@@ -97,20 +57,34 @@ class ToolsPlugin:
         if op == "list":
             tools = [
                 {"name": name, "description": spec["description"], "parameters": spec["parameters"]}
-                for name, spec in TOOLS.items()
+                for name, spec in ALL_TOOLS.items()
+                if name in _ENABLED
             ]
             return {"ok": True, "tools": tools}
         if op == "call":
-            name = payload.get("name")
-            spec = TOOLS.get(name)
-            if spec is None:
-                return _err(f"unknown tool: {name}")
-            args = payload.get("args") or {}
-            try:
-                return {"ok": True, "result": spec["run"](args)}
-            except Exception as exc:  # noqa: BLE001 - 工具失败回喂 LLM，不中断循环
-                return _err(f"{type(exc).__name__}: {exc}")
-        return _err(f"unknown op: {op}")
+            return self._call(payload)
+        return _err(f"unknown op: {op}", code="K400")
+
+    def _call(self, payload: dict) -> dict:
+        name = payload.get("name")
+        if name not in ALL_TOOLS:
+            avail = sorted(_ENABLED)
+            return _err(f"unknown tool: {name}（可用: {', '.join(avail)}）", code="UNKNOWN_TOOL")
+        if name not in _ENABLED:
+            return _err(
+                f"tool '{name}' 未授权（TOOLS_ENABLED={','.join(sorted(_ENABLED))}）。"
+                "如需启用请在宿主环境调整 TOOLS_ENABLED。",
+                code="TOOL_DISABLED",
+            )
+        args = payload.get("args") or {}
+        try:
+            if not isinstance(args, dict):
+                return _err(f"args 必须是对象，收到: {type(args).__name__}", code="BAD_ARGS", field="args")
+            return {"ok": True, "result": ALL_TOOLS[name]["run"](args)}
+        except ToolError as exc:
+            return _err(str(exc), code=exc.code, field=exc.field)
+        except Exception as exc:  # noqa: BLE001 - 工具失败回喂 LLM，不中断循环
+            return _err(f"{type(exc).__name__}: {exc}")
 
     def destroy(self) -> None:
         pass

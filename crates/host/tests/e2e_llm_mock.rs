@@ -19,7 +19,7 @@ async fn llm_mock_echo_and_scripted_toolcall() {
 
     let script = json!([
         {"ok": true, "content": "mock says hi", "tool_calls": [], "model": "mock", "finish_reason": "stop"},
-        {"ok": true, "content": null, "tool_calls": [{"id": "c9", "name": "calculator", "arguments": {"expr": "1+1"}}], "model": "mock", "finish_reason": "tool_calls"},
+        {"ok": true, "content": null, "tool_calls": [{"id": "c9", "name": "bash", "arguments": {"command": "echo 2"}}], "model": "mock", "finish_reason": "tool_calls"},
     ]);
 
     let kernel = fresh_kernel();
@@ -57,8 +57,8 @@ async fn llm_mock_echo_and_scripted_toolcall() {
     assert_eq!(r["finish_reason"], json!("tool_calls"));
     let calls = r["tool_calls"].as_array().unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0]["name"], json!("calculator"));
-    assert_eq!(calls[0]["arguments"]["expr"], json!("1+1"));
+    assert_eq!(calls[0]["name"], json!("bash"));
+    assert_eq!(calls[0]["arguments"]["command"], json!("echo 2"));
 
     kernel.stop();
     kernel.destroy().await;

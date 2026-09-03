@@ -43,6 +43,14 @@ pub struct MemoryMsg {
 
 // ---- agent-loop ------------------------------------------------------------
 
+/// 逐轮工具调用观测（steps，只回传不持久化；事件日志 Phase 3 的对位预留）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepRecord {
+    pub round: u32,
+    pub tool: String,
+    pub ms: u64,
+}
+
 /// `agent-loop` chat 请求。
 #[derive(Debug, Deserialize)]
 pub struct ChatReq {

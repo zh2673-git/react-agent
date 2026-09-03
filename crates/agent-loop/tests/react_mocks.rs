@@ -97,6 +97,34 @@ fn mock_tools(result: Value) -> PluginInstance {
     })
 }
 
+/// assets mock：skills.list/load + prompts.get。
+fn mock_assets(skill_content: &'static str) -> PluginInstance {
+    MockPlugin::simple("assets", &["assets.registry"], move |env| {
+        match env.payload.get("op").and_then(|v| v.as_str()) {
+            Some("skills.list") => json!({"ok": true, "skills": [{"name": "demo", "description": "A demo skill."}]}),
+            Some("skills.load") => json!({"ok": true, "content": skill_content}),
+            Some("prompts.get") => json!({"ok": true, "content": "PROMPT_TEMPLATE"}),
+            _ => json!({"ok": false, "error": {"code": "K400", "message": "bad op"}}),
+        }
+    })
+}
+
+/// 捕获发给 LLM 的 messages，供提示词组装/历史水位断言。
+fn mock_llm_capturing(script: Vec<Value>, captured: Arc<Mutex<Vec<Vec<Value>>>>) -> PluginInstance {
+    let seq = Arc::new(Mutex::new(script));
+    MockPlugin::simple("llm-adapter", &["llm.chat"], move |env| {
+        if let Some(msgs) = env.payload.get("messages").and_then(|m| m.as_array()) {
+            captured.lock().unwrap().push(msgs.clone());
+        }
+        let mut s = seq.lock().unwrap();
+        if s.len() > 1 {
+            s.remove(0)
+        } else {
+            s.first().cloned().unwrap_or_else(|| json!({"ok": false}))
+        }
+    })
+}
+
 // ---- 测试工具 ---------------------------------------------------------------
 
 async fn boot(plugins: Vec<PluginInstance>) -> Arc<Kernel> {
@@ -210,6 +238,49 @@ async fn react_tool_error_is_observed_not_fatal() {
 }
 
 #[tokio::test]
+async fn task_delegates_and_denies_nesting() {
+    // 捕获每次 plan 的 messages：子代理第 2 轮应收到「嵌套拒绝」的观察
+    let captured = Arc::new(Mutex::new(Vec::<Vec<Value>>::new()));
+    let llm_script = vec![
+        // ① 父 r1：委派 task
+        tool_call_resp(json!([{"id": "c1", "name": "task", "arguments": {"task": "研究子任务"}}])),
+        // ② 子 r1：再嵌套 task（应被拒绝）
+        tool_call_resp(json!([{"id": "c2", "name": "task", "arguments": {"task": "再嵌套"}}])),
+        // ③ 子 r2：收敛
+        json!({"ok": true, "content": "SUB-ANSWER", "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+        // ④ 父 r2：收敛
+        json!({"ok": true, "content": "PARENT-FINAL", "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+    ];
+    let kernel = boot(vec![
+        mock_memory(Arc::new(Mutex::new(vec![]))),
+        mock_llm_capturing(llm_script, captured.clone()),
+        mock_tools(json!({"ok": true})),
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "start").await;
+    assert_eq!(r["ok"], json!(true), "{r}");
+    assert_eq!(r["answer"], json!("PARENT-FINAL"), "{r}");
+
+    let calls = captured.lock().unwrap();
+    // 调用顺序：父 r1 → 子 r1 → 子 r2 → 父 r2
+    assert_eq!(calls.len(), 4, "llm 调用次数: {}", calls.len());
+    // 子 r2 的最后一条消息应是嵌套拒绝的观察
+    let sub_r2_last = calls[2].last().unwrap();
+    assert_eq!(sub_r2_last["role"], json!("tool"), "子 r2 观察: {sub_r2_last}");
+    assert!(
+        sub_r2_last["content"].as_str().unwrap().contains("不支持嵌套委派"),
+        "嵌套拒绝应回喂子代理: {sub_r2_last}"
+    );
+    // 父 r2 的观察应含子代理最终答案
+    let parent_r2_last = calls[3].last().unwrap();
+    assert!(
+        parent_r2_last["content"].as_str().unwrap().contains("SUB-ANSWER"),
+        "task 结果应含子代理答案: {parent_r2_last}"
+    );
+}
+
+#[tokio::test]
 async fn agent_loop_without_providers_is_not_dispatchable() {
     // 硬依赖无 provider ⇒ K302 ⇒ register 静默失败 ⇒ dispatch 报 UnknownPlugin
     let kernel = boot(vec![agent_loop(8)]).await;
@@ -226,4 +297,115 @@ async fn agent_loop_without_providers_is_not_dispatchable() {
 async fn chat_req_parses_with_default_session() {
     let req: ChatReq = serde_json::from_value(json!({"op": "chat", "user_text": "x"})).unwrap();
     assert_eq!(req.session_id, "default");
+}
+
+// ---- Phase 1 新能力 ----------------------------------------------------------
+
+#[tokio::test]
+async fn load_skill_routes_to_assets_and_records_steps() {
+    let mem_state = Arc::new(Mutex::new(Vec::<MemoryMsg>::new()));
+    let llm_script = vec![
+        tool_call_resp(json!([{"id": "c1", "name": "load_skill", "arguments": {"name": "demo"}}])),
+        json!({"ok": true, "content": "skill loaded, done", "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+    ];
+    let kernel = boot(vec![
+        mock_memory(mem_state.clone()),
+        mock_llm(llm_script),
+        mock_tools(json!({"ok": true})),
+        mock_assets("FULL SKILL BODY"),
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "use the demo skill").await;
+    assert_eq!(r["ok"], json!(true), "{r}");
+    assert_eq!(r["answer"], json!("skill loaded, done"));
+
+    // steps：round 递增、含保留名调用、ms 为正
+    let steps = r["steps"].as_array().expect("steps present");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["round"], json!(1));
+    assert_eq!(steps[0]["tool"], json!("load_skill"));
+    assert!(steps[0]["ms"].as_u64().unwrap() < 60_000);
+
+    // skill 全文经 tool 消息进入 memory（Execution 阶段的模型可见性来源）
+    let mem = mem_state.lock().unwrap();
+    assert!(mem.iter().any(|m| m.role == "tool" && m.content.as_deref().unwrap_or("").contains("FULL SKILL BODY")));
+}
+
+#[tokio::test]
+async fn load_skill_failure_is_observed_not_fatal() {
+    // 无 assets 注册（软依赖缺失）→ load_skill 合成 ok:false 回喂，循环不中断
+    let llm_script = vec![
+        tool_call_resp(json!([{"id": "c1", "name": "load_skill", "arguments": {"name": "demo"}}])),
+        json!({"ok": true, "content": "assets missing but I recover", "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+    ];
+    let kernel = boot(vec![
+        mock_memory(Arc::new(Mutex::new(vec![]))),
+        mock_llm(llm_script),
+        mock_tools(json!({"ok": true})),
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "use missing skill").await;
+    assert_eq!(r["ok"], json!(true), "assets 缺失不得中断循环: {r}");
+    assert_eq!(r["answer"], json!("assets missing but I recover"));
+}
+
+#[tokio::test]
+async fn skills_catalog_is_injected_into_system_prompt() {
+    let captured = Arc::new(Mutex::new(Vec::<Vec<Value>>::new()));
+    let llm_script = vec![json!({"ok": true, "content": "done", "tool_calls": [], "model": "mock", "finish_reason": "stop"})];
+    let kernel = boot(vec![
+        mock_memory(Arc::new(Mutex::new(vec![]))),
+        mock_llm_capturing(llm_script, captured.clone()),
+        mock_tools(json!({"ok": true})),
+        mock_assets("BODY"),
+        agent_loop(8),
+    ])
+    .await;
+    chat(&kernel, "hi").await;
+    let cap = captured.lock().unwrap();
+    let system = cap[0][0]["content"].as_str().unwrap();
+    assert!(system.contains("## Available skills"), "{system}");
+    assert!(system.contains("- demo: A demo skill."), "{system}");
+    assert!(system.contains("load_skill"), "{system}");
+}
+
+#[tokio::test]
+async fn system_prompt_env_overrides_builtin_and_history_limit_truncates() {
+    // 本测试操作进程级 env，断言对并行用例无影响的键（AGENT_SYSTEM_PROMPT/HISTORY_LIMIT 不被其他用例检查）
+    std::env::set_var("AGENT_SYSTEM_PROMPT", "CUSTOM PROMPT");
+    std::env::set_var("HISTORY_LIMIT", "2");
+
+    // 预置 4 条历史
+    let mem_state = Arc::new(Mutex::new(vec![
+        MemoryMsg { role: "user".into(), content: Some("old1".into()), tool_calls: None, tool_call_id: None },
+        MemoryMsg { role: "assistant".into(), content: Some("old2".into()), tool_calls: None, tool_call_id: None },
+        MemoryMsg { role: "user".into(), content: Some("old3".into()), tool_calls: None, tool_call_id: None },
+        MemoryMsg { role: "assistant".into(), content: Some("old4".into()), tool_calls: None, tool_call_id: None },
+    ]));
+    let captured = Arc::new(Mutex::new(Vec::<Vec<Value>>::new()));
+    let llm_script = vec![json!({"ok": true, "content": "done", "tool_calls": [], "model": "mock", "finish_reason": "stop"})];
+    let kernel = boot(vec![
+        mock_memory(mem_state),
+        mock_llm_capturing(llm_script, captured.clone()),
+        mock_tools(json!({"ok": true})),
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "new question").await;
+    assert_eq!(r["ok"], json!(true));
+
+    let cap = captured.lock().unwrap();
+    let msgs = &cap[0];
+    // system = env 覆盖（无 assets → 无附录，但环境可能残留其它键——只断言前缀）
+    assert!(msgs[0]["content"].as_str().unwrap().starts_with("CUSTOM PROMPT"), "{}", msgs[0]["content"]);
+    // 历史水位：append（本轮 user）先于截断 → 5 条截为最近 2 条 = [old4, new]
+    let non_system = &msgs[1..];
+    assert_eq!(non_system.len(), 2, "{:?}", non_system);
+    assert_eq!(non_system[0]["content"], json!("old4"));
+    assert_eq!(non_system[1]["content"], json!("new question"));
+
+    std::env::remove_var("AGENT_SYSTEM_PROMPT");
+    std::env::remove_var("HISTORY_LIMIT");
 }

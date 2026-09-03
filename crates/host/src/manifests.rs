@@ -2,7 +2,7 @@
 //! agent-loop 硬依赖三个 provider 的 capability；`Kernel::register` 对 K302 静默失败，
 //! 因此 provider 必须先注册且通过探测。（agent-loop 自身的 manifest 在其 crate 内构造。）
 
-use agent_kernel_sdk::{ApiVersion, Capability, DependencySpec, Domain, Manifest, PluginKind, Semantics, Version};
+use agent_kernel_sdk::{ApiVersion, Capability, Domain, Manifest, PluginKind, Semantics, Version};
 
 /// Process 域 guest 的 host 侧 manifest。
 /// 注意：api_version 必须 (0,1)——握手要求 guest major == host major 且 guest minor >= host minor，
