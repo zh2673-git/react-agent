@@ -1,0 +1,16 @@
+[package]
+name = "react-agent-agent-loop"
+description = "ReAct 编排插件（InProcess）：感知→规划→行动→观察 状态机，跨插件调用 memory/llm-adapter/tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-kernel-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+agent-kernel-kernel.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "react-agent-host"
+description = "宿主二进制：装配 agent-kernel，spawn Python/TS guest 插件，注册 agent-loop 并提供单轮/REPL 聊天"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+react-agent-agent-loop = { path = "../agent-loop" }
+agent-kernel-sdk.workspace = true
+agent-kernel-kernel.workspace = true
+agent-kernel-process.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

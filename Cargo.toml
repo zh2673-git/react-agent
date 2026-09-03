@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/agent-loop", "crates/host"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+# 内核（发布版：git 依赖，锁定 v0.1.1 —— 含 Process 域 destroy 同步 kill 修复）
+agent-kernel-sdk = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.1" }
+agent-kernel-kernel = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.1", features = [
+    "process",
+] }
+agent-kernel-process = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.1" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 本地开发：切换到旁边的内核 checkout（取消注释后 cargo build 即用本地源码）
+# [patch."https://github.com/zh2673-git/agent-kernel"]
+# agent-kernel-sdk = { path = "../agent-kernel/crates/sdk" }
+# agent-kernel-kernel = { path = "../agent-kernel/crates/kernel" }
+# agent-kernel-process = { path = "../agent-kernel/crates/process" }
