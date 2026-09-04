@@ -26,7 +26,22 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // config.json（08 §2.2 持久通道）：启动时应用为 env，spawn 下发复用既有机制
+    let applied = config::apply_config_file_to_env();
+    if applied > 0 {
+        tracing::info!("已从 {} 应用 {applied} 项持久配置", config::config_file().display());
+    }
+
     let cfg = HostConfig::from_env();
+
+    // 流式旁路目录：建目录后以 env 下发（agent-loop 为 InProcess，同进程读 env；
+    // llm-adapter 所需路径由 agent-loop 按同一规则拼出后随 payload 下发）
+    let stream_dir = config::stream_dir();
+    if let Err(e) = std::fs::create_dir_all(&stream_dir) {
+        tracing::warn!("流式旁路目录创建失败，退化为非流式: {e}");
+    }
+    std::env::set_var("AGENT_STREAM_DIR", &stream_dir);
+
     // Kernel::new 本就返回 Arc<Kernel>
     let kernel = Kernel::new(GlobalConfig {
         node_id: "react-agent".into(),

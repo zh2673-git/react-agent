@@ -3,11 +3,13 @@ resolver = "2"
 members = ["crates/agent-loop", "crates/host"]
 
 [workspace.package]
-version = "0.1.0"
+# 版本对齐内核：react-agent 的 <version> 表示「基于 agent-kernel 同版本构建」（见下方 dependency 的 tag）。
+# 例如 0.1.x 对应内核 v0.1.1；后续针对已知限制（运行中断 / sid 唯一性）迭代时再 bump 次版本号。
+version = "0.1.1"
 edition = "2021"
 
 [workspace.dependencies]
-# 内核（发布版：git 依赖，锁定 v0.1.1 —— 含 Process 域 destroy 同步 kill 修复）
+# 内核（发布版：git 依赖，锁定 v0.1.1 —— 含 Process 域 destroy 同步 kill 修复；react-agent 0.1.x 对应内核 v0.1.1）
 agent-kernel-sdk = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.1" }
 agent-kernel-kernel = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.1", features = [
     "process",

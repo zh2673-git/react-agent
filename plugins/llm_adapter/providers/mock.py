@@ -27,4 +27,8 @@ def chat(payload: dict) -> dict:
     )
 
 
-PROVIDER = {"name": "mock", "chat": chat, "requires_env": []}
+def models(payload: dict) -> dict:
+    return {"ok": True, "models": ["mock-1"]}
+
+
+PROVIDER = {"name": "mock", "chat": chat, "models": models, "requires_env": []}

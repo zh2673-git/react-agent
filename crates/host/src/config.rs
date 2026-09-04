@@ -1,5 +1,6 @@
 //! 宿主配置：一律读环境变量（内核 Init 不传 config；子进程继承 env）。
 
+use serde_json::Value;
 use std::path::PathBuf;
 
 /// bash 沙箱策略解析结果（BASH_SANDBOX，05 §2.1 宿主层 fail-closed）。
@@ -135,6 +136,111 @@ impl HostConfig {
 /// WORKSPACE_ROOT：未设置时取宿主进程 cwd（tools 文件工具的越界拦截根）。
 pub fn workspace_root() -> String {
     std::env::var("WORKSPACE_ROOT").unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().to_string_lossy().into_owned())
+}
+
+/// 项目根目录（crates/host → crates → workspace root）。
+pub fn workspace_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("host crate under workspace")
+        .to_path_buf()
+}
+
+/// 流式旁路目录：llm-adapter 边生成边写增量，本进程 tail 后经 SSE 推前端。
+/// 缺省 `<项目根>/.stream`；可用 AGENT_STREAM_DIR 覆盖。
+pub fn stream_dir() -> PathBuf {
+    std::env::var_os("AGENT_STREAM_DIR")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| workspace_dir().join(".stream"))
+}
+
+/// 旁路文件路径。session 名来自 URL 参数，必须过安全校验（防路径穿越）；
+/// 非法即 None（退化为无流式）。规则须与 agent-loop 的 stream_file_for 完全一致。
+pub fn stream_file(session: &str) -> Option<PathBuf> {
+    let safe = !session.is_empty()
+        && session.len() <= 64
+        && !session.contains("..")
+        && session.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !safe {
+        return None;
+    }
+    Some(stream_dir().join(format!("{session}.jsonl")))
+}
+
+/// skills 根目录（Web 技能 CRUD 的写入位置；与 assets guest 同源：SKILLS_DIR env 或缺省同目录）。
+pub fn skills_dir() -> PathBuf {
+    std::env::var_os("SKILLS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_dir().join("plugins").join("assets").join("skills"))
+}
+
+// ───────────────────────── config.json（08 §2.2 活配置持久态） ─────────────────────────
+//
+// 形状：{"llm":{"provider","model","base_url","api_key"},"tools":{"enabled":[...]}}
+// 持久通道：启动时 apply → env（spawn 下发复用现有机制，零改动）；热通道：PUT /api/config
+// 转发 configure op 成功后落盘。api_key 明文落 config.json（本机文件），线上回显只给尾 4 位。
+
+/// config.json 路径（CONFIG_FILE env 或 `<项目根>/config.json`）。
+pub fn config_file() -> PathBuf {
+    std::env::var_os("CONFIG_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_dir().join("config.json"))
+}
+
+/// 读 config.json；缺失/损坏 → Null（启动不因坏配置失败，warn 由调用方记）。
+pub fn load_config() -> Value {
+    match std::fs::read_to_string(config_file()) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    }
+}
+
+/// 写 config.json（PUT /api/config 全成后调用）。
+pub fn persist_config(v: &Value) -> anyhow::Result<()> {
+    let path = config_file();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(v)? + "\n")?;
+    Ok(())
+}
+
+/// 启动时把 config.json 应用为 env（spawn 下发走既有机制）。返回应用的键数。
+pub fn apply_config_file_to_env() -> usize {
+    let cfg = load_config();
+    if cfg.is_null() {
+        return 0;
+    }
+    let mut n = 0;
+    let mut set = |k: &str, v: String| {
+        std::env::set_var(k, v);
+        n += 1;
+    };
+    if let Some(llm) = cfg.get("llm") {
+        let provider = llm.get("provider").and_then(Value::as_str);
+        if let Some(v) = provider {
+            set("LLM_PROVIDER", v.into());
+        }
+        if let Some(v) = llm.get("model").and_then(Value::as_str) {
+            set("LLM_MODEL", v.into());
+        }
+        let anthropic = provider == Some("anthropic");
+        if let Some(v) = llm.get("base_url").and_then(Value::as_str) {
+            set(if anthropic { "ANTHROPIC_BASE_URL" } else { "LLM_BASE_URL" }, v.into());
+        }
+        if let Some(v) = llm.get("api_key").and_then(Value::as_str) {
+            set(if anthropic { "ANTHROPIC_API_KEY" } else { "OPENAI_API_KEY" }, v.into());
+        }
+    }
+    if let Some(enabled) = cfg.get("tools").and_then(|t| t.get("enabled")).and_then(Value::as_array) {
+        let names: Vec<&str> = enabled.iter().filter_map(Value::as_str).collect();
+        if !names.is_empty() {
+            set("TOOLS_ENABLED", names.join(","));
+        }
+    }
+    n
 }
 
 /// 工具全集名（与 plugins/tools/tools_plugin.py 的 ALL_TOOLS 保持同步）。

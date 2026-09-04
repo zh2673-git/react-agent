@@ -1,6 +1,6 @@
 # react-agent
 
-基于 [agent-kernel](https://github.com/zh2673-git/agent-kernel)（v0.1.0，git 依赖）构建的下游 agent 项目：**Rust InProcess 编排 + Python/TS 跨语言插件（gRPC Process 域）** 的 ReAct 式 agent。
+基于 [agent-kernel](https://github.com/zh2673-git/agent-kernel)（v0.1.1，git 依赖）构建的下游 agent 项目：**Rust InProcess 编排 + Python/TS 跨语言插件（gRPC Process 域）** 的 ReAct 式 agent。
 
 ```
 宿主(装配内核+前端) ──dispatch──> agent-loop(Rust, InProcess)
@@ -17,14 +17,16 @@
 - ReAct 循环：感知(读记忆)→规划(LLM+工具清单)→行动(执行工具/保留名路由)→观察(写回记忆)→收敛；全程发射事件（trace）+ 逐轮进度回显
 - 三家 LLM 全覆盖：OpenAI 兼容（可换 base_url 适配 DeepSeek 等）、Anthropic、Ollama；另带 **mock** provider 供离线测试
 - 生产级工具 7 件：read_file / write_file / edit_file / list_dir / bash / web_search / web_read（全部免费默认无 key）
-- 双前端：REPL（默认）/ Web 网关（HTTP+SSE，dsh 风格事件流式会话，刷新恢复=日志重放）
+- 双前端：REPL（默认）/ Web 网关（HTTP+SSE，DeepSeek 风格单页会话：左侧会话栏+持久化、工具调用状态点卡片、富 markdown 代码块复制，刷新恢复=日志重放）
+- **Web 配置中心**（08）：设置面板在线配 LLM（provider/model/base_url/api_key，热生效+落盘 config.json）、勾选工具白名单、技能 CRUD（SKILL.md 在线编辑）
+- **自扩展**（08）：L1 技能自扩展——skills 根在 WORKSPACE_ROOT 内时系统提示词授权模型用 write_file 自建技能（文件即注册表，下轮对话自动可见）；L2 工具自扩展——`tools.reload` 动态装载新工具模块（装载≠启用，白名单两步分离）
 - subagent：保留工具 `task` 委派子任务（新 session 复用全链路，深度防嵌套）
 
 ## 目录
 
 ```
 crates/agent-loop        ReAct 编排插件（InProcess，仅依赖 agent-kernel-sdk）
-crates/host              宿主二进制：装配、spawn、探测、双前端、sandbox-run 助手
+crates/host              宿主二进制：装配、spawn、探测、双前端、sandbox-run 助手；web-dist/ 为 web 前端单页（运行时 serve，非内嵌）
 plugins/llm_adapter      LLM 适配器（Python guest，providers/ 按 vendor 分 pack）
 plugins/tools            工具注册与执行（Python guest，纯 stdlib，files/bash/web 分文件）
 plugins/assets           skills/prompts 注册表（Python guest，开放标准 SKILL.md）
@@ -33,6 +35,8 @@ docs/                    方案与设计文档（01 总纲 / 02 架构 / 03 模�
 ```
 
 ## 环境准备（一次）
+
+> Windows 下用 [start.cmd](start.cmd) 一键启动可跳过本节——脚本会自动检测并安装缺失依赖。
 
 ```bash
 pip install grpcio httpx                                  # python guest 需要
@@ -45,13 +49,22 @@ cd ../agent-kernel/bindings/typescript && npm install     # TS guest 从内核�
 
 ## 运行
 
-```bash
-# 离线（默认 mock provider，无需任何 key）
-cargo run -p react-agent-host -- "用 bash 算一下 128*64"
-cargo run -p react-agent-host                          # 无参数进入 REPL
+> ⚠️ 默认 `cargo run -p react-agent-host`（不带参数）进入 **REPL 终端交互**，**不会开网页**。
+> 要开 Web 页面，必须显式启用 web 前端（见下 `REACT_FRONTEND=web`），或直接双击 `start.cmd`。
 
-# Web 前端（dsh 风格事件流式会话，浏览器打开 http://127.0.0.1:8710）
+```bash
+# ── Web 前端（推荐，浏览器开 http://127.0.0.1:8710）──
+# Windows 一键（自动补依赖 + 自动开浏览器）：
+start.cmd
+# PowerShell（bash 的 VAR=val 前缀在 pwsh 不生效，改用 $env:）：
+$env:REACT_FRONTEND="web"; cargo run -p react-agent-host
+# bash / Linux / macOS：
 REACT_FRONTEND=web cargo run -p react-agent-host
+# 前端为 web-dist/index.html（运行时读取），改样式刷新即生效（Ctrl+Shift+R 防缓存）
+
+# ── REPL 终端（默认，无网页）──
+cargo run -p react-agent-host                          # 进 REPL
+cargo run -p react-agent-host -- "用 bash 算一下 128*64"   # 单轮（离线 mock）后退出
 
 # Ollama（本机，推荐支持工具调用的模型如 qwen2.5 / llama3.1+）
 LLM_PROVIDER=ollama LLM_MODEL=qwen2.5:7b cargo run -p react-agent-host -- "..."
@@ -64,6 +77,18 @@ OPENAI_API_KEY=sk-xxx LLM_MODEL=deepseek-chat cargo run -p react-agent-host -- "
 LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-xxx cargo run -p react-agent-host -- "..."
 ```
 
+## 前端开发（无构建）
+
+Web 前端是单文件 `crates/host/web-dist/index.html`（内联 CSS/JS，无框架、无构建步骤），由后端 `GET /` 运行时读取 serve。
+
+- **默认（推荐）**：`cargo run -p react-agent-host`（或 `start.cmd`）起 8710，浏览器开 `http://127.0.0.1:8710` 即同时拿到前端与 `/api`。改 `web-dist/index.html` 后**刷新浏览器即生效**（无需重编 host；若页面不更新按 `Ctrl+Shift+R` 硬刷规避缓存）。
+- **前后端分离（独立端口，HMR）**：后端 `cargo run -p react-agent-host`（8710 作 API 源），前端用 `vite` 起在 `crates/host/web-dist/`（已内置 `vite.config.js`，`/api` 自动反代回 8710）：
+  ```bash
+  cd crates/host/web-dist && npm install && npm run dev   # 默认 http://localhost:5173
+  ```
+  浏览器开 5173 即前端（热重载），`/api/*` 经代理转发到 8710，无需跨域配置。仅改样式也可直接编辑 `index.html` 后刷新，不必起 vite。
+  > 没有构建/HMR 需求时不必分离：单文件前端改完刷新即生效，「一体启动」已是最简工作流。
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
@@ -71,7 +96,7 @@ LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-xxx cargo run -p react-agent-hos
 | `LLM_PROVIDER` | `mock` | mock / openai / anthropic / ollama（也可按请求覆盖） |
 | `LLM_MODEL` | 按 provider | 模型名 |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | openai 兼容端点 |
-| `OLLAMA_HOST` | `localhost:11434` | ollama 地址 |
+| `OLLAMA_HOST` | `localhost:11434` | ollama 地址（Web 设置面板「ollama 地址」栏可改，默认即此值；ollama 免 key，api_key 无效） |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | 密钥（经子进程 env 传递，不落 manifest） |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic 端点 |
 | `MOCK_SCRIPT` | — | mock provider 脚本（JSON 数组，逐次弹出） |
@@ -92,6 +117,7 @@ LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-xxx cargo run -p react-agent-hos
 | `BASH_SANDBOX` | `on` | on=sandbox-run 受限令牌沙箱（探测失败 fail-closed 移除 bash）；off=显式豁免直跑 |
 | `REACT_FRONTEND` | `repl` | 前端选择：repl / web |
 | `WEB_ADDR` | `127.0.0.1:8710` | web 网关监听地址 |
+| `CONFIG_FILE` | `<workspace>/config.json` | 配置中心持久化文件（启动时应用为 env，Web 保存后落盘） |
 | `RUST_LOG` | `warn,react_agent_host=info` | 日志 |
 
 ## 测试
@@ -101,7 +127,7 @@ cargo test -p react-agent-agent-loop   # 纯 Rust mock 测试（无需 python/no
 cargo test --workspace                 # 全量（含跨语言 e2e，缺解释器自动 skip）
 ```
 
-e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚本)、**全链路 ReAct**、上下文压缩、web 网关、subagent（委派+嵌套拒绝）。
+e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚本)、**全链路 ReAct**、上下文压缩、web 网关（chat+SSE 重放 + **配置中心与技能 CRUD**）、subagent（委派+嵌套拒绝）。
 
 > 注意：若测试失败提前退出，guest 子进程可能残留（占用内存无害）；可用 `Get-Process python,node` 检查清理。测试内已将 guest stderr 指向 null，cargo 不会再被泄漏进程扣住。
 
@@ -119,14 +145,19 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 - Msg = `{"role":"system"|"user"|"assistant"|"tool","content":str|null,"tool_calls"?:[{"id","name","arguments":object}],"tool_call_id"?:str}`
 - ToolSpec = `{"name","description","parameters":json-schema}`
 - resp `{"ok":true,"content":str|null,"tool_calls":[{"id","name","arguments":object}],"model":str,"finish_reason":"stop"|"tool_calls"}`
+- 扩展 `{"op":"configure","provider"?,"model"?,"base_url"?,"api_key"?}` → `{"ok":true,"applied":{...}}`（08 运行时热配置：更新本进程 env；api_key 只回 api_key_set）
+- 扩展 `{"op":"models.list","provider"?}` → `{"ok":true,"models":[str]}`（openai/deepseek 走 `/v1/models`；ollama 走 `/api/tags`；anthropic/mock 走静态清单；失败 `{"ok":false,"error":{...}}`）
 
 **tools**（`tools.exec`）
 - `{"op":"list"}` → `{"ok":true,"tools":[ToolSpec]}`（生产级 7 件：read_file / write_file / edit_file / list_dir / bash / web_search / web_read，受 `TOOLS_ENABLED` 裁剪）
+- `{"op":"list","all":true}` → 额外含未启用工具，各项附 `"enabled":bool`（配置中心视图）
 - `{"op":"call","name":str,"args":object}` → `{"ok":true,"result":any}` | `{"ok":false,"error":{"code","message","field"?}}`（字段级错误：哪个参数错、合法值是什么）
+- 扩展 `{"op":"configure","enabled":[str,...]}` → 运行时整体替换白名单（未知名 → 字段级 400）
+- 扩展 `{"op":"reload"}` → 扫描 tools/ 目录动态装载新模块 → `{"ok":true,"loaded":[...],"added":[...],"skipped":[...]}`（**装载≠启用**：新工具进可用池不进白名单，需 configure 启用；内置不可覆盖，单模块失败跳过 fail-closed）
 
 **assets**（`assets.registry`）
-- `{"op":"skills.list"}` → `{"ok":true,"skills":[{"name","description"}]}`
-- `{"op":"skills.load","name":str}` → `{"ok":true,"content":str}` | `{"ok":false,"error":{...}}`
+- `{"op":"skills.list"}` → `{"ok":true,"skills":[{"name","description"}],"root":str}`（每次调用重扫目录；root 供 agent-loop 自扩展可达性探测）
+- `{"op":"skills.load","name":str}` → `{"ok":true,"content":str}` | `{"ok":false,"error":{...}}`（读取前重扫）
 - `{"op":"prompts.list"}` → `{"ok":true,"prompts":[{"name","description"}]}`
 - `{"op":"prompts.get","name":str}` → `{"ok":true,"content":str}`
 
@@ -142,9 +173,22 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 - Event 建议形状 `{type, ts, ...}`；存储 `<MEMORY_DATA_DIR>/traces/<session>.jsonl`
 
 **web 网关**（host 级，非插件）
-- `GET /` → 单页（dsh 风格事件流式会话）
+- `GET /` → 单页（DeepSeek 风格事件流式会话：左侧会话栏持久化、工具调用状态点卡片、富 markdown 代码块复制 + ⚙ 设置面板：LLM / 工具 / 技能）
 - `GET /api/events?session=&after=` → SSE（从 0 全量重放 + 实时增量）
 - `POST /api/chat` body `{"session_id":str,"message":str}` → 阻塞至收敛，回 agent.chat 响应
+- `GET /api/config` → 配置视图（llm：config.json > env 缺省，key 只回 key_set+尾 4 位；tools 全集+enabled；skills_count）
+- `GET /api/models` → 转发 llm-adapter `models.list`，返回当前 provider 可用模型 id（前端「拉取模型」按钮；配好 base_url/key 后自动填充 model 下拉）
+- `PUT /api/config` body `{"llm"?:{...},"tools"?":{"enabled":[...]}}` → 逐项转发 configure op（任一失败 400 不落盘，重启即回滚）；全成落 config.json
+- `GET /api/skills` → assets skills.list（实时目录）
+- `GET /api/skills/{name}` → `{"ok":true,"name","content"}`（SKILL.md 原文，编辑用）
+- `PUT /api/skills/{name}` body `{"content":SKILL.md全文}` → 写入（frontmatter name 须与目录名一致；名字仅字母数字/_/-）
+- `DELETE /api/skills/{name}` → 删除技能目录
+
+## 配置中心与自扩展（08）
+
+- **配置中心**：Web 设置面板保存 → llm-adapter/tools configure op 热生效（env）→ merge 落 `config.json`；重启时 `apply_config_file_to_env` 还原。env 仍是一切配置之源（spawn 复用既有机制）
+- **L1 技能自扩展**：assets `skills.list` 回传 root，agent-loop 判定 root ⊆ WORKSPACE_ROOT 后在系统提示词注入授权段——模型用 `write_file` 写 `<skills-root>/<name>/SKILL.md` 即完成注册（list 每次重扫，下轮对话可见，无需 reload）。授权≠边界：真正的硬边界仍是文件工具 realpath 越界拦截
+- **L2 工具自扩展**：把符合 ToolSpec 三元组（name/description/parameters/run）的 `TOOLS` dict 放进 `plugins/tools/` 下的新 .py 文件，对话中说「重载工具」→ `tools.reload` 装载进池；再经配置中心勾选启用（装载≠启用，写与启用两步分离）
 
 ## 架构要点（内核约束的落点）
 
@@ -154,3 +198,11 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 - **配置走环境变量**：内核 Init 不传业务配置，子进程继承宿主 env
 - **循环无跨调用可变态**：ReAct 状态在局部变量 + memory 插件，插件本体 `&self`（A1）；每步转发带 deadline（A2）
 - Rust 插件仅依赖 `agent-kernel-sdk`；仅 host 依赖 kernel（process feature）+ process —— 规则防穿透
+
+## 已知限制（摘要）
+
+- **运行中断未支持**：Web 前端无「停止」按钮，运行中的一轮无法中途打断（关闭页面 / 杀进程即整体终止）。
+  改造涉及 agent-loop + host + 前端三处，路线图见 `crates/agent-loop/README.md`「运行中断」。
+- **sid 跨对话不保证唯一**：同 round 的不同对话回合生成相同 sid，极端情况下后一回合的流式动画被去重逻辑误忽略
+  （直接显示最终答案，无打字效果）。细节与修复建议见 `crates/agent-loop/README.md`「流式编排」。
+- SSE 增量续传、刷新恢复、断线不重绘不重复的完整数据流设计见 `crates/host/README.md`「数据流设计要点」。

@@ -1,15 +1,17 @@
 //! 前端装配（Phase 3-2，01 §Phase3）：`trait Frontend` 两实现。
 //!
 //! - `ReplFrontend`：终端交互（REPL / 单轮），斜杠命令见 `repl_command`。
-//! - `WebFrontend`：dsh 风格「事件流式会话」——静态单页 + SSE 实时渲染 + 日志重放恢复。
+//! - `WebFrontend`：DeepSeek 风格「事件流式会话」——静态单页（web-dist/index.html 运行时 serve）+ SSE 实时渲染 + 日志重放恢复。
 //!
 //! host 是组合根：前端是**入口组件**而非 guest 能力——网关需调 `agent.chat` + `session.trace`，
 //! 而 guest 不可互调（内核物理约束）；前端切换必伴随重启，热插拔无收益。
 //! 选择：`REACT_FRONTEND=repl`（默认）/ `web`（`WEB_ADDR` 默认 127.0.0.1:8710）。
+use crate::config;
 use agent_kernel_sdk::{Envelope, PluginId};
 use agent_kernel_kernel::Kernel;
 use serde_json::{json, Value};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -186,13 +188,13 @@ async fn assets(kernel: &Kernel, payload: Value) -> Option<Value> {
 
 // ───────────────────────────── WebFrontend ─────────────────────────────
 
-/// dsh 风格单页（编译期内嵌，无外部静态文件）。
-static WEB_HTML: &str = include_str!("web.html");
+/// web 前端单页：运行时从 `web-dist/index.html` 读取（serve 目录模式），
+/// 改样式后刷新浏览器即生效，无需重编 host 二进制。定位见 `web_index_path`。
 
 /// dsh 风格 web 网关：极简手写 HTTP（tokio TcpListener，不引 web 框架依赖）。
 ///
 /// 路由：
-///   GET  /                      → dsh 风格单页（web.html，include_str! 内嵌）
+///   GET  /                      → 单页（web-dist/index.html，运行时读取，改样式刷新即生效）
 ///   GET  /api/events?session=&after= → SSE：增量轮询 memory trace.read，逐事件推送
 ///   POST /api/chat              → {"session_id","message"} → agent.chat（阻塞到收敛）
 pub struct WebFrontend {
@@ -235,6 +237,63 @@ impl Frontend for WebFrontend {
 }
 
 // ── HTTP 最小实现 ──
+
+/// 定位 web 前端静态文件 `web-dist/index.html`，按优先级尝试：
+/// 1. 编译期注入的源码目录（`CARGO_MANIFEST_DIR`，`cargo run`/`build` 时有效）；
+/// 2. 相对 cwd 的 `crates/host/web-dist/index.html`（在 workspace 根启动）；
+/// 3. 相对二进制同级的 `web-dist/index.html`（打包发布）。
+fn web_index_path() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(manifest) = option_env!("CARGO_MANIFEST_DIR") {
+        candidates.push(PathBuf::from(manifest).join("web-dist").join("index.html"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("crates").join("host").join("web-dist").join("index.html"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("web-dist").join("index.html"));
+        }
+    }
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// `GET /`：从 `web-dist/index.html` 读取并返回；文件缺失给出明确 500（而非 panic）。
+/// 首页强制 `no-store`：前端是运行时 serve 的，任何改动刷新即生效，绝不被浏览器缓存旧 JS。
+async fn serve_index(stream: &mut TcpStream) -> anyhow::Result<()> {
+    match web_index_path() {
+        Some(p) => match tokio::fs::read(&p).await {
+            Ok(bytes) => {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                stream.write_all(head.as_bytes()).await?;
+                stream.write_all(&bytes).await?;
+                stream.flush().await?;
+                Ok(())
+            }
+            Err(e) => respond(
+                stream,
+                500,
+                "application/json; charset=utf-8",
+                json!({"ok": false, "error": {"code": "K500", "message": format!("读取前端文件失败: {e}")}})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .await,
+        },
+        None => respond(
+            stream,
+            500,
+            "application/json; charset=utf-8",
+            json!({"ok": false, "error": {"code": "K500", "message": "找不到 web-dist/index.html（应在 crates/host/web-dist/ 下；cargo run 在 workspace 根或 crate 同级即可）"}})
+                .to_string()
+                .as_bytes(),
+        )
+        .await,
+    }
+}
 
 async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Result<()> {
     // 读请求头（至多 64KB）
@@ -281,10 +340,21 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
     };
 
     match (method.as_str(), route) {
-        ("GET", "/") | ("GET", "/index.html") => {
-            respond(&mut stream, 200, "text/html; charset=utf-8", WEB_HTML.as_bytes()).await
-        }
+        ("GET", "/") | ("GET", "/index.html") => serve_index(&mut stream).await,
         ("GET", "/api/events") => sse_events(stream, kernel, query).await,
+        ("GET", "/api/config") => get_config(&mut stream, &kernel).await,
+        ("GET", "/api/models") => get_models(&mut stream, &kernel, query).await,
+        ("PUT", "/api/config") => put_config(&mut stream, &kernel, &body).await,
+        ("GET", "/api/skills") => get_skills(&mut stream, &kernel).await,
+        ("GET", r) if r.starts_with("/api/skills/") => {
+            get_skill(&mut stream, r.trim_start_matches("/api/skills/")).await
+        }
+        ("PUT", r) if r.starts_with("/api/skills/") => {
+            put_skill(&mut stream, r.trim_start_matches("/api/skills/"), &body).await
+        }
+        ("DELETE", r) if r.starts_with("/api/skills/") => {
+            delete_skill(&mut stream, r.trim_start_matches("/api/skills/")).await
+        }
         ("POST", "/api/chat") => {
             let req: Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
@@ -351,6 +421,325 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
     }
 }
 
+// ── 配置中心与技能 CRUD（08 §2.2）──
+
+/// GET /api/models：转发 llm-adapter `models.list`，返回该 provider 当前可用模型 id 列表
+/// （openai/deepseek 走 `/v1/models`；ollama 走 `/api/tags`；anthropic/mock 走静态清单）。
+async fn get_models(stream: &mut TcpStream, kernel: &Kernel, query: &str) -> anyhow::Result<()> {
+    // 前端可经 ?provider= 覆盖（未保存设置时也能拉对应 provider 的模型清单）
+    let provider = parse_query(query).get("provider").cloned().unwrap_or_default();
+    let mut op = json!({"op": "models.list"});
+    if !provider.is_empty() {
+        op["provider"] = json!(provider);
+    }
+    match dispatch_or_err(kernel, "llm-adapter", op).await {
+        Ok(v) => {
+            let models = v.get("models").and_then(Value::as_array).cloned().unwrap_or_default();
+            json_resp(stream, 200, json!({"ok": true, "models": models})).await
+        }
+        Err(e) => json_resp(stream, 502, e).await,
+    }
+}
+
+async fn json_resp(stream: &mut TcpStream, status: u16, v: Value) -> anyhow::Result<()> {
+    respond(stream, status, "application/json; charset=utf-8", v.to_string().as_bytes()).await
+}
+
+fn bad_request(msg: impl Into<String>, field: Option<&str>) -> Value {
+    let mut error = json!({"code": "K400", "message": msg.into()});
+    if let Some(f) = field {
+        error["field"] = json!(f);
+    }
+    json!({"ok": false, "error": error})
+}
+
+/// guest 调用便捷封装：ok → Ok(v)；业务失败/传输失败 → Err（错误 payload）。
+async fn dispatch_or_err(kernel: &Kernel, target: &str, payload: Value) -> Result<Value, Value> {
+    match kernel.dispatch(Envelope::new(PluginId::new(target), payload)).await {
+        Ok(v) if v.get("ok") == Some(&json!(true)) => Ok(v),
+        Ok(v) => Err(v),
+        Err(e) => Err(json!({"ok": false, "error": {"code": "K500", "message": e.to_string()}})),
+    }
+}
+
+/// GET /api/config：llm 视图（config.json > env 缺省；key 只回 key_set + 尾 4 位，绝不回明文）
+/// + tools 全集视图（list all=true，含未启用项，各项附 enabled）+ skills 计数。
+async fn get_config(stream: &mut TcpStream, kernel: &Kernel) -> anyhow::Result<()> {
+    let cfg = config::load_config();
+    let llm = cfg.get("llm").cloned().unwrap_or_else(|| json!({}));
+    let provider = llm
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "mock".into()));
+    let anthropic = provider == "anthropic";
+    let model_default = match provider.as_str() {
+        "openai" => "gpt-4o-mini",
+        "anthropic" => "claude-3-5-sonnet-latest",
+        "ollama" => "qwen2.5:7b",
+        _ => "mock-1",
+    };
+    let model = llm
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| std::env::var("LLM_MODEL").unwrap_or_else(|_| model_default.into()));
+    let (base_env, base_default, key_env) = if anthropic {
+        ("ANTHROPIC_BASE_URL", "https://api.anthropic.com", "ANTHROPIC_API_KEY")
+    } else {
+        ("LLM_BASE_URL", "https://api.openai.com/v1", "OPENAI_API_KEY")
+    };
+    let base_url = llm
+        .get("base_url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| std::env::var(base_env).unwrap_or_else(|_| base_default.into()));
+    let ollama_host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "localhost:11434".into());
+    let key = llm
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| std::env::var(key_env).ok())
+        .unwrap_or_default();
+    let key_view = if key.is_empty() {
+        json!({"key_set": false})
+    } else {
+        let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        json!({"key_set": true, "key_tail": tail})
+    };
+
+    let tools = match dispatch_or_err(kernel, "tools", json!({"op": "list", "all": true})).await {
+        Ok(v) => v
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.get("name").and_then(Value::as_str).unwrap_or("?"),
+                            "enabled": t.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        Err(_) => vec![],
+    };
+    let skills_count = match dispatch_or_err(kernel, "assets", json!({"op": "skills.list"})).await {
+        Ok(v) => v.get("skills").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
+        Err(_) => 0,
+    };
+    json_resp(
+        stream,
+        200,
+        json!({
+            "ok": true,
+            "config": {
+                "llm": {"provider": provider, "model": model, "base_url": base_url, "ollama_host": ollama_host, "key": key_view},
+                "tools": tools,
+                "skills_count": skills_count,
+            },
+        }),
+    )
+    .await
+}
+
+/// PUT /api/config：llm → llm-adapter configure（env 热应用）；tools → tools configure（白名单替换）。
+/// 全成后 merge 落 config.json（重启由持久通道还原）；任一失败 → 字段级 400 且不落盘（重启即回滚）。
+async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[u8]) -> anyhow::Result<()> {
+    let Ok(req) = serde_json::from_slice::<Value>(body) else {
+        return json_resp(stream, 400, bad_request("body 非法 JSON", None)).await;
+    };
+    let llm = req.get("llm").filter(|v| v.is_object());
+    let tools = req.get("tools").filter(|v| v.is_object());
+    if llm.is_none() && tools.is_none() {
+        return json_resp(stream, 400, bad_request("body 需含 llm 或 tools 对象", None)).await;
+    }
+    if let Some(llm) = llm {
+        let mut payload = json!({"op": "configure"});
+        for k in ["provider", "model", "base_url", "api_key"] {
+            if let Some(v) = llm.get(k).filter(|v| !v.is_null()) {
+                payload[k] = v.clone();
+            }
+        }
+        if let Err(e) = dispatch_or_err(kernel, "llm-adapter", payload).await {
+            return json_resp(stream, 400, e).await;
+        }
+    }
+    if let Some(tools) = tools {
+        let Some(enabled) = tools.get("enabled").cloned() else {
+            return json_resp(stream, 400, bad_request("tools 缺 enabled 数组", Some("enabled"))).await;
+        };
+        if let Err(e) = dispatch_or_err(kernel, "tools", json!({"op": "configure", "enabled": enabled})).await {
+            return json_resp(stream, 400, e).await;
+        }
+    }
+    // 全成 → merge 落盘（llm 逐字段合并保留未改字段如 api_key；tools.enabled 整体替换）
+    let mut cfg = {
+        let mut c = config::load_config();
+        if c.is_null() {
+            c = json!({});
+        }
+        c
+    };
+    if let Some(llm) = llm {
+        let mut cur = cfg.get("llm").cloned().unwrap_or_else(|| json!({}));
+        if let Some(obj) = llm.as_object() {
+            for (k, v) in obj {
+                if !v.is_null() {
+                    cur[k] = v.clone();
+                }
+            }
+        }
+        cfg["llm"] = cur;
+    }
+    if let Some(enabled) = tools.and_then(|t| t.get("enabled")).cloned() {
+        let mut cur = cfg.get("tools").cloned().unwrap_or_else(|| json!({}));
+        cur["enabled"] = enabled;
+        cfg["tools"] = cur;
+    }
+    match config::persist_config(&cfg) {
+        Ok(()) => json_resp(
+            stream,
+            200,
+            json!({"ok": true, "persisted": config::config_file().to_string_lossy()}),
+        )
+        .await,
+        Err(e) => json_resp(
+            stream,
+            500,
+            json!({"ok": false, "error": {"code": "K500", "message": format!("配置已热应用但落盘失败: {e}")}}),
+        )
+        .await,
+    }
+}
+
+/// GET /api/skills：转发 assets skills.list（每次重扫，Web 端即见最新目录）。
+async fn get_skills(stream: &mut TcpStream, kernel: &Kernel) -> anyhow::Result<()> {
+    let v = match dispatch_or_err(kernel, "assets", json!({"op": "skills.list"})).await {
+        Ok(v) => v,
+        Err(e) => return json_resp(stream, 503, e).await,
+    };
+    json_resp(stream, 200, v).await
+}
+
+/// GET /api/skills/{name}：读回 SKILL.md 原文（技能编辑）。直读文件（与 put/delete 同源，绕过 assets）。
+async fn get_skill(stream: &mut TcpStream, name: &str) -> anyhow::Result<()> {
+    if !valid_skill_name(name) {
+        return json_resp(stream, 400, bad_request("非法技能名（仅字母数字/_/-，≤64 字符）", Some("name"))).await;
+    }
+    let skill_md = config::skills_dir().join(name).join("SKILL.md");
+    match std::fs::read_to_string(&skill_md) {
+        Ok(content) => json_resp(stream, 200, json!({"ok": true, "name": name, "content": content})).await,
+        Err(_) if !config::skills_dir().join(name).is_dir() => json_resp(
+            stream,
+            404,
+            json!({"ok": false, "error": {"code": "K404", "message": format!("技能不存在: {name}")}}),
+        )
+        .await,
+        Err(e) => json_resp(
+            stream,
+            500,
+            json!({"ok": false, "error": {"code": "K500", "message": format!("读取失败: {e}")}}),
+        )
+        .await,
+    }
+}
+
+/// 技能名约束：字母数字/下划线/连字符（同时杜绝路径注入——不含分隔符即无法越出 skills 根）。
+fn valid_skill_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// frontmatter 最小校验：`---` 开头，闭合前含 `name: {name}`（与目录名一致）与非空 `description:`。
+fn skill_frontmatter_ok(content: &str, name: &str) -> Result<(), String> {
+    let Some(rest) = content.strip_prefix("---") else {
+        return Err("SKILL.md 须以 '---' frontmatter 开头".into());
+    };
+    let mut has_desc = false;
+    for line in rest.lines() {
+        let t = line.trim();
+        if t == "---" {
+            break;
+        }
+        if let Some(v) = t.strip_prefix("name:") {
+            if v.trim() != name {
+                return Err(format!("frontmatter name '{}' 与目录名 '{name}' 不一致", v.trim()));
+            }
+        }
+        if let Some(v) = t.strip_prefix("description:") {
+            if !v.trim().is_empty() {
+                has_desc = true;
+            }
+        }
+    }
+    // name 行存在性：由闭合前的循环保证（未找到即失败）
+    let name_found = rest
+        .lines()
+        .map(str::trim)
+        .take_while(|t| *t != "---")
+        .any(|t| t.strip_prefix("name:").map(|v| v.trim() == name).unwrap_or(false));
+    if !name_found {
+        return Err(format!("frontmatter 缺 name: {name}"));
+    }
+    if !has_desc {
+        return Err("frontmatter 缺非空 description".into());
+    }
+    Ok(())
+}
+
+/// PUT /api/skills/{name}：写 SKILL.md（文件即注册表；assets 重扫后下轮对话目录可见）。
+async fn put_skill(stream: &mut TcpStream, name: &str, body: &[u8]) -> anyhow::Result<()> {
+    if !valid_skill_name(name) {
+        return json_resp(stream, 400, bad_request("非法技能名（仅字母数字/_/-，≤64 字符）", Some("name"))).await;
+    }
+    let Ok(req) = serde_json::from_slice::<Value>(body) else {
+        return json_resp(stream, 400, bad_request("body 非法 JSON", None)).await;
+    };
+    let Some(content) = req.get("content").and_then(Value::as_str) else {
+        return json_resp(stream, 400, bad_request("缺 content（SKILL.md 全文）", Some("content"))).await;
+    };
+    if let Err(e) = skill_frontmatter_ok(content, name) {
+        return json_resp(stream, 400, bad_request(e, Some("content"))).await;
+    }
+    let dir = config::skills_dir().join(name);
+    let skill_md = dir.join("SKILL.md");
+    match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&skill_md, content)) {
+        Ok(()) => json_resp(
+            stream,
+            200,
+            json!({
+                "ok": true,
+                "name": name,
+                "path": skill_md.to_string_lossy(),
+                "note": "已写入；下轮对话技能目录自动可见（list 每次重扫）"
+            }),
+        )
+        .await,
+        Err(e) => json_resp(stream, 500, json!({"ok": false, "error": {"code": "K500", "message": format!("写入失败: {e}")}})).await,
+    }
+}
+
+/// DELETE /api/skills/{name}：删除技能目录（名字约束已杜绝路径注入）。
+async fn delete_skill(stream: &mut TcpStream, name: &str) -> anyhow::Result<()> {
+    if !valid_skill_name(name) {
+        return json_resp(stream, 400, bad_request("非法技能名（仅字母数字/_/-，≤64 字符）", Some("name"))).await;
+    }
+    let dir = config::skills_dir().join(name);
+    if !dir.is_dir() {
+        return json_resp(
+            stream,
+            404,
+            json!({"ok": false, "error": {"code": "K404", "message": format!("技能不存在: {name}")}}),
+        )
+        .await;
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => json_resp(stream, 200, json!({"ok": true, "name": name})).await,
+        Err(e) => json_resp(stream, 500, json!({"ok": false, "error": {"code": "K500", "message": format!("删除失败: {e}")}})).await,
+    }
+}
+
 /// SSE：从 `after` 起增量轮询 memory 的 trace.read，逐事件 `data:` 推送；客户端断开即返回。
 /// 连接建立即从 after=0 重放全量（刷新恢复 = 日志重放），随后跟随实时增量。
 async fn sse_events(mut stream: TcpStream, kernel: Arc<Kernel>, query: &str) -> anyhow::Result<()> {
@@ -359,12 +748,19 @@ async fn sse_events(mut stream: TcpStream, kernel: Arc<Kernel>, query: &str) -> 
     let mut after: u64 = params.get("after").and_then(|v| v.parse().ok()).unwrap_or(0);
 
     // 写 SSE 响应头
-    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: keep-alive\r\n\r\n";
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\nconnection: keep-alive\r\n\r\n";
     stream.write_all(head.as_bytes()).await?;
     stream.flush().await?;
 
     let (mut read_half, mut write_half) = tokio::io::split(stream);
-    let mut ping_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    // 重放阶段（after 尚未 catch up）：只推持久 trace 事件、不推流式旁路（最终 assistant 已含完整内容）；
+    // 一旦某批 trace.read 返回空（catch up）即进入实时阶段，开始推 stream_*。
+    let mut replaying = true;
+    let mut ping_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    // 流式旁路：llm-adapter 边生成边写增量，本连接 tail 后与 trace 事件合并推送。
+    // session 名非法（防路径穿越）→ None，退化为纯 trace 重放。
+    let stream_path = config::stream_file(&session);
+    let mut stream_off: u64 = 0;
     loop {
         // 增量拉取
         let resp = kernel
@@ -384,6 +780,11 @@ async fn sse_events(mut stream: TcpStream, kernel: Arc<Kernel>, query: &str) -> 
                     }
                 }
                 after = v.get("next").and_then(Value::as_u64).unwrap_or(after);
+                // 本批无新事件 = 已 catch up（重放结束）→ 此后进入实时阶段，开始推流式旁路
+                let empty = v.get("events").and_then(Value::as_array).map_or(true, |a| a.is_empty());
+                if empty {
+                    replaying = false;
+                }
             }
             Ok(v) => {
                 let line = format!(
@@ -400,20 +801,66 @@ async fn sse_events(mut stream: TcpStream, kernel: Arc<Kernel>, query: &str) -> 
                 write_half.write_all(line.as_bytes()).await?;
             }
         }
+        // 流式旁路增量：读文件新增字节（按行；未写完的半行留给下一轮补齐）。
+        // 仅在实时阶段（replaying=false）推送——重放阶段已由最终 assistant 事件覆盖，不再推中间态。
+        let mut streaming = false;
+        if !replaying {
+        if let Some(path) = &stream_path {
+            if let Ok(buf) = std::fs::read(path) {
+                let len = buf.len() as u64;
+                if len < stream_off {
+                    stream_off = 0; // 新一轮以 "w" 覆盖重写 → 从头读
+                }
+                if len > stream_off {
+                    let text = String::from_utf8_lossy(&buf[stream_off as usize..]).to_string();
+                    let mut consumed = 0usize;
+                    for line in text.split_inclusive('\n') {
+                        if !line.ends_with('\n') {
+                            break; // 半行：等下一轮
+                        }
+                        consumed += line.len();
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let Ok(mut ev) = serde_json::from_str::<Value>(trimmed) else {
+                            continue; // 损坏行：跳过（offset 已推进，不重试）
+                        };
+                        // 加 stream_ 前缀，避免与 trace 事件类型撞名（如 error）
+                        let mapped = match ev.get("type").and_then(Value::as_str) {
+                            Some("start") => "stream_start",
+                            Some("delta") => "stream_delta",
+                            Some("end") => "stream_end",
+                            Some("error") => "stream_error",
+                            _ => continue,
+                        };
+                        ev["type"] = json!(mapped);
+                        write_half.write_all(format!("data: {ev}\n\n").as_bytes()).await?;
+                        streaming = true;
+                        has_new = true;
+                    }
+                    stream_off += consumed as u64;
+                }
+            }
+        }
+        }
         if has_new {
             write_half.flush().await?;
-            continue; // 有积压立刻再拉
+            if !streaming {
+                continue; // 非流式积压立刻再拉；流式期间让位给下面的 sleep，避免忙轮询
+            }
         }
         // 心跳注释行（防中间层空闲断连）
         if tokio::time::Instant::now() >= ping_deadline {
             write_half.write_all(b": ping\n\n").await?;
             write_half.flush().await?;
-            ping_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            ping_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         }
-        // 等待：300ms 轮询 or 客户端断开
+        // 等待：流式进行中 50ms（跟手），空闲 300ms（省 memory 轮询开销）
+        let poll_ms = if streaming { 50 } else { 300 };
         let mut byte = [0u8; 1];
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(poll_ms)) => {}
             r = read_half.read(&mut byte) => {
                 if r.is_err() || r.unwrap_or(1) == 0 {
                     break; // 客户端离开

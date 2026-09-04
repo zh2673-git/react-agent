@@ -52,4 +52,16 @@ def chat(payload: dict) -> dict:
     return norm("\n".join(text) or None, calls, data.get("model", model), "tool_calls" if calls else finish)
 
 
-PROVIDER = {"name": "anthropic", "chat": chat, "requires_env": ["ANTHROPIC_API_KEY"]}
+_ANTHROPIC_MODELS = [
+    "claude-3-5-sonnet-latest",
+    "claude-3-5-haiku-latest",
+    "claude-3-opus-latest",
+    "claude-3-haiku-20240307",
+]
+
+
+def models(payload: dict) -> dict:
+    return {"ok": True, "models": list(_ANTHROPIC_MODELS)}
+
+
+PROVIDER = {"name": "anthropic", "chat": chat, "models": models, "requires_env": ["ANTHROPIC_API_KEY"]}

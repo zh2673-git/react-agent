@@ -1,6 +1,7 @@
-//! e2e：web 网关全链路（Phase 3-2）——真实 memory/llm(mock)/tools guest + 真 agent-loop。
+//! e2e：web 网关全链路（Phase 3-2 / Phase 4）——真实 memory/llm(mock)/tools guest + 真 agent-loop。
 //! POST /api/chat → agent.chat 收敛；GET /api/events → SSE 从 0 重放全量事件；
 //! 非法请求 → 400 字段级错误。HTTP 客户端用裸 TcpStream（不引测试依赖）。
+//! Phase 4（08）：/api/config 读写（llm 热应用 + 落盘 + tools 白名单）、/api/skills CRUD。
 
 mod common;
 
@@ -115,6 +116,162 @@ async fn web_gateway_serves_chat_and_sse_replay() {
 
     let _ = std::fs::remove_dir_all(&mem_dir);
     let _ = std::fs::remove_dir_all(&ws_dir);
+    kernel.stop();
+    kernel.destroy().await;
+}
+
+/// Phase 4（08 §2.2）：配置中心 + 技能 CRUD 全链路。
+/// 前置：CONFIG_FILE / SKILLS_DIR 指向临时目录（宿主进程级 env，本文件内另一测试不读它们）。
+#[tokio::test]
+async fn web_config_center_and_skills_crud() {
+    let Some(py) = find_interpreter() else {
+        skip("python not found");
+        return;
+    };
+    if !kernel_repo().join("bindings/python").join("agent_kernel").exists() {
+        skip("kernel bindings/python not found");
+        return;
+    }
+
+    // 隔离：config.json 与 skills 目录都落临时路径（不影响真实项目文件）
+    let tag = format!("{}-{}", std::process::id(), nanos());
+    let cfg_file = std::env::temp_dir().join(format!("react-agent-cfg-{tag}.json"));
+    let skills_dir = std::env::temp_dir().join(format!("react-agent-skills-{tag}"));
+    std::fs::create_dir_all(&skills_dir).expect("create skills dir");
+    // 先设 env 再 spawn：宿主 skills_dir() 与 assets guest 同源
+    // （同二进制并行测试不受影响：唯一兄弟测试不读这些变量）
+    std::env::set_var("CONFIG_FILE", &cfg_file);
+    std::env::set_var("SKILLS_DIR", &skills_dir);
+    // key 断言需确定性：暂存并移除宿主进程可能携带的真实 key
+    let saved_keys: Vec<_> = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (*k, v)))
+        .collect();
+    for (k, _) in &saved_keys {
+        std::env::remove_var(k);
+    }
+
+    let kernel = fresh_kernel();
+    let llm = spawn_python(
+        py,
+        &plugins_dir().join("llm_adapter").join("llm_plugin.py"),
+        guest_manifest("llm-adapter", &["llm.chat"]),
+        &[("LLM_PROVIDER", "mock".into()), ("LLM_MODEL", "mock-1".into())],
+    )
+    .await
+    .expect("spawn llm-adapter");
+    register(&kernel, llm).await;
+
+    let tools = spawn_python(
+        py,
+        &plugins_dir().join("tools").join("tools_plugin.py"),
+        guest_manifest("tools", &["tools.exec"]),
+        &[("WORKSPACE_ROOT", std::env::temp_dir().to_string_lossy().into_owned())],
+    )
+    .await
+    .expect("spawn tools");
+    register(&kernel, tools).await;
+
+    let assets = spawn_python(
+        py,
+        &plugins_dir().join("assets").join("assets_plugin.py"),
+        guest_manifest("assets", &["assets.registry"]),
+        &[("SKILLS_DIR", skills_dir.to_string_lossy().into_owned())],
+    )
+    .await
+    .expect("spawn assets");
+    register(&kernel, assets).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind :0");
+    let addr = listener.local_addr().expect("local_addr");
+    let server_kernel = kernel.clone();
+    tokio::spawn(async move {
+        let _ = react_agent_host::frontend::WebFrontend::serve_listener(listener, server_kernel).await;
+    });
+
+    // 1. GET /api/config：初始视图（spawn env 为真相；未落盘前 tools 全启用）
+    let (status, body) = http(addr, "GET", "/api/config", None).await;
+    assert_eq!(status, 200, "get config: {body}");
+    let v: Value = serde_json::from_str(&body).expect("config JSON");
+    assert_eq!(v["config"]["llm"]["provider"], json!("mock"), "{v}");
+    assert_eq!(v["config"]["llm"]["key"]["key_set"], json!(false), "{v}");
+    let tools: Vec<&Value> = v["config"]["tools"].as_array().expect("tools array").iter().collect();
+    assert!(tools.iter().any(|t| t["name"] == json!("bash") && t["enabled"] == json!(true)), "{v}");
+
+    // 2. PUT /api/config：llm（model+api_key）+ tools 白名单（只留 read_file）
+    let (status, body) = http(
+        addr,
+        "PUT",
+        "/api/config",
+        Some(&json!({
+            "llm": {"model": "mock-2", "api_key": "sk-test-1234"},
+            "tools": {"enabled": ["read_file"]}
+        }).to_string()),
+    )
+    .await;
+    assert_eq!(status, 200, "put config: {body}");
+
+    // 3. 回读：模型/key 尾号已更新；bash 出池 read_file 在池（热生效）
+    let (status, body) = http(addr, "GET", "/api/config", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).expect("config JSON");
+    assert_eq!(v["config"]["llm"]["model"], json!("mock-2"), "{v}");
+    assert_eq!(v["config"]["llm"]["key"]["key_set"], json!(true), "{v}");
+    assert_eq!(v["config"]["llm"]["key"]["key_tail"], json!("1234"), "key 只回尾 4 位: {v}");
+    let tools_arr = v["config"]["tools"].as_array().expect("tools array");
+    let bash = tools_arr.iter().find(|t| t["name"] == json!("bash")).expect("bash in all-view");
+    assert_eq!(bash["enabled"], json!(false), "configure 后 bash 应未启用: {v}");
+    let rf = tools_arr.iter().find(|t| t["name"] == json!("read_file")).expect("read_file");
+    assert_eq!(rf["enabled"], json!(true), "{v}");
+
+    // 4. 持久化：config.json 落盘且含 model/api_key/tools.enabled（重启还原通道）
+    let persisted: Value =
+        serde_json::from_str(&std::fs::read_to_string(&cfg_file).expect("config.json exists")).expect("persisted JSON");
+    assert_eq!(persisted["llm"]["model"], json!("mock-2"), "{persisted}");
+    assert_eq!(persisted["llm"]["api_key"], json!("sk-test-1234"), "{persisted}");
+    assert_eq!(persisted["tools"]["enabled"], json!(["read_file"]), "{persisted}");
+
+    // 5. 技能 CRUD：PUT → GET 列表（assets 重扫可见）→ GET 单个回读
+    let skill_md = "---\nname: e2e-skill\ndescription: e2e 测试技能\n---\n\n# 执行指引\n测试内容\n";
+    let (status, body) = http(
+        addr,
+        "PUT",
+        "/api/skills/e2e-skill",
+        Some(&json!({"content": skill_md}).to_string()),
+    )
+    .await;
+    assert_eq!(status, 200, "put skill: {body}");
+    let (status, body) = http(addr, "GET", "/api/skills", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("e2e-skill"), "列表应含新技能: {body}");
+    let (status, body) = http(addr, "GET", "/api/skills/e2e-skill", None).await;
+    assert_eq!(status, 200, "get skill: {body}");
+    let v: Value = serde_json::from_str(&body).expect("skill JSON");
+    assert_eq!(v["content"], json!(skill_md), "回读应与写入一致: {v}");
+
+    // 6. 技能写入校验：frontmatter 缺失 → 400；name 不一致 → 400；非法名（路径注入）→ 400
+    let (status, body) = http(addr, "PUT", "/api/skills/bad", Some(&json!({"content": "no frontmatter"}).to_string())).await;
+    assert_eq!(status, 400, "frontmatter 缺失: {body}");
+    let bad_fm = "---\nname: other\ndescription: x\n---\nbody";
+    let (status, _) = http(addr, "PUT", "/api/skills/bad", Some(&json!({"content": bad_fm}).to_string())).await;
+    assert_eq!(status, 400, "name 不一致应 400");
+    let (status, _) = http(addr, "PUT", "/api/skills/a%2Fb", Some(&json!({"content": bad_fm}).to_string())).await;
+    assert_eq!(status, 400, "路径注入名应 400");
+
+    // 7. DELETE：删后列表与单个均不可见
+    let (status, _) = http(addr, "DELETE", "/api/skills/e2e-skill", None).await;
+    assert_eq!(status, 200, "delete skill");
+    let (status, _) = http(addr, "GET", "/api/skills/e2e-skill", None).await;
+    assert_eq!(status, 404, "删除后应 404");
+    let (status, body) = http(addr, "GET", "/api/skills", None).await;
+    assert_eq!(status, 200);
+    assert!(!body.contains("e2e-skill"), "列表不应再含已删技能: {body}");
+
+    let _ = std::fs::remove_file(&cfg_file);
+    let _ = std::fs::remove_dir_all(&skills_dir);
+    for (k, v) in saved_keys {
+        std::env::set_var(k, v);
+    }
     kernel.stop();
     kernel.destroy().await;
 }

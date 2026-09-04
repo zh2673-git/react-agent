@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub const ID: &str = "agent-loop";
@@ -104,6 +105,20 @@ impl Drop for DepthGuard<'_> {
     }
 }
 
+/// 路径前缀包含判断（L1 可达性探测）：分隔符归一 + Windows 大小写不敏感。
+/// 尽力而为的声明级判断——真正的硬边界是文件工具的 realpath 前缀拦截。
+fn path_within(child: &str, parent: &str) -> bool {
+    fn norm(p: &str) -> String {
+        let mut s = p.replace('/', "\\");
+        while s.ends_with('\\') {
+            s.pop();
+        }
+        s.to_ascii_lowercase()
+    }
+    let (c, p) = (norm(child), norm(parent));
+    c != p && c.starts_with(&format!("{p}\\"))
+}
+
 /// `task` 保留工具的声明（随 tools 传给模型，使其在严格函数调用协议下可见可调）。
 fn task_spec() -> ToolSpec {
     ToolSpec {
@@ -118,6 +133,58 @@ Returns only the final answer. Use for heavy research/exploration/summarization 
             },
             "required": ["task"]
         }),
+    }
+}
+
+/// 流式旁路目录（宿主以 AGENT_STREAM_DIR 下发）；未配置 → 无流式（行为同改造前）。
+fn stream_dir() -> Option<PathBuf> {
+    std::env::var_os("AGENT_STREAM_DIR").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+}
+
+/// 旁路文件路径：session 名来自 URL 参数，必须过安全校验（防路径穿越）。
+fn stream_file_for(session: &str) -> Option<String> {
+    let dir = stream_dir()?;
+    let safe = !session.is_empty()
+        && session.len() <= 64
+        && !session.contains("..")
+        && session.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !safe {
+        return None;
+    }
+    Some(dir.join(format!("{session}.jsonl")).to_string_lossy().into_owned())
+}
+
+/// 多轮累计用量：ReAct 一轮可能多次调用 LLM，用户要的是总消耗而非单轮。
+#[derive(Default)]
+struct UsageAcc {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    reasoning: u64,
+    seen: bool,
+}
+
+impl UsageAcc {
+    fn add(&mut self, u: Option<&Value>) {
+        let Some(u) = u else { return };
+        self.seen = true;
+        self.input += u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+        self.output += u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+        self.cache_read += u.get("cache_read_tokens").and_then(Value::as_u64).unwrap_or(0);
+        self.reasoning += u.get("reasoning_tokens").and_then(Value::as_u64).unwrap_or(0);
+    }
+
+    /// provider 未上报用量时返回 Null（前端据此不显示统计条，而非显示 0）。
+    fn to_value(&self) -> Value {
+        if !self.seen {
+            return Value::Null;
+        }
+        json!({
+            "input_tokens": self.input,
+            "output_tokens": self.output,
+            "cache_read_tokens": self.cache_read,
+            "reasoning_tokens": self.reasoning,
+        })
     }
 }
 
@@ -173,6 +240,8 @@ impl AgentLoopPlugin {
     }
 
     /// 技能附录（Discovery，07 §2.1）：assets 不可用/空列表 → 省略（不花 token）。
+    /// skills.list 附带 root（08 §L1）：root ⊆ WORKSPACE_ROOT 时追加「技能自扩展」授权段——
+    /// 模型可用 write_file 创建新技能（文件即注册表，list 每次重扫，下轮对话自动可见）。
     async fn skills_appendix(&self, src: &Envelope) -> String {
         let Ok(v) = self.call(src, ID_ASSETS, json!({"op": "skills.list"}), ASSETS_DEADLINE).await else {
             return String::new();
@@ -180,22 +249,49 @@ impl AgentLoopPlugin {
         let Some(skills) = v.get("skills").and_then(Value::as_array) else {
             return String::new();
         };
-        if skills.is_empty() {
-            return String::new();
-        }
-        let mut lines = vec![
-            String::new(),
-            "## Available skills".into(),
-            "To use a skill, call the reserved tool load_skill with {\"name\": \"...\"} to load its full instructions.".into(),
-        ];
-        for s in skills {
-            let name = s.get("name").and_then(Value::as_str).unwrap_or("");
-            let desc = s.get("description").and_then(Value::as_str).unwrap_or("");
-            if !name.is_empty() {
-                lines.push(format!("- {name}: {desc}"));
+        let root = v.get("root").and_then(Value::as_str).unwrap_or("");
+        let mut lines = vec![String::new()];
+        if !skills.is_empty() {
+            lines.push("## Available skills".into());
+            lines.push(
+                "To use a skill, call the reserved tool load_skill with {\"name\": \"...\"} to load its full instructions."
+                    .into(),
+            );
+            for s in skills {
+                let name = s.get("name").and_then(Value::as_str).unwrap_or("");
+                let desc = s.get("description").and_then(Value::as_str).unwrap_or("");
+                if !name.is_empty() {
+                    lines.push(format!("- {name}: {desc}"));
+                }
             }
         }
+        if let Some(section) = Self::self_extension_section(root) {
+            lines.push(section);
+        }
         lines.join("\n")
+    }
+
+    /// L1 技能自扩展授权段（08 §三）：仅当 skills 根目录落在 WORKSPACE_ROOT 内（模型经
+    /// write_file 可物理写入）时注入。这是授权声明而非新边界——真正的硬边界仍是
+    /// 文件工具的越界拦截（提示词约束≠执行边界）。
+    fn self_extension_section(skills_root: &str) -> Option<String> {
+        if skills_root.is_empty() {
+            return None;
+        }
+        let ws = std::env::var("WORKSPACE_ROOT").ok()?;
+        if !path_within(skills_root, &ws) {
+            return None;
+        }
+        Some(
+            "\n## Skill self-extension\n\
+             You can extend your own skills: use write_file to create `<skills-root>/<name>/SKILL.md` \
+             (directory name must equal the frontmatter `name`; frontmatter requires `name` and \
+             `description`; the body holds execution guidance, optionally referencing `references/` files \
+             you also write). New/changed skills become visible in this catalog on the NEXT chat round — \
+             no reload call needed. Keep skills small and focused; invalid frontmatter is silently skipped."
+                .replace("<skills-root>", skills_root)
+                + "\n",
+        )
     }
 
     /// 感知：拉取会话历史，并按 HISTORY_LIMIT 截断（保留最近 N 条）。
@@ -286,7 +382,8 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             tool_calls: None,
             tool_call_id: None,
         });
-        let summary = match self.plan(src, &sum_msgs, None).await {
+        // 压缩摘要不是用户可见输出 → 不走流式旁路
+        let summary = match self.plan(src, &sum_msgs, None, None).await {
             Ok(r) if r.ok => r.content.unwrap_or_default(),
             Ok(r) => {
                 tracing::warn!(target: ID, "compaction llm failed, keeping full history: {:?}", r.error);
@@ -331,17 +428,26 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
     }
 
     /// 规划：调用 LLM（含/不含工具）。
+    ///
+    /// `stream` = Some((旁路文件绝对路径, 本轮 sid))：llm-adapter 据此在生成过程中把
+    /// 增量写往该文件，宿主 tail 后经 SSE 推前端（guest 协议为 unary，插件无反向通道）。
+    /// None 时行为与流式改造前完全一致。
     async fn plan(
         &self,
         src: &Envelope,
         messages: &[MemoryMsg],
         tools: Option<&[ToolSpec]>,
+        stream: Option<(&str, &str)>,
     ) -> Result<LlmChatResp, KernelError> {
         let mut payload = json!({"op": "chat", "messages": messages});
         if let Some(t) = tools {
             if !t.is_empty() {
                 payload["tools"] = json!(t);
             }
+        }
+        if let Some((path, sid)) = stream {
+            payload["stream_path"] = json!(path);
+            payload["sid"] = json!(sid);
         }
         let v = self.call(src, ID_LLM, payload, LLM_DEADLINE).await?;
         Ok(serde_json::from_value(v).unwrap_or(LlmChatResp {
@@ -351,6 +457,9 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             model: String::new(),
             finish_reason: String::new(),
             error: Some(json!({"code": "LLM_BAD_SHAPE", "message": "llm-adapter 返回了无法解析的响应"})),
+            reasoning: None,
+            usage: None,
+            elapsed_ms: None,
         }))
     }
 
@@ -487,21 +596,35 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
 
         let mut steps: Vec<StepRecord> = Vec::new();
         let mut rounds: u32 = 0;
+        // 流式旁路：宿主以 AGENT_STREAM_DIR 下发目录；未配置即退化为一问一答（行为同改造前）。
+        let stream_path = stream_file_for(&req.session_id);
+        let mut usage = UsageAcc::default();
+        let mut llm_ms: u64 = 0;
         for _round in 0..self.max_rounds {
             rounds += 1;
-            let resp = match self.plan(env, &messages, Some(&tools)).await {
+            let sid = format!("{}-r{}", req.session_id, rounds);
+            let stream = stream_path.as_deref().map(|p| (p, sid.as_str()));
+            let resp = match self.plan(env, &messages, Some(&tools), stream).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.trace(env, &req.session_id, json!({"type": "error", "where": "llm.chat", "message": e.to_string()})).await;
                     return json!({"ok": false, "error": {"code": e.code(), "message": format!("llm chat failed: {e}")}});
                 }
             };
+            usage.add(resp.usage.as_ref());
+            llm_ms += resp.elapsed_ms.unwrap_or(0);
             if !resp.ok {
-                self.trace(env, &req.session_id, json!({"type": "error", "where": "llm.chat", "message": resp.error})).await;
-                return json!({"ok": false, "error": resp.error.clone().unwrap_or_else(|| json!({"code":"LLM_ERROR","message":"llm-adapter 返回失败"}))});
+                let err_val = resp.error.clone().unwrap_or_else(|| json!({"code":"LLM_ERROR","message":"llm-adapter 返回失败"}));
+                let emsg = err_val
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "llm-adapter 返回失败".into());
+                self.trace(env, &req.session_id, json!({"type": "error", "where": "llm.chat", "message": emsg})).await;
+                return json!({"ok": false, "error": err_val});
             }
             if resp.tool_calls.is_empty() {
-                return self.finish(env, &req.session_id, resp, rounds, steps).await;
+                return self.finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms).await;
             }
 
             // 行动 + 观察：assistant(tool_calls) + 每个 tool 结果各一条消息
@@ -528,22 +651,41 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
 
         // 轮次耗尽：最后一轮不带工具，强制收敛
         rounds += 1;
-        let resp = match self.plan(env, &messages, None).await {
+        let sid = format!("{}-r{}", req.session_id, rounds);
+        let stream = stream_path.as_deref().map(|p| (p, sid.as_str()));
+        let resp = match self.plan(env, &messages, None, stream).await {
             Ok(r) => r,
             Err(e) => {
                 self.trace(env, &req.session_id, json!({"type": "error", "where": "llm.chat", "message": e.to_string()})).await;
                 return json!({"ok": false, "error": {"code": e.code(), "message": format!("llm chat failed: {e}")}});
             }
         };
+        usage.add(resp.usage.as_ref());
+        llm_ms += resp.elapsed_ms.unwrap_or(0);
         if resp.ok && resp.tool_calls.is_empty() {
-            return self.finish(env, &req.session_id, resp, rounds, steps).await;
+            return self.finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms).await;
         }
         self.trace(env, &req.session_id, json!({"type": "error", "where": "max_rounds", "message": format!("agent loop exhausted max_rounds={}", self.max_rounds)})).await;
         json!({"ok": false, "error": {"code": "K502", "message": format!("agent loop exhausted max_rounds={}", self.max_rounds)}})
     }
 
     /// 收敛：最终答案入记忆并返回（含 steps）。
-    async fn finish(&self, env: &Envelope, session_id: &str, resp: LlmChatResp, rounds: u32, steps: Vec<StepRecord>) -> Value {
+    ///
+    /// 事件带上 sid（与流式增量对位，供前端复用同一气泡）、reasoning、累计 usage 与
+    /// LLM 总耗时。流式增量只经旁路文件实时外抛，不落日志；这条事件才是持久化与
+    /// 刷新恢复的唯一依据，因此内容必须与流式所见一致（含思考）。
+    #[allow(clippy::too_many_arguments)]
+    async fn finish(
+        &self,
+        env: &Envelope,
+        session_id: &str,
+        resp: LlmChatResp,
+        rounds: u32,
+        steps: Vec<StepRecord>,
+        sid: String,
+        usage: UsageAcc,
+        llm_ms: u64,
+    ) -> Value {
         let answer = resp.content.clone().unwrap_or_default();
         self.observe(
             env,
@@ -556,7 +698,21 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             }],
         )
         .await;
-        self.trace(env, session_id, json!({"type": "assistant", "answer": answer, "rounds": rounds})).await;
+        let reasoning = resp.reasoning.clone();
+        self.trace(
+            env,
+            session_id,
+            json!({
+                "type": "assistant",
+                "answer": answer,
+                "rounds": rounds,
+                "sid": sid,
+                "reasoning": reasoning,
+                "usage": usage.to_value(),
+                "elapsed_ms": llm_ms,
+            }),
+        )
+        .await;
         json!({"ok": true, "answer": answer, "rounds": rounds, "steps": steps, "session_id": session_id})
     }
 }
@@ -582,5 +738,45 @@ impl Plugin for AgentLoopPlugin {
     }
     fn destroy(&self) -> KernelResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_within_prefix_and_case_insensitive() {
+        // 直接子目录
+        assert!(path_within(r"C:\ws\skills", r"C:\ws"));
+        // 混合分隔符
+        assert!(path_within("C:/ws/skills/x", r"C:\WS"));
+        // 同目录不算 within（skills 根 = workspace 根时拒绝授权）
+        assert!(!path_within(r"C:\ws", r"C:\ws"));
+        // 仅前缀字符串相同但非目录边界
+        assert!(!path_within(r"C:\ws2\skills", r"C:\ws"));
+        // 完全无关
+        assert!(!path_within(r"D:\other\skills", r"C:\ws"));
+    }
+
+    #[test]
+    fn self_extension_section_gated_by_workspace_reachability() {
+        let saved = std::env::var("WORKSPACE_ROOT").ok();
+        std::env::set_var("WORKSPACE_ROOT", r"C:\ws");
+
+        // root 为空 → 不授权
+        assert!(AgentLoopPlugin::self_extension_section("").is_none());
+        // skills 根在 workspace 外 → 不授权
+        assert!(AgentLoopPlugin::self_extension_section(r"D:\elsewhere\skills").is_none());
+        // skills 根在 workspace 内 → 授权段含路径与 write_file 指引
+        let section = AgentLoopPlugin::self_extension_section(r"C:\ws\skills").expect("in-workspace");
+        assert!(section.contains(r"C:\ws\skills"));
+        assert!(section.contains("write_file"));
+        assert!(section.contains("Skill self-extension"));
+
+        match saved {
+            Some(v) => std::env::set_var("WORKSPACE_ROOT", v),
+            None => std::env::remove_var("WORKSPACE_ROOT"),
+        }
     }
 }

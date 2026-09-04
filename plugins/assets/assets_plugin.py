@@ -6,8 +6,10 @@
   Execution: 复用基础工具（assets 从不执行 skill 代码，语言无关）
 
 线契约（03 §2.4）：
-  {"op":"skills.list"}             → {"ok":true,"skills":[{"name","description"}]}
-  {"op":"skills.load","name":str}  → {"ok":true,"content":str} | {"ok":false,"error":{...}}
+  {"op":"skills.list"}             → {"ok":true,"skills":[{"name","description"}],"root":str}
+                                     每次调用重扫目录（08：Web 技能 CRUD / L1 自扩展实时可见）；
+                                     root=skills 根目录绝对路径（agent-loop 自扩展可达性探测用）
+  {"op":"skills.load","name":str}  → {"ok":true,"content":str} | {"ok":false,"error":{...}}（读取前重扫）
   {"op":"prompts.list"}            → {"ok":true,"prompts":[{"name","description"}]}
   {"op":"prompts.get","name":str}  → {"ok":true,"content":str}
 
@@ -104,12 +106,15 @@ class AssetsPlugin:
         payload = envelope.get("payload") or {}
         op = payload.get("op")
         if op == "skills.list":
+            self._skills = _scan_skills(self._skills_root)  # 每次重扫：Web CRUD / 自扩展写盘即时可见
             return {
                 "ok": True,
                 "skills": [{"name": n, "description": s["description"]} for n, s in self._skills.items()],
+                "root": str(self._skills_root),
             }
         if op == "skills.load":
             name = payload.get("name")
+            self._skills = _scan_skills(self._skills_root)  # 读取前重扫：刚写入的技能立即可激活
             entry = self._skills.get(name)
             if entry is None:
                 avail = ", ".join(sorted(self._skills)) or "（无）"
@@ -120,12 +125,14 @@ class AssetsPlugin:
                 return _err(f"skill 读取失败: {exc}")
             return {"ok": True, "content": content}
         if op == "prompts.list":
+            self._prompts = _scan_prompts(self._prompts_root)
             return {
                 "ok": True,
                 "prompts": [{"name": n, "description": s["description"]} for n, s in self._prompts.items()],
             }
         if op == "prompts.get":
             name = payload.get("name")
+            self._prompts = _scan_prompts(self._prompts_root)
             entry = self._prompts.get(name)
             if entry is None:
                 avail = ", ".join(sorted(self._prompts)) or "（无）"

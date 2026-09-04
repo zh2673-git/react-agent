@@ -79,4 +79,14 @@ pub struct LlmChatResp {
     pub finish_reason: String,
     #[serde(default)]
     pub error: Option<Value>,
+    // ── 追加可选字段（缺省 = provider 未提供，旧插件/未升级 provider 不受影响）──
+    /// 思考内容（DeepSeek reasoning_content 等）；无思考模型为 None。
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    /// 归一化用量：{input_tokens, output_tokens, cache_read_tokens, reasoning_tokens}。
+    #[serde(default)]
+    pub usage: Option<Value>,
+    /// 该次 LLM 请求墙钟耗时（毫秒）。
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
 }

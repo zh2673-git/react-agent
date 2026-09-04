@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 plugins/memory/data/
 *.log
+.stream/
+config.json
