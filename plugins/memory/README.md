@@ -27,10 +27,15 @@
 {"op":"summarize","session_id","summary","keep_last"?} → {"ok":true,"count":int}
 {"op":"trace.append","session_id","events":[Event]}    → {"ok":true,"count":int}
 {"op":"trace.read","session_id","after"?}              → {"ok":true,"events":[Event],"next":int}
+{"op":"rollback","session_id","upto_user_index":int}   → {"ok":true,"removed_messages":int,"removed_events":int}
 ```
 
-- `Msg = {role, content?, tool_calls?, tool_call_id?}`——与 `crates/agent-loop/src/contract.rs`
-  的 `MemoryMsg` **严格镜像，改形状必须两边同步**。
+- `Msg = {role, content?, tool_calls?, tool_call_id?, attachments?}`——与 `crates/agent-loop/src/contract.rs`
+  的 `MemoryMsg` **严格镜像，改形状必须两边同步**。`attachments` 是 R3 多模态图片附件
+  （`[{name,mime,data_b64}]`，仅图片；文本文件已在 agent-loop 构造时拼入 content），纯追加字段。
+- **rollback（R2 回滚）**：物理截断语义——按「第 `upto_user_index` 条 user 消息」（0 基，压缩标记
+  不计入轮次）定位切点，**消息与 trace 双侧同源截断**（任一侧越界即整体失败不落盘，保证 UI 重放
+  与 LLM 上下文对齐）。trace 侧按 JSONL 字节偏移 truncate，容忍半行写入。
 - `Event` 是任意 JSON 对象，约定带 `type` 与 `ts`。
 - 所有 op 都要求 `session_id`，缺失直接返回 `{"ok":false,"error":{"message":"session_id is required"}}`。
 - 未知 op 返回错误，**不抛异常**（gRPC 层异常会转成 INTERNAL）。

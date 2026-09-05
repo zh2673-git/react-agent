@@ -91,13 +91,32 @@
   .wrap { max-width: 820px; margin: 0 auto; padding: 0 20px; display: flex; flex-direction: column; gap: 18px; }
 
   /* ── 消息 ── */
-  .ev.user { display: flex; justify-content: flex-end; }
+  .ev.user { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
   .ev.user .bubble { background: var(--card-2); color: var(--text); border: 1px solid var(--border-soft); padding: 10px 15px; border-radius: 16px 16px 4px 16px;
-    max-width: 78%; white-space: pre-wrap; word-break: break-word; line-height: 1.6; }
+    max-width: 78%; word-break: break-word; line-height: 1.6; }
+  .ev.user .bubble .txt { white-space: pre-wrap; }
   .ev.assistant .card { background: var(--card); border: 1px solid var(--border-soft); border-radius: var(--radius);
     padding: 14px 18px; }
   .ev.assistant .meta { color: var(--faint); font-size: 11.5px; margin-bottom: 8px; display: flex; align-items: center; gap: 7px; }
   .ev.assistant .meta .who { color: var(--point); font-weight: 600; }
+
+  /* ── 回滚 / 重新生成（R2）：hover 显现 ── */
+  .rb-btn, .rg-btn { opacity: 0; pointer-events: none; transition: opacity .12s; background: var(--card-2);
+    border: 1px solid var(--border); color: var(--muted); border-radius: 8px; padding: 4px 11px; font-size: 11.5px; white-space: nowrap; }
+  .ev.user:hover .rb-btn, .ev.assistant:hover .rg-btn { opacity: 1; pointer-events: auto; }
+  .rb-btn:hover, .rg-btn:hover { color: var(--text); border-color: var(--accent); }
+  .ev.assistant .meta .rg-btn { margin-left: auto; }
+
+  /* ── 附件（R3）：气泡内重放 + composer 待发条 ── */
+  .batts { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .batt-img { max-width: 240px; max-height: 180px; border-radius: 10px; display: block; border: 1px solid var(--border-soft); }
+  .batt-file { background: var(--card); border: 1px solid var(--border-soft); border-radius: 8px; padding: 3px 10px; font-size: 12px; color: var(--muted); }
+  .atts { max-width: 820px; margin: 0 auto 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .att { display: flex; align-items: center; gap: 7px; background: var(--card-2); border: 1px solid var(--border-soft);
+    border-radius: 8px; padding: 4px 8px; font-size: 12px; }
+  .att img { width: 40px; height: 40px; object-fit: cover; border-radius: 6px; }
+  .att .rm { cursor: pointer; color: var(--faint); font-size: 14px; }
+  .att .rm:hover { color: var(--err); }
   .ev.error .banner { background: rgba(201,79,79,.08); border: 1px solid rgba(201,79,79,.4); color: var(--err);
     border-radius: 10px; padding: 9px 14px; font-family: Consolas, monospace; font-size: 12.5px; white-space: pre-wrap; }
   .ev.compaction { text-align: center; color: var(--faint); font-size: 12px; }
@@ -114,6 +133,16 @@
     color: var(--muted); display: flex; align-items: center; gap: 7px; user-select: none; }
   details.think .think-body { padding: 2px 12px 11px; color: var(--faint); font-size: 12.5px;
     white-space: pre-wrap; word-break: break-word; line-height: 1.65; max-height: 320px; overflow: auto; }
+  /* 过程链框：思考段 + 工具卡统一收纳（回合级），最终答案在框外 */
+  details.process { margin: 0; background: var(--accent-soft); border: 1px solid var(--border-soft);
+    border-radius: 10px; overflow: hidden; }
+  details.process summary { cursor: pointer; padding: 7px 12px; list-style: none; font-size: 12.5px;
+    color: var(--muted); display: flex; align-items: center; gap: 7px; user-select: none; }
+  details.process .plabel { font-weight: 600; color: var(--text); }
+  details.process .pbody { padding: 2px 10px 10px; display: flex; flex-direction: column; gap: 8px; }
+  details.process .think-body { padding: 2px 4px 0; color: var(--faint); font-size: 12.5px;
+    white-space: pre-wrap; word-break: break-word; line-height: 1.65; max-height: 320px; overflow: auto; }
+  details.process details.tool { background: var(--card); }
   .ev.assistant .stats { margin-top: 9px; padding-top: 8px; border-top: 1px dashed var(--border-soft);
     color: var(--faint); font-size: 11.5px; display: flex; gap: 14px; flex-wrap: wrap; }
   .ev.assistant .stats[hidden] { display: none; }
@@ -172,6 +201,8 @@
   .composer button { background: var(--accent); color: #fff; border: none; border-radius: 14px; padding: 0 22px; height: 48px; font-weight: 600; }
   .composer button:hover { background: var(--accent-2); }
   .composer button:disabled { opacity: .5; cursor: default; }
+  .composer button.attach { background: var(--card-2); color: var(--muted); width: 48px; padding: 0; flex: 0 0 auto; font-size: 17px; }
+  .composer button.attach:hover { color: var(--text); }
 
   /* ── 设置抽屉 ── */
   #drawer { position: fixed; top: 0; right: -440px; width: 420px; max-width: 94vw; height: 100vh;
@@ -198,6 +229,8 @@
   .btn.danger { background: none; border: 1px solid var(--err); color: var(--err); }
   .row { display: flex; gap: 9px; align-items: center; }
   .hint { color: var(--faint); font-size: 12px; margin: 9px 0; line-height: 1.5; }
+  .site-link { color: var(--point); font-size: 12px; white-space: nowrap; text-decoration: none; }
+  .site-link:hover { text-decoration: underline; }
   .flash { font-size: 12px; } .flash.ok { color: var(--ok); } .flash.err { color: var(--err); }
   .toolitem { display: flex; align-items: center; gap: 10px; padding: 9px 11px; border: 1px solid var(--border-soft);
     border-radius: 9px; margin-bottom: 6px; background: var(--card); cursor: pointer; }
@@ -231,10 +264,14 @@
   </header>
   <div id="stream"><div class="wrap" id="feed"></div></div>
   <footer>
+    <div class="atts" id="atts" hidden></div>
     <div class="composer">
-      <textarea id="input" placeholder="输入消息，Enter 发送（Shift+Enter 换行）"></textarea>
+      <button id="attach" class="attach" title="附加图片或文本文件（最多 4 个，单个 ≤2MB）">📎</button>
+      <textarea id="input" placeholder="输入消息，Enter 发送（Shift+Enter 换行；可直接粘贴图片）"></textarea>
       <button id="stop" hidden style="background: var(--card-2); color: var(--text);">停止</button>
       <button id="send">发送</button>
+      <input type="file" id="file" multiple hidden
+        accept="image/*,text/*,.md,.markdown,.txt,.log,.json,.csv,.py,.js,.ts,.tsx,.rs,.go,.java,.c,.cpp,.h,.toml,.yaml,.yml,.xml,.html,.css,.sql,.sh">
     </div>
   </footer>
 </div>
@@ -256,6 +293,10 @@
           <option value="anthropic">anthropic</option>
           <option value="ollama">ollama（本地）</option>
         </select>
+      </div>
+      <div class="field" id="llm-site-field"><label>站点（预设一键切换）</label>
+        <select id="llm-site" style="flex:1"></select>
+        <a id="llm-site-key-url" class="site-link" href="#" target="_blank" rel="noopener" hidden>申请 key ↗</a>
       </div>
       <div class="field"><label>model</label><select id="llm-model" style="flex:1"></select><input id="llm-model-custom" placeholder="自定义模型名" style="flex:1; display:none"><button type="button" class="btn ghost" id="llm-fetch-models">拉取模型</button></div>
       <div class="field"><label>base_url</label><input id="llm-base" placeholder="https://api.deepseek.com/v1"></div>
@@ -424,7 +465,7 @@ function setStatus(t) { statusEl.textContent = t || ""; }
 // ── 流式渲染：思考与正文分块，结束显示用量与耗时 ──
 // 旁路文件只服务「边生成边看」，不落日志；最终 assistant 事件才是持久化与刷新恢复的
 // 依据。两者靠 sid 对位：同 sid 复用同一个气泡，避免同一条消息渲染两次。
-let streamSid = null, streamCard = null, streamThink = null, streamThinkBody = null, streamBody = null, streamStats = null;
+let streamSid = null, streamCard = null, streamBody = null, streamStats = null;
 const streamBuf = { reasoning: "", text: "" };
 const doneSids = new Set(); // 已完成回合的 sid：最终 assistant 事件已渲染，后续同 sid 的重连 stream_* 帧一律忽略，避免尾部覆盖/重弹
 
@@ -454,26 +495,57 @@ function applyStats(node, usage, elapsedMs) {
   node.textContent = parts.join(" · ");
 }
 
+// 过程链框（回合级）：思考段 + 工具卡统一收纳其中，最终答案在框外——无论上游
+// 帧序如何（ollama 逐帧前置 / 部分网关把 reasoning 攒到最后），呈现顺序都稳定。
+// 生命周期：user 事件重置；首个 reasoning/tool_call 时创建；assistant 最终事件收起。
+let processBox = null, processBody = null, processThink = null;
+
+function ensureProcessBox() {
+  if (processBox) return;
+  processBox = el(`<details class="ev process" open><summary><span class="plabel">思考与工具</span><span class="chev">›</span></summary><div class="pbody"></div></details>`);
+  processBody = processBox.querySelector(".pbody");
+  feed.appendChild(processBox);
+}
+
+// R2 重新生成：绑定到该卡对应的 user 轮次（渲染时的最后一轮）。回滚到该问题
+// （问题本身一并删除）后自动重发原文+附件——新答案覆盖旧答案位置。
+function bindRegen(card) {
+  const btn = card.querySelector(".rg-btn");
+  if (!btn) return;
+  if (!userTurns.length) { btn.remove(); return; }
+  const u = userTurns[userTurns.length - 1];
+  btn.onclick = () => rollbackTo(u.idx, true, u);
+}
+
+function ensureAnswerCard() {
+  if (streamCard) return;
+  streamCard = el(`<div class="ev assistant streaming"><div class="card"><div class="meta"><span class="who">assistant</span><span>生成中…</span><button class="rg-btn" title="回滚到本问题并重新生成">↻ 重新生成</button></div><div class="md"></div><div class="stats" hidden></div></div></div>`);
+  streamBody = streamCard.querySelector(".md");
+  streamStats = streamCard.querySelector(".stats");
+  feed.appendChild(streamCard);
+  bindRegen(streamCard);
+}
+
 function startStream(sid) {
   if (streamCard) endStream(null); // 上一轮异常收尾（未等到最终事件）
   streamSid = sid ?? null;
   streamBuf.reasoning = ""; streamBuf.text = "";
-  streamCard = el(`<div class="ev assistant streaming"><div class="card"><div class="meta"><span class="who">assistant</span><span>生成中…</span></div><details class="think" hidden><summary>思考过程</summary><div class="think-body"></div></details><div class="md"></div><div class="stats" hidden></div></div></div>`);
-  streamThink = streamCard.querySelector("details.think");
-  streamThinkBody = streamCard.querySelector(".think-body");
-  streamBody = streamCard.querySelector(".md");
-  streamStats = streamCard.querySelector(".stats");
-  feed.appendChild(streamCard);
+  processThink = null; // 每轮流新开一段思考区（多轮按序混排在过程框内）
+  streamCard = streamBody = streamStats = null; // 答案卡延迟到首个 text delta（保证过程框在前）
 }
 
 function pushStream(ev) {
-  if (!streamCard) startStream(ev.sid); // 兜底：未收到 start（连接中途才建立）
   if (ev.kind === "reasoning") {
+    ensureProcessBox();
+    if (!processThink) {
+      processThink = el(`<div class="think-body" style="white-space:pre-wrap"></div>`);
+      processBody.appendChild(processThink);
+    }
     streamBuf.reasoning += ev.text || "";
-    streamThink.hidden = false;
-    streamThink.open = true; // 思考进行中自动展开
-    streamThinkBody.textContent = streamBuf.reasoning;
+    processThink.textContent = streamBuf.reasoning;
+    processBox.open = true; // 过程进行中保持展开
   } else {
+    ensureAnswerCard();
     streamBuf.text += ev.text || "";
     streamBody.textContent = streamBuf.text; // 流式期间纯文本追加，结束再渲染 markdown
   }
@@ -482,51 +554,67 @@ function pushStream(ev) {
 function endStream(ev) {
   if (!streamCard) return;
   streamCard.classList.remove("streaming");
-  if (streamThink) streamThink.open = false; // 思考结束自动收起（用户仍可点开回看）
   if (streamBuf.text) streamBody.innerHTML = md(streamBuf.text);
   applyStats(streamStats, ev ? ev.usage : null, ev ? ev.elapsed_ms : null);
+  // streamCard 不清：多轮流共享同一张答案卡（最终 assistant 事件覆盖内容后才随 renderAssistant 清）
 }
 
 function renderAssistant(ev, ts) {
   if (!ev.answer && !ev.reasoning) return; // 工具轮内容为空，仅 tool_call 渲染
-  if (ev.sid && ev.sid === streamSid && streamCard) {
-    // 同轮：复用流式气泡，用最终内容覆盖（含思考）；并把标题从「生成中…」改成时间戳
+  if (ev.sid && ev.sid === streamSid) {
+    // 同回合：答案卡填最终内容；过程框收起（回合完成，用户仍可点开回看）
+    ensureAnswerCard();
     streamCard.classList.remove("streaming");
     const tsSpan = streamCard.querySelector(".meta span:nth-child(2)");
     if (tsSpan) tsSpan.textContent = ts || "完成";
-    if (ev.reasoning) {
-      streamThink.hidden = false;
-      streamThink.open = false; // 最终渲染收起，与 endStream 行为一致
-      streamThinkBody.textContent = ev.reasoning;
-    }
     streamBody.innerHTML = md(ev.answer || "");
     applyStats(streamStats, ev.usage ?? null, ev.elapsed_ms ?? null);
+    if (ev.reasoning && processThink) processThink.textContent = ev.reasoning; // 兜底：流式思考帧缺失（网关攒帧）时补全
     if (ev.sid) doneSids.add(ev.sid); // 标记已完成：后续同 sid 的重连 stream_* 帧忽略
-    streamSid = streamCard = streamThink = streamThinkBody = streamBody = streamStats = null;
+    if (processBox) processBox.open = false;
+    streamSid = streamCard = streamBody = streamStats = null;
     return;
   }
-  // 重放 / 无流式：新建完整卡片（思考默认折叠）
-  const card = el(`<div class="ev assistant"><div class="card"><div class="meta"><span class="who">assistant</span><span>${ts}</span></div><details class="think" hidden><summary>思考过程</summary><div class="think-body"></div></details><div class="md"></div><div class="stats" hidden></div></div></div>`);
+  // 重放 / 无流式：过程框（思考，折叠）+ 完整答案卡
   if (ev.reasoning) {
-    const th = card.querySelector("details.think");
-    th.hidden = false;
-    th.querySelector(".think-body").textContent = ev.reasoning;
+    ensureProcessBox();
+    processThink = el(`<div class="think-body" style="white-space:pre-wrap"></div>`);
+    processBody.appendChild(processThink);
+    processThink.textContent = ev.reasoning;
+    processBox.open = false; // 重放默认折叠
   }
+  const card = el(`<div class="ev assistant"><div class="card"><div class="meta"><span class="who">assistant</span><span>${ts}</span><button class="rg-btn" title="回滚到本问题并重新生成">↻ 重新生成</button></div><div class="md"></div><div class="stats" hidden></div></div></div>`);
   card.querySelector(".md").innerHTML = md(ev.answer || "");
   applyStats(card.querySelector(".stats"), ev.usage ?? null, ev.elapsed_ms ?? null);
   if (ev.sid) doneSids.add(ev.sid); // 标记已完成：后续同 sid 的重连 stream_* 帧忽略
   feed.appendChild(card);
+  bindRegen(card);
 }
 
 // ── 事件渲染 ──
 const pending = new Map();
+// R2：本回合内已渲染的 user 轮次（idx = trace 内第几条 user 事件，0 基）。
+// 回滚按「第 N 条 user 消息」定位；重新生成复用最后一轮的原文+附件（trace user 事件带全量 b64）。
+let userTurns = [];
 function render(ev) {
   const ts = ev.ts ? new Date(ev.ts).toLocaleTimeString() : "";
   switch (ev.type) {
-    case "user":
+    case "user": {
       doneSids.clear(); // 新回合开始：作废上一回合标记，防止同 round sid 碰撞误伤新回合流式
-      feed.appendChild(el(`<div class="ev user"><div class="bubble">${esc(ev.text)}</div></div>`));
+      processBox = processBody = processThink = null; // 过程链框按用户回合划分
+      const idx = userTurns.length;
+      userTurns.push({ idx, text: ev.text ?? "", atts: ev.attachments ?? [] });
+      // R3 附件重放：图片缩略图 / 文件条（trace user 事件带全量 b64）
+      const attsHtml = (ev.attachments ?? []).map((a) =>
+        a.mime && a.mime.startsWith("image/") && a.data_b64
+          ? `<img class="batt-img" alt="${esc(a.name)}" src="data:${esc(a.mime)};base64,${a.data_b64}">`
+          : `<span class="batt-file">📄 ${esc(a.name)}</span>`
+      ).join("");
+      const uel = el(`<div class="ev user"><button class="rb-btn" title="删除该问题及其后的对话，回到提问前">⤺ 回滚</button><div class="bubble">${attsHtml ? `<div class="batts">${attsHtml}</div>` : ""}<div class="txt">${esc(ev.text)}</div></div></div>`);
+      uel.querySelector(".rb-btn").onclick = () => rollbackTo(idx, false);
+      feed.appendChild(uel);
       break;
+    }
     case "assistant":
       renderAssistant(ev, ts);
       break;
@@ -543,8 +631,9 @@ function render(ev) {
       if (!(ev.sid && doneSids.has(ev.sid))) endStream(null);
       break;
     case "tool_call": {
+      ensureProcessBox(); // 工具卡与思考段同框（过程链）
       const card = el(`<details class="tool" open><summary><span class="statedot"></span><span class="name">⚙ ${esc(ev.name)}</span><span class="round">round ${esc(ev.round)}</span><span class="ms"></span><span class="chev">›</span></summary><div class="body"><div class="sec"><div class="lbl">参数</div><pre class="result-pre">${esc(JSON.stringify(ev.args ?? {}, null, 2))}</pre></div><div class="sec result-sec" style="display:none"><div class="lbl">结果</div><div class="result-pre result-body"></div></div></div></details>`);
-      feed.appendChild(card);
+      processBody.appendChild(card);
       pending.set(`${ev.round}|${ev.name}`, card);
       break;
     }
@@ -552,8 +641,9 @@ function render(ev) {
       const key = `${ev.round}|${ev.name}`;
       let card = pending.get(key);
       if (!card) {
+        ensureProcessBox();
         card = el(`<details class="tool"><summary><span class="statedot"></span><span class="name">⚙ ${esc(ev.name)}</span><span class="round">round ${ev.round}</span><span class="ms"></span><span class="chev">›</span></summary><div class="body"><div class="sec result-sec"><div class="lbl">结果</div><div class="result-pre result-body"></div></div></div></details>`);
-        feed.appendChild(card);
+        processBody.appendChild(card);
       }
       card.classList.add("done", ev.ok ? "ok" : "fail");
       card.open = false; // 执行结束自动收起（用户仍可点开看参数与结果）
@@ -590,9 +680,9 @@ let es = null, lastAfter = 0;
 function connect(after) {
   after = after || 0;
   if (es) es.close();
-  if (after === 0) { feed.innerHTML = ""; pending.clear(); lastAfter = 0; doneSids.clear(); } // 首屏/切换：清空后全量重放
+  if (after === 0) { feed.innerHTML = ""; pending.clear(); lastAfter = 0; doneSids.clear(); processBox = processBody = processThink = null; userTurns = []; } // 首屏/切换/回滚后：清空后全量重放
   // 清 DOM 后流式句柄一并失效，避免继续写入已移除的气泡
-  streamSid = streamCard = streamThink = streamThinkBody = streamBody = streamStats = null;
+  streamSid = streamCard = streamBody = streamStats = null;
   es = new EventSource(`/api/events?session=${encodeURIComponent(session)}&after=${after}`);
   es.onopen = () => { connEl.classList.add("live"); setStatus(""); };
   es.onerror = () => { connEl.classList.remove("live"); setStatus("连接断开，重连中…"); connect(lastAfter); }; // 增量续传，不清空
@@ -604,16 +694,58 @@ function connect(after) {
 }
 connect();
 
-async function send() {
-  const text = input.value.trim();
+// ── R3 附件：待发托盘（FileReader → base64；与 host 校验口径一致：≤4 个、单个 ≤2MB）──
+const ATT_MAX_COUNT = 4, ATT_MAX_BYTES = 2000000;
+let pendingAtts = [];
+const EXT_MIME = { md: "text/plain", markdown: "text/plain", txt: "text/plain", log: "text/plain",
+  py: "text/x-python", js: "text/javascript", ts: "text/typescript", tsx: "text/typescript",
+  rs: "text/x-rust", go: "text/x-go", java: "text/x-java", c: "text/x-c", cpp: "text/x-c", h: "text/x-c",
+  json: "application/json", toml: "text/plain", yaml: "text/plain", yml: "text/plain",
+  xml: "text/xml", html: "text/html", css: "text/css", sql: "text/plain", sh: "text/x-sh", csv: "text/csv" };
+
+$("attach").onclick = () => $("file").click();
+$("file").onchange = async (e) => { for (const f of e.target.files) await addAttach(f); e.target.value = ""; };
+input.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files ?? [])];
+  if (files.length) { e.preventDefault(); files.forEach(addAttach); }
+});
+
+function addAttach(f) {
+  return new Promise((done) => {
+    if (pendingAtts.length >= ATT_MAX_COUNT) { setStatus(`附件最多 ${ATT_MAX_COUNT} 个`); return done(); }
+    if (f.size > ATT_MAX_BYTES) { setStatus(`附件 ${f.name} 超过 2MB 上限`); return done(); }
+    const mime = f.type || EXT_MIME[String(f.name.split(".").pop() || "").toLowerCase()] || "application/octet-stream";
+    const r = new FileReader();
+    r.onload = () => {
+      pendingAtts.push({ name: f.name, mime, data_b64: String(r.result).split(",")[1] || "" });
+      renderAtts(); done();
+    };
+    r.onerror = () => { setStatus(`读取 ${f.name} 失败`); done(); };
+    r.readAsDataURL(f);
+  });
+}
+function renderAtts() {
+  const box = $("atts");
+  box.innerHTML = ""; box.hidden = !pendingAtts.length;
+  pendingAtts.forEach((a, i) => {
+    const item = el(`<div class="att">${a.mime.startsWith("image/") ? `<img alt="" src="data:${esc(a.mime)};base64,${a.data_b64}">` : ""}<span>${esc(a.name)}</span><span class="rm" title="移除">×</span></div>`);
+    item.querySelector(".rm").onclick = () => { pendingAtts.splice(i, 1); renderAtts(); };
+    box.appendChild(item);
+  });
+}
+
+async function send(presetText, presetAtts) {
+  const text = (presetText ?? input.value).trim();
   if (!text) return;
-  input.value = ""; input.style.height = "48px";
+  // 附件：手动发送取托盘待发件；重新生成用 trace 留存的原始附件
+  const atts = presetAtts ? presetAtts : pendingAtts.splice(0);
+  if (presetText === undefined) { input.value = ""; input.style.height = "48px"; renderAtts(); }
   sendBtn.disabled = true; stopBtn.hidden = false; setStatus("思考中…");
   touchSession(session);
   try {
     const r = await fetch("/api/chat", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ session_id: session, message: text }),
+      body: JSON.stringify({ session_id: session, message: text, ...(atts.length ? { attachments: atts } : {}) }),
     });
     const v = await r.json();
     if (!v.ok) setStatus("失败: " + (v.error?.message ?? r.status));
@@ -621,7 +753,19 @@ async function send() {
   } catch (e) { setStatus("请求失败: " + e); }
   finally { sendBtn.disabled = false; stopBtn.hidden = true; input.focus(); }
 }
-sendBtn.onclick = send;
+sendBtn.onclick = () => send();
+
+// R2 回滚：物理截断到第 idx 条 user 消息之前（该问题及其后全部删除，memory 消息与
+// trace 事件同源截断）。resend=true 为「重新生成」：截掉该问题后立即重发原文+附件。
+async function rollbackTo(idx, resend, ut) {
+  if (sendBtn.disabled) { setStatus("对话进行中，请先停止或等待完成"); return; }
+  if (!confirm(resend ? "回滚本问题并重新生成回答？" : "回滚到该问题之前？（该问题及其后的对话将被删除）")) return;
+  try {
+    await api("POST", "/api/chat/rollback", { session_id: session, upto_user_index: idx });
+  } catch (e) { setStatus("回滚失败: " + e.message); return; }
+  connect(0); // 全量重放截断后的历史（重置 SSE 游标）
+  if (resend && ut) send(ut.text, ut.atts || []);
+}
 
 // P2/T1 停止：发送期间可见。置位取消信号（agent-loop 在轮次边界收敛为 K499），
 // 与发送互斥——stopBtn 仅在 sendBtn.disabled 时出现。
@@ -671,6 +815,7 @@ async function api(method, url, body) {
 let cfgTools = [];
 async function loadConfig() {
   try {
+    await loadPresets(); // 站点清单就绪后再回显，base_url 反查预设
     const c = (await api("GET", "/api/config")).config;
     $("llm-provider").value = c.llm.provider;
     const model = c.llm.model ?? "";
@@ -685,6 +830,7 @@ async function loadConfig() {
     $("llm-base").value = isOllama ? (c.llm.ollama_host ?? "localhost:11434") : (c.llm.base_url ?? "");
     $("llm-key").value = "";
     $("llm-key").placeholder = c.llm.key?.key_set ? `已设置（尾号 ${c.llm.key.key_tail}，留空不修改）` : "未设置";
+    if (sitePresets.length && c.llm.provider === "openai") { $("llm-site").value = curSiteId(); updateSiteLink(curSiteId()); }
     cfgTools = c.tools ?? [];
     syncLlmFields();
     const a = c.agent ?? {};
@@ -705,20 +851,27 @@ function curModelName() {
   const msel = $("llm-model");
   return msel.value === "__custom__" ? $("llm-model-custom").value.trim() : msel.value;
 }
-// Agent 页 llm_context_tokens 的原生窗口提示 + 「填入原生值」
+// Agent 页 llm_context_tokens 提示 + 「填入原生值」（L7：按 provider 联动——仅本地窗口型生效）
 function updateCtxHint() {
   const hit = modelsMeta.find((m) => m.name === curModelName() && m.ctx_limit);
   const hint = $("ctx-hint"), fill = $("ctx-fill");
+  const p = $("llm-provider").value;
+  if (p !== "ollama") {
+    // 云端 API：窗口由服务端管理，token 闸与 num_ctx 均不生效（值保留，切回本地部署自动恢复）
+    hint.textContent = p === "openai" || p === "anthropic"
+      ? `当前 provider（${p}）为云端 API：窗口由服务端管理，此设置不生效（切回本地部署时自动恢复作用）`
+      : "此设置仅本地窗口型 provider（ollama 等）生效";
+    fill.hidden = true;
+    return;
+  }
   if (hit) {
-    hint.textContent = `当前模型原生窗口 ${fmtCtx(hit.ctx_limit)} tokens`;
+    hint.textContent = `当前模型原生窗口 ${fmtCtx(hit.ctx_limit)} tokens（为速度可调小；原生值仅参考，非必填）`;
     fill.hidden = false;
   } else if (modelsMeta.length) {
-    hint.textContent = "未探测到该模型的原生窗口（自定义模型或响应缺失）";
+    hint.textContent = "未探测到该模型的原生窗口（自定义模型或响应缺失）；为速度可调小";
     fill.hidden = true;
   } else {
-    hint.textContent = $("llm-provider").value === "ollama"
-      ? "原生窗口：未拉取模型列表（LLM 页「拉取模型」后可用）"
-      : "原生窗口探测仅 ollama 支持；其余 provider 请按官方文档填写";
+    hint.textContent = "原生窗口：未拉取模型列表（LLM 页「拉取模型」后可用）；为速度可调小";
     fill.hidden = true;
   }
 }
@@ -774,11 +927,55 @@ function syncModelField() {
 $("llm-model").addEventListener("change", () => { syncModelField(); updateCtxHint(); });
 $("llm-model-custom").addEventListener("input", updateCtxHint);
 $("llm-provider").addEventListener("change", syncLlmFields);
+// L6 站点预设：一键切换 OpenAI 兼容站点（数据源 /api/presets → presets.py；保存 = configure 热应用，零重启）
+let sitePresets = [];
+async function loadPresets() {
+  if (sitePresets.length) return;
+  try {
+    const v = await api("GET", "/api/presets");
+    if (v && v.ok && Array.isArray(v.presets) && v.presets.length) {
+      sitePresets = v.presets;
+      const sel = $("llm-site");
+      sel.innerHTML = "";
+      for (const p of sitePresets) {
+        const o = document.createElement("option");
+        o.value = p.id; o.textContent = p.base_url ? p.name : `${p.name}（手填 base_url）`;
+        sel.appendChild(o);
+      }
+    }
+  } catch (e) { /* 软依赖：拉不到则站点栏留空不阻塞 */ }
+}
+function siteById(id) { return sitePresets.find((p) => p.id === id); }
+function curSiteId() {
+  const base = $("llm-base").value.trim().replace(/\/+$/, "");
+  const hit = sitePresets.find((p) => p.base_url && p.base_url.replace(/\/+$/, "") === base);
+  return hit ? hit.id : (sitePresets.length ? "custom" : "");
+}
+function applySite(id) {
+  const p = siteById(id);
+  if (!p) { $("llm-site-key-url").hidden = true; return; }
+  if (p.base_url) {
+    $("llm-base").value = p.base_url;
+    const saved = localStorage.getItem("react-agent:llmkey:" + p.id) || "";
+    $("llm-key").value = saved;
+    $("llm-key").placeholder = saved ? `已记忆该站点 key（尾号 ${saved.slice(-4)}，可覆盖）` : "未保存过该站点 key";
+  } else {
+    $("llm-base").value = ""; $("llm-key").value = "";
+    $("llm-key").placeholder = "输入该站点 api_key";
+  }
+  updateSiteLink(id);
+}
+function updateSiteLink(id) {
+  const p = siteById(id), link = $("llm-site-key-url");
+  if (p && p.key_url) { link.href = p.key_url; link.hidden = false; } else link.hidden = true;
+}
+$("llm-site").addEventListener("change", () => applySite($("llm-site").value));
 function syncLlmFields() {
   const p = $("llm-provider").value;
   const baseWrap = $("llm-base").closest(".field");
   const baseLabel = baseWrap.querySelector("label");
   const keyWrap = $("llm-key").closest(".field");
+  const siteWrap = $("llm-site-field");
   if (p === "ollama") {
     baseLabel.textContent = "ollama 地址";
     $("llm-base").placeholder = "localhost:11434";
@@ -786,14 +983,17 @@ function syncLlmFields() {
     if (!bv || /api\.(openai|anthropic|deepseek)\.com/.test(bv)) $("llm-base").value = "localhost:11434";
     keyWrap.style.display = "none";
     baseWrap.style.display = "";
+    siteWrap.style.display = "none";
   } else if (p === "mock") {
     baseWrap.style.display = "none";
     keyWrap.style.display = "none";
+    siteWrap.style.display = "none";
   } else {
     baseLabel.textContent = "base_url";
     $("llm-base").placeholder = p === "anthropic" ? "https://api.anthropic.com" : "https://api.deepseek.com/v1";
     baseWrap.style.display = "";
     keyWrap.style.display = "";
+    siteWrap.style.display = p === "openai" ? "" : "none"; // 站点预设仅 OpenAI 兼容族
   }
 }
 $("llm-save").onclick = async () => {
@@ -804,6 +1004,11 @@ $("llm-save").onclick = async () => {
   if (key) body.llm.api_key = key;
   try {
     await api("PUT", "/api/config", body);
+    // per-site key 记忆：按站点 id 存 localStorage（custom 不记，base_url 不定）；config.json 只落当前生效站
+    if (key && $("llm-provider").value === "openai") {
+      const sid = $("llm-site").value;
+      if (sid && sid !== "custom") localStorage.setItem("react-agent:llmkey:" + sid, key);
+    }
     flash("llm-flash", true, "已保存并热生效");
     loadConfig();
     fetchModels();

@@ -197,8 +197,10 @@ async fn assets(kernel: &Kernel, payload: Value) -> Option<Value> {
 /// 路由：
 ///   GET  /                      → 单页（web-dist/index.html，运行时读取，改样式刷新即生效）
 ///   GET  /api/events?session=&after= → SSE：增量轮询 memory trace.read，逐事件推送
-///   POST /api/chat              → {"session_id","message"} → agent.chat（阻塞到收敛）
-///   POST /api/chat/cancel?session= → agent-loop cancel op（置位取消标志，立即返回）
+///   POST /api/chat              → {"session_id","message","attachments"?} → agent.chat（阻塞到收敛）
+///   POST /api/chat/cancel?session= → agent-loop cancel + llm-adapter abort（取消，立即返回）
+///   POST /api/chat/rollback     → {"session_id","upto_user_index"} → memory rollback（R2 回滚）
+///   GET  /api/presets           → llm-adapter presets.list（OpenAI 兼容站点预设清单）
 pub struct WebFrontend {
     addr: String,
 }
@@ -346,6 +348,7 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
         ("GET", "/api/events") => sse_events(stream, kernel, query).await,
         ("GET", "/api/config") => get_config(&mut stream, &kernel).await,
         ("GET", "/api/models") => get_models(&mut stream, &kernel, query).await,
+        ("GET", "/api/presets") => get_presets(&mut stream, &kernel).await,
         ("PUT", "/api/config") => put_config(&mut stream, &kernel, &body).await,
         ("GET", "/api/skills") => get_skills(&mut stream, &kernel).await,
         ("GET", r) if r.starts_with("/api/skills/") => {
@@ -360,19 +363,60 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
         ("POST", "/api/chat/cancel") => {
             // P2/T1：取消运行中的 chat。转发 agent-loop `cancel` op（置位取消标志，
             // 循环在轮次边界收敛为 K499）。不等待 chat 结束，立即返回。
+            // R1 补强：并行向 llm-adapter dispatch `abort`——流式生成逐帧检查命中即关流，
+            // 单轮长生成无需等轮次边界（llm-adapter 已为 Concurrent 语义，可即时受理）。
             let session = parse_query(query).get("session").cloned().unwrap_or_default();
             if session.is_empty() {
                 return json_resp(&mut stream, 400, bad_request("缺 session 参数", Some("session"))).await;
             }
             match dispatch_or_err(&kernel, "agent-loop", json!({"op": "cancel", "session_id": session})).await {
                 Ok(_) => {
+                    if let Err(e) =
+                        dispatch_or_err(&kernel, "llm-adapter", json!({"op": "abort", "session_id": session})).await
+                    {
+                        tracing::warn!(session = %session, "llm-adapter abort dispatch failed（轮次边界取消仍有效）: {e}");
+                    }
                     json_resp(
                         &mut stream,
                         200,
-                        json!({"ok": true, "session_id": session, "note": "取消信号已置位；当前轮完成后中断"}),
+                        json!({"ok": true, "session_id": session, "note": "取消信号已置位；流式生成中断或轮次边界收敛"}),
                     )
                     .await
                 }
+                Err(e) => json_resp(&mut stream, 502, e).await,
+            }
+        }
+        ("POST", "/api/chat/rollback") => {
+            // R2 回滚：按「第 N 条 user 消息」（0 基）截断——memory 插件原子回滚
+            // 会话消息（LLM 上下文）与 trace 事件日志（UI 重放），二者同源对齐。
+            let req: Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(
+                        &mut stream,
+                        400,
+                        "application/json; charset=utf-8",
+                        json!({"ok": false, "error": {"code": "K400", "message": format!("body 非法 JSON: {e}")}})
+                            .to_string()
+                            .as_bytes(),
+                    )
+                    .await
+                }
+            };
+            let Some(session) = req.get("session_id").and_then(Value::as_str) else {
+                return json_resp(&mut stream, 400, bad_request("缺 session_id", Some("session_id"))).await;
+            };
+            let Some(idx) = req.get("upto_user_index").and_then(Value::as_u64) else {
+                return json_resp(&mut stream, 400, bad_request("缺 upto_user_index", Some("upto_user_index"))).await;
+            };
+            match dispatch_or_err(
+                &kernel,
+                "memory",
+                json!({"op": "rollback", "session_id": session, "upto_user_index": idx}),
+            )
+            .await
+            {
+                Ok(v) => json_resp(&mut stream, 200, v).await,
                 Err(e) => json_resp(&mut stream, 502, e).await,
             }
         }
@@ -413,11 +457,20 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
                 )
                 .await;
             };
+            // R3 附件（可选）：[{name, mime, data_b64}]——校验形状与体量上限后透传
+            // agent-loop（构造多模态 user 消息）。非法/超限 = 确定性 K400，不静默丢弃。
+            let mut chat_payload = json!({"op": "chat", "session_id": session, "user_text": message});
+            if let Some(att) = req.get("attachments") {
+                match validate_attachments(att) {
+                    Ok(Some(list)) => {
+                        chat_payload["attachments"] = list;
+                    }
+                    Ok(None) => {}
+                    Err(e) => return json_resp(&mut stream, 400, e).await,
+                }
+            }
             let resp = kernel
-                .dispatch(Envelope::new(
-                    PluginId::new("agent-loop"),
-                    json!({"op": "chat", "session_id": session, "user_text": message}),
-                ))
+                .dispatch(Envelope::new(PluginId::new("agent-loop"), chat_payload))
                 .await
                 .unwrap_or_else(|e| json!({"ok": false, "error": {"code": "K500", "message": e.to_string()}}));
             respond(
@@ -443,6 +496,18 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
 }
 
 // ── 配置中心与技能 CRUD（08 §2.2）──
+
+/// GET /api/presets：转发 llm-adapter `presets.list`（OpenAI 兼容站点预设清单，
+/// 数据源 plugins/llm_adapter/presets.py——切换站点 = configure 热应用，零重启）。
+async fn get_presets(stream: &mut TcpStream, kernel: &Kernel) -> anyhow::Result<()> {
+    match dispatch_or_err(kernel, "llm-adapter", json!({"op": "presets.list"})).await {
+        Ok(v) => {
+            let presets = v.get("presets").cloned().unwrap_or_else(|| json!([]));
+            json_resp(stream, 200, json!({ "ok": true, "presets": presets })).await
+        }
+        Err(e) => json_resp(stream, 502, e).await,
+    }
+}
 
 /// GET /api/models：转发 llm-adapter `models.list`，返回该 provider 当前可用模型 id 列表
 /// （openai/deepseek 走 `/v1/models`；ollama 走 `/api/tags` + 逐模型 `/api/show` 探测原生窗口；
@@ -477,6 +542,72 @@ fn bad_request(msg: impl Into<String>, field: Option<&str>) -> Value {
         error["field"] = json!(f);
     }
     json!({"ok": false, "error": error})
+}
+
+/// R3 附件上限（系统边界校验）：条数与单体 base64 体量。
+/// 2MB 原始 ≈ 2.8MB base64 字符；图片直接进 LLM，文本文件由 agent-loop 截断后拼入。
+const ATTACH_MAX_COUNT: usize = 4;
+const ATTACH_MAX_B64_CHARS: usize = 2_800_000;
+
+/// R3 附件校验：`[{name,mime,data_b64}]` 形状 + 条数/体量上限。
+/// 返回 `Ok(None)` = 未携带/空数组（不带 attachments 键透传）；
+/// `Ok(Some(list))` = 规整后的附件数组；`Err` = 确定性 K400 payload。
+/// 注意：200 字符上限只约束 name/mime 元数据字段；data_b64 走 2MB 体量闸
+/// （b64 ≤ `ATTACH_MAX_B64_CHARS`），两者不可混用。
+fn validate_attachments(v: &Value) -> Result<Option<Value>, Value> {
+    let Some(arr) = v.as_array() else {
+        return Err(bad_request("attachments 必须是数组", Some("attachments")));
+    };
+    if arr.is_empty() {
+        return Ok(None);
+    }
+    if arr.len() > ATTACH_MAX_COUNT {
+        return Err(bad_request(
+            format!("附件最多 {} 个", ATTACH_MAX_COUNT),
+            Some("attachments"),
+        ));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let Some(obj) = item.as_object() else {
+            return Err(bad_request(format!("attachments[{i}] 必须是对象"), Some("attachments")));
+        };
+        // 元数据字段：非空字符串 ≤200 字符
+        let mut meta = Vec::with_capacity(2);
+        for key in ["name", "mime"] {
+            match obj.get(key).and_then(Value::as_str).map(str::trim) {
+                Some(s) if !s.is_empty() && s.len() <= 200 => meta.push(s.to_string()),
+                Some(_) => {
+                    return Err(bad_request(
+                        format!("attachments[{i}].{key} 过长（>200 字符）"),
+                        Some("attachments"),
+                    ))
+                }
+                None => {
+                    return Err(bad_request(
+                        format!("attachments[{i}].{key} 缺失或非空字符串"),
+                        Some("attachments"),
+                    ))
+                }
+            }
+        }
+        // 数据字段：非空，≤ 2MB 体量闸（b64 字符数）
+        let data = obj.get("data_b64").and_then(Value::as_str).unwrap_or("").trim();
+        if data.is_empty() {
+            return Err(bad_request(
+                format!("attachments[{i}].data_b64 缺失或非空字符串"),
+                Some("attachments"),
+            ));
+        }
+        if data.len() > ATTACH_MAX_B64_CHARS {
+            return Err(bad_request(
+                format!("attachments[{i}] 超过 2MB 上限"),
+                Some("attachments"),
+            ));
+        }
+        out.push(json!({"name": meta[0], "mime": meta[1], "data_b64": data}));
+    }
+    Ok(Some(Value::Array(out)))
 }
 
 /// agent 段数值键（P5/E1）：非法值（非数字）直接 400，防垃圾配置静默失效。
@@ -1087,5 +1218,37 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    #[test]
+    fn validate_attachments_shapes_and_limits() {
+        // R3：未携带（非数组）→ K400；空数组 → Ok(None)（不透传 attachments 键）
+        assert!(validate_attachments(&serde_json::json!("x")).is_err());
+        assert!(validate_attachments(&serde_json::json!([])).unwrap().is_none());
+
+        // 合法单附件 → 规整透传
+        let ok = serde_json::json!([{"name": "a.png", "mime": "image/png", "data_b64": "QUJD"}]);
+        let v = validate_attachments(&ok).unwrap().expect("some");
+        assert_eq!(v[0]["name"], "a.png");
+
+        // data_b64 不受 200 字符元数据上限约束：200 字符 ~ 2.8M 之间合法（真实文件体量）
+        let mid = serde_json::json!([{"name": "a.txt", "mime": "text/plain", "data_b64": "Q".repeat(300_000)}]);
+        assert!(validate_attachments(&mid).is_ok(), "中等体量附件必须合法");
+
+        // 形状错误：元素非对象 / 缺字段 / 空串
+        assert!(validate_attachments(&serde_json::json!(["x"])).is_err());
+        assert!(validate_attachments(&serde_json::json!([{"name": "a", "mime": "image/png"}])).is_err());
+        assert!(validate_attachments(
+            &serde_json::json!([{"name": "a", "mime": "image/png", "data_b64": ""}])
+        )
+        .is_err());
+
+        // 条数超限（> 4）
+        let item = serde_json::json!({"name": "a", "mime": "text/plain", "data_b64": "x"});
+        assert!(validate_attachments(&serde_json::Value::Array(vec![item; 5])).is_err());
+
+        // 体量超限（b64 > 2_800_000 字符）
+        let big = serde_json::json!([{"name": "a", "mime": "text/plain", "data_b64": "A".repeat(2_800_001)}]);
+        assert!(validate_attachments(&big).is_err());
     }
 }

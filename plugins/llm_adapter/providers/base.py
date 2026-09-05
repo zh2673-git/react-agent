@@ -26,7 +26,70 @@
 import json
 import os
 import re
+import threading
 import time
+
+
+# ── 取消（R1 停止失效修复）──────────────────────────────────────────────
+# host cancel 端点在 agent-loop cancel（轮次边界收敛）之外，向本插件并行 dispatch
+# `abort` op——流式循环每帧检查命中即关流返回 K499，单轮长生成无需等轮次边界。
+# 进程级注册表：session_id → 取消请求时间戳(ms)。线程安全由 _ABORTS_LOCK 保证。
+#
+# 时间戳语义（误伤防护）：流式开始时记录 start_ts，仅「时间戳 >= start_ts」的取消
+# 命中——取消早于本轮流式开始属陈旧信号（轮次边界检查已覆盖），流式启动时消费掉、
+# 不中断本轮。命中即消费，防残留误杀同会话下轮对话。
+_ABORTS: dict[str, int] = {}
+_ABORTS_LOCK = threading.Lock()
+
+# sid 形如 "{session_id}-r{round}"（agent-loop chat_run 逐轮编号）。
+# 贪婪取最后一次 "-r<数字>" 前缀，session_id 自身含 "-r<数字>" 时仍还原正确。
+_SID_RE = re.compile(r"^(.*)-r\d+$")
+
+
+def sid_session(sid: str | None) -> str | None:
+    """流式 sid → 会话 id；无法解析（无 sid/无 -r 后缀）返回 None（不参与取消检查）。"""
+    if not sid or not isinstance(sid, str):
+        return None
+    m = _SID_RE.match(sid)
+    return m.group(1) if m else None
+
+
+def request_abort(session_id: str) -> None:
+    """置位取消（llm_plugin abort op 入口；重复置位刷新时间戳）。"""
+    with _ABORTS_LOCK:
+        _ABORTS[session_id] = int(time.time() * 1000)
+
+
+def stream_checkpoint(sid: str | None) -> int:
+    """流式启动检查点：记录本轮 start_ts 并消费陈旧取消信号（早于本轮开始的
+    取消属上一轮遗留——轮次边界检查已覆盖，不得误杀本轮），返回 start_ts 供
+    逐帧 `abort_requested(sid, start_ts)` 对位。"""
+    start_ts = int(time.time() * 1000)
+    session = sid_session(sid)
+    if session is not None:
+        with _ABORTS_LOCK:
+            ts = _ABORTS.get(session)
+            if ts is not None and ts < start_ts:
+                _ABORTS.pop(session, None)
+    return start_ts
+
+
+def abort_requested(sid: str | None, start_ts: int) -> bool:
+    """流式循环逐帧调用：本会话存在「晚于本轮开始」的取消请求 → True（调用方应立即关流收敛）。"""
+    session = sid_session(sid)
+    if session is None:
+        return False
+    with _ABORTS_LOCK:
+        ts = _ABORTS.get(session)
+        return ts is not None and ts >= start_ts
+
+
+def consume_abort(sid: str | None) -> None:
+    """命中取消后消费信号（防残留误杀同会话后续对话）。"""
+    session = sid_session(sid)
+    if session is not None:
+        with _ABORTS_LOCK:
+            _ABORTS.pop(session, None)
 
 
 def err(message: str, code: str = "LLM_ERROR") -> dict:

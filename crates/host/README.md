@@ -33,7 +33,7 @@ react-agent 的运行时：拉起全部 guest 插件、暴露 Web UI 与 SSE、�
 ## Web 与 SSE
 
 - 静态根：`crates/host/web-dist/`（运行时 serve，非编译内嵌——改 HTML 刷新即生效）。
-- `/api/*`：配置读写、会话、技能 CRUD 等（见 `frontend.rs`）。
+- `/api/*`：配置读写、会话、技能 CRUD、chat（含 R3 attachments 透传校验）/ cancel（R1 双通道）/ rollback（R2 回滚转发）等（见 `frontend.rs`；API 表见根 README）。
 - `/api/events`（SSE）：`sse_events` 每 50~300ms（流式进行中）/ 300ms（空闲）轮询一次：
   - `memory.session.trace.read`（`after` 游标推进）→ 转成 `trace_*` 事件；
   - `.stream/<session>.jsonl` 旁路 → 转成 `stream_*` 事件（`start` / `delta` / `end` / `error`，
@@ -70,8 +70,10 @@ react-agent 的运行时：拉起全部 guest 插件、暴露 Web UI 与 SSE、�
 
 ## 已知限制
 
-- **运行中断（停止）**：已支持（P2/T1）。`POST /api/chat/cancel?session=` 转发 agent-loop `cancel` op
-  （置位取消标志，立即返回）；前端发送期间显示「停止」按钮；循环在轮次边界命中即以 K499 收敛
-  （半轮不中断——进行中的 LLM 流式与工具执行照常完成）。详见 agent-loop README「运行中断（停止）」。
+- **运行中断（停止）**：已支持（P2/T1 + R1 补强）。`POST /api/chat/cancel?session=` 并行双通道：
+  转发 agent-loop `cancel` op（轮次边界 K499 收敛）+ dispatch llm-adapter `abort` op（流式循环逐帧
+  检查命中即关流，**单轮长生成可即时中断**；llm-adapter 已为 Concurrent 语义可即时受理，abort
+  dispatch 失败仅 warn 降级——轮次边界取消仍有效）。前端发送期间显示「停止」按钮。详见
+  agent-loop README「运行中断（停止）」与 llm_adapter README「abort」。
 - **sid 跨对话不保证唯一**：同 round 的不同对话回合 sid 相同，重连去重（`doneSids`）可能误忽略后一回合的
   流式动画（直接显示最终答案）。属已知退化，不影响最终内容完整性。

@@ -23,7 +23,17 @@ import json
 import os
 import time
 
-from .base import StreamSink, as_object, err, err_from_resp, norm, require_httpx
+from .base import (
+    StreamSink,
+    abort_requested,
+    as_object,
+    consume_abort,
+    err,
+    err_from_resp,
+    norm,
+    require_httpx,
+    stream_checkpoint,
+)
 from .openai_compat import _chat_with
 
 
@@ -48,6 +58,7 @@ def to_native_messages(msgs: list) -> list:
 
     tool 消息按 tool_name 对位：从配对 assistant 的 tool_calls 反查 id → name；
     反查不到（孤儿）置空串。assistant.tool_calls 的 arguments 归一化侧已是 object，直接放。
+    R3：图片附件 → `images` 数组（ollama 要求裸 base64，与 data_b64 约定一致）。
     """
     out: list = []
     id2name: dict = {}
@@ -67,7 +78,15 @@ def to_native_messages(msgs: list) -> list:
         elif role == "tool":
             out.append({"role": "tool", "content": m.get("content"), "tool_name": id2name.get(m.get("tool_call_id") or "", "")})
         else:
-            out.append({"role": role, "content": m.get("content")})
+            entry = {"role": role, "content": m.get("content")}
+            images = [
+                a["data_b64"]
+                for a in (m.get("attachments") or [])
+                if isinstance(a, dict) and a.get("data_b64")
+            ]
+            if images:
+                entry["images"] = images
+            out.append(entry)
     return out
 
 
@@ -157,6 +176,7 @@ def _native_stream_once(endpoint: dict, body: dict, sink: StreamSink, provider_l
     model = endpoint["model"]
     final_data: dict | None = None
     start = time.monotonic()
+    start_ts = stream_checkpoint(payload_sid := sink.sid)  # R1：流式启动检查点（消费陈旧取消信号）
     try:
         with httpx.stream("POST", endpoint["api_url"], json=body, headers=endpoint["headers"], timeout=120.0) as resp:
             if resp.status_code >= 400:
@@ -165,6 +185,12 @@ def _native_stream_once(endpoint: dict, body: dict, sink: StreamSink, provider_l
                 sink.error(payload["error"]["message"])
                 return payload
             for raw in resp.iter_lines():
+                # R1：逐帧取消检查——命中立即关流收敛（K499），不再消费剩余增量。
+                if abort_requested(payload_sid, start_ts):
+                    consume_abort(payload_sid)
+                    message = "已被用户取消"
+                    sink.error(message)
+                    return err(message, code="K499")
                 line = raw.strip() if isinstance(raw, str) else raw.decode("utf-8", "replace").strip()
                 if not line:
                     continue

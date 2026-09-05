@@ -39,6 +39,18 @@ pub struct MemoryMsg {
     /// role == "tool" 时必填（关联 assistant 的 tool_calls[].id）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// R3 多模态附件（仅图片；文本文件已在构造时拼入 content）：纯追加字段，
+    /// 旧 memory 数据 / 未升级 provider 读不到该键时行为不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<Attachment>>,
+}
+
+/// R3 附件（用户上传）：`data_b64` 为不含 `data:` 前缀的裸 base64。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    pub name: String,
+    pub mime: String,
+    pub data_b64: String,
 }
 
 // ---- agent-loop ------------------------------------------------------------
@@ -70,6 +82,9 @@ pub struct ChatReq {
     /// 剩余 token 预算（T4）：input+output 累计口径。继承语义同上。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_left: Option<u64>,
+    /// R3 用户附件（可选）：host 已做形状/条数/体量校验，此处仅透传。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<Attachment>>,
 }
 
 fn default_session() -> String {

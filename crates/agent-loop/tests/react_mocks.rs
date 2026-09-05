@@ -496,10 +496,10 @@ async fn system_prompt_env_overrides_builtin_and_history_limit_truncates() {
 
     // 预置 4 条历史
     let mem_state = Arc::new(Mutex::new(vec![
-        MemoryMsg { role: "user".into(), content: Some("old1".into()), tool_calls: None, tool_call_id: None },
-        MemoryMsg { role: "assistant".into(), content: Some("old2".into()), tool_calls: None, tool_call_id: None },
-        MemoryMsg { role: "user".into(), content: Some("old3".into()), tool_calls: None, tool_call_id: None },
-        MemoryMsg { role: "assistant".into(), content: Some("old4".into()), tool_calls: None, tool_call_id: None },
+        MemoryMsg { role: "user".into(), content: Some("old1".into()), tool_calls: None, tool_call_id: None, attachments: None },
+        MemoryMsg { role: "assistant".into(), content: Some("old2".into()), tool_calls: None, tool_call_id: None, attachments: None },
+        MemoryMsg { role: "user".into(), content: Some("old3".into()), tool_calls: None, tool_call_id: None, attachments: None },
+        MemoryMsg { role: "assistant".into(), content: Some("old4".into()), tool_calls: None, tool_call_id: None, attachments: None },
     ]));
     let captured = Arc::new(Mutex::new(Vec::<Vec<Value>>::new()));
     let llm_script = vec![json!({"ok": true, "content": "done", "tool_calls": [], "model": "mock", "finish_reason": "stop"})];
@@ -586,6 +586,7 @@ async fn history_limit_does_not_block_compaction() {
         content: Some(c.into()),
         tool_calls: None,
         tool_call_id: None,
+        attachments: None,
     };
     // 预置 6 条历史 > TRIGGER(4)：本轮 user 入库后共 7 条，压缩必应触发
     let mem_state = Arc::new(Mutex::new(vec![
@@ -1019,7 +1020,7 @@ async fn subagent_inherits_remaining_token_budget() {
 
 /// 预置 4 条 400 ASCII 字符的历史（估算 100 tokens/条）。
 fn big_history() -> Arc<Mutex<Vec<MemoryMsg>>> {
-    let mk = |role: &str, c: String| MemoryMsg { role: role.into(), content: Some(c), tool_calls: None, tool_call_id: None };
+    let mk = |role: &str, c: String| MemoryMsg { role: role.into(), content: Some(c), tool_calls: None, tool_call_id: None, attachments: None };
     let big = "x".repeat(400);
     Arc::new(Mutex::new(vec![
         mk("user", big.clone()),
@@ -1036,12 +1037,15 @@ async fn token_gate_triggers_compaction() {
     // 预算 301：压缩前历史估算 422 > 301 触发；压缩后工作集估算 ≈274 ≤ 301 不再收紧。
     let _env_guard = ENV_LOCK.lock().unwrap();
     let saved = [
+        // L7：窗口值仅本地窗口型 provider 生效——闸类测试一律预置 LLM_PROVIDER=ollama
+        ("LLM_PROVIDER", std::env::var("LLM_PROVIDER").ok()),
         ("LLM_CONTEXT_TOKENS", std::env::var("LLM_CONTEXT_TOKENS").ok()),
         ("COMPACT_TRIGGER", std::env::var("COMPACT_TRIGGER").ok()),
         ("COMPACT_KEEP", std::env::var("COMPACT_KEEP").ok()),
         ("HISTORY_LIMIT", std::env::var("HISTORY_LIMIT").ok()),
         ("AGENT_SYSTEM_PROMPT", std::env::var("AGENT_SYSTEM_PROMPT").ok()),
     ];
+    std::env::set_var("LLM_PROVIDER", "ollama");
     std::env::set_var("LLM_CONTEXT_TOKENS", "430");
     std::env::set_var("COMPACT_TRIGGER", "100"); // 条数闸不触发（5 条历史 ≪ 100）
     std::env::set_var("COMPACT_KEEP", "2");
@@ -1094,12 +1098,15 @@ async fn context_overflow_fails_before_request() {
     // → CONTEXT_OVERFLOW，正文请求不发出（修复前原样发出 → provider 400 杀死整轮）。
     let _env_guard = ENV_LOCK.lock().unwrap();
     let saved = [
+        // L7：窗口值仅本地窗口型 provider 生效——闸类测试一律预置 LLM_PROVIDER=ollama
+        ("LLM_PROVIDER", std::env::var("LLM_PROVIDER").ok()),
         ("LLM_CONTEXT_TOKENS", std::env::var("LLM_CONTEXT_TOKENS").ok()),
         ("COMPACT_TRIGGER", std::env::var("COMPACT_TRIGGER").ok()),
         ("AGENT_SYSTEM_PROMPT", std::env::var("AGENT_SYSTEM_PROMPT").ok()),
         ("HISTORY_LIMIT", std::env::var("HISTORY_LIMIT").ok()),
         ("TOOL_RESULT_LIMIT", std::env::var("TOOL_RESULT_LIMIT").ok()),
     ];
+    std::env::set_var("LLM_PROVIDER", "ollama");
     std::env::set_var("LLM_CONTEXT_TOKENS", "20"); // 预算 14：必然超限
     std::env::set_var("AGENT_SYSTEM_PROMPT", "SYS");
     std::env::remove_var("HISTORY_LIMIT");
@@ -1224,9 +1231,11 @@ async fn provider_overflow_converges_after_one_degrade_retry() {
 async fn num_ctx_passthrough_follows_context_window() {
     // L2+L3 回归：`LLM_CONTEXT_TOKENS` 语义升级为「上下文窗口」——>0 时 llm.chat payload
     // 携带平级字段 num_ctx（ollama native 映射 options.num_ctx，本地估算闸与服务端窗口对齐）；
-    // 0/缺省不携带（向后兼容，openai_compat/anthropic 忽略）。
+    // 0/缺省不携带（向后兼容）。L7：num_ctx 仅本地窗口型 provider 下发，故预置 ollama。
     let _env_guard = ENV_LOCK.lock().unwrap();
+    let saved_provider = std::env::var("LLM_PROVIDER").ok();
     let saved = std::env::var("LLM_CONTEXT_TOKENS").ok();
+    std::env::set_var("LLM_PROVIDER", "ollama");
 
     let ok = json!({"ok": true, "content": "hi", "tool_calls": [], "model": "mock", "finish_reason": "stop"});
     let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -1269,5 +1278,9 @@ async fn num_ctx_passthrough_follows_context_window() {
     match saved {
         Some(v) => std::env::set_var("LLM_CONTEXT_TOKENS", v),
         None => std::env::remove_var("LLM_CONTEXT_TOKENS"),
+    }
+    match saved_provider {
+        Some(v) => std::env::set_var("LLM_PROVIDER", v),
+        None => std::env::remove_var("LLM_PROVIDER"),
     }
 }

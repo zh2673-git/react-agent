@@ -7,6 +7,8 @@
   req:  {"op":"chat","provider"?:"openai"|"anthropic"|"ollama"|"mock","messages":[...],"tools"?:[...]}
   resp: {"ok":true,"content":str|null,"tool_calls":[{"id","name","arguments":object}],"model":str,
          "finish_reason":str} | {"ok":false,"error":{"code","message"}}
+  附加 op（R1 取消）：{"op":"abort","session_id":str} → {"ok":true,...} —— 置位取消信号，
+  各 provider 流式循环逐帧检查命中即关流返回 K499；仅流式（web 前端）可中断单轮生成。
 
 provider 按请求 payload["provider"] 覆盖，否则环境变量 LLM_PROVIDER（缺省 mock）。
 配置一律走环境变量：LLM_PROVIDER / LLM_MODEL / LLM_BASE_URL / OLLAMA_HOST /
@@ -42,8 +44,22 @@ class LlmAdapterPlugin:
         op = payload.get("op", "chat")
         if op == "configure":
             return self._configure(payload)
+        if op == "abort":
+            # R1 停止失效修复：host cancel 端点并行 dispatch（本插件 Concurrent 语义，
+            # 流式 chat 进行中即可受理）。置位后各 provider 流式循环逐帧检查命中。
+            from providers.base import request_abort
+
+            session = payload.get("session_id")
+            if not isinstance(session, str) or not session:
+                return _err("abort 需 session_id", code="K400")
+            request_abort(session)
+            return {"ok": True, "session_id": session, "note": "取消信号已置位；流式生成将中断"}
         if op == "models.list":
             return self._models_list(payload)
+        if op == "presets.list":
+            from presets import list_presets
+
+            return list_presets(payload)
         if op != "chat":
             return _err(f"unknown op: {op}", code="K400")
         name = payload.get("provider") or os.environ.get("LLM_PROVIDER", "mock")

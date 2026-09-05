@@ -33,6 +33,19 @@
 //   user 消息截没了）同归 CONTEXT_OVERFLOW；其余错误维持 LLM_ERROR 原文透传。
 // num_ctx：agent-loop 从 LLM_CONTEXT_TOKENS 下发（0/缺省不带，向后兼容）；仅 ollama native
 //   映射 options.num_ctx，openai_compat / anthropic 忽略（窗口由服务端模型决定）。
+// messages[].attachments（R3）：`[{name,mime,data_b64}]` 图片附件（文本文件已由 agent-loop
+//   内嵌进 content，不到达本层）。provider 按协议映射：openai_compat → content 数组
+//   image_url data URI；ollama native → `messages[].images=[裸b64]`；anthropic → content 块
+//   数组 base64 source。无附件保持纯字符串（不破坏既有请求形状）。模型本身不支持视觉时
+//   由服务端报错（本层原样归一化透传）。
+
+// abort（R1 取消；本插件为 Concurrent 语义，流式 chat 进行中可并发受理）
+{"op":"abort","session_id":str} → {"ok":true,"session_id","note"}
+// 置位进程级取消注册表（session_id → 时间戳）。流式循环逐帧 `abort_requested(sid, start_ts)`
+// 检查：命中即关流返回 K499「已被用户取消」。时间戳语义防误伤——仅「晚于本轮流式开始」的
+// 取消命中，陈旧信号由 `stream_checkpoint` 在流式启动时消费（轮次边界检查已覆盖）；命中即
+// `consume_abort` 消费，防残留误杀同会话下轮。非流式（anthropic 单发）不经过流式循环，
+// 取消由 agent-loop 轮次边界兜底。
 
 // configure（运行时热配置）
 {"op":"configure","provider"?,"model"?,"base_url"?,"api_key"?}
@@ -42,6 +55,12 @@
 {"op":"models.list","provider"?} → {"ok":true,"models":[str],"models_meta"?}
 // models_meta 为可选扩展（ollama 独有）：[{"name","ctx_limit"?}]，ctx_limit 来自 native
 // /api/show 的 <family>.context_length（模型原生上下文窗口），取不到省略键；其他 provider 不带。
+
+// presets.list（站点预设清单，L6）
+{"op":"presets.list"} → {"ok":true,"presets":[{"id","name","base_url","key_url"}]}
+// OpenAI 兼容站点预设（ModelScope / 硅基流动 / OpenRouter 等），数据源 presets.py（纯数据，
+// 非 provider pack）。前端「站点」下拉一键切换 = 选站填 base_url + per-site key（localStorage
+// 记忆）→ 保存走 configure 热应用，零重启。增改站点 = 改 presets.py 数据。
 ```
 
 ## 新增一个 provider（标准步骤）

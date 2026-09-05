@@ -8,7 +8,18 @@ import json
 import os
 import time
 
-from .base import StreamSink, as_object, err, err_from_resp, map_usage, norm, require_httpx
+from .base import (
+    StreamSink,
+    abort_requested,
+    as_object,
+    consume_abort,
+    err,
+    err_from_resp,
+    map_usage,
+    norm,
+    require_httpx,
+    stream_checkpoint,
+)
 
 
 def resolve_openai() -> dict:
@@ -21,7 +32,19 @@ def resolve_openai() -> dict:
 
 def to_openai_msg(m: dict) -> dict:
     role = m.get("role", "user")
-    out: dict = {"role": role, "content": m.get("content")}
+    content = m.get("content")
+    # R3 图片附件 → content 数组（image_url data URI）。文本附件由 agent-loop 内嵌进
+    # content，不在此处理。无附件保持纯字符串（不破坏既有请求形状）。
+    images = [a for a in (m.get("attachments") or []) if isinstance(a, dict) and a.get("data_b64")]
+    if images:
+        parts: list = [{"type": "text", "text": content or ""}]
+        parts += [
+            {"type": "image_url", "image_url": {"url": f"data:{a.get('mime', 'image/png')};base64,{a['data_b64']}"}}
+            for a in images
+        ]
+        out: dict = {"role": role, "content": parts}
+    else:
+        out = {"role": role, "content": content}
     if m.get("tool_calls"):
         out["tool_calls"] = [
             {
@@ -72,12 +95,16 @@ def _chat_once(endpoint: dict, body: dict, provider_label: str) -> dict:
     if resp.status_code >= 400:
         return err_from_resp(provider_label, resp.status_code, resp.text)
     data = resp.json()
-    msg = data["choices"][0]["message"]
+    # 200 异常态防护：部分网关（限流/瞬时故障）会在 200 里返回非 chat 形态（null / {"error":...}），
+    # 硬下标 choices 会崩成 'NoneType' object is not subscriptable——统一收敛为业务错误。
+    if not isinstance(data, dict) or not data.get("choices"):
+        return err(f"{provider_label} HTTP 200 响应缺少 choices（网关异常响应）: {json.dumps(data, ensure_ascii=False)[:300]}")
+    msg = data["choices"][0].get("message") or {}
     calls = [
         {"id": tc.get("id", ""), "name": tc["function"]["name"], "arguments": as_object(tc["function"].get("arguments"))}
         for tc in (msg.get("tool_calls") or [])
     ]
-    finish = data["choices"][0].get("finish_reason", "stop")
+    finish = data["choices"][0].get("finish_reason") or "stop"
     # 非流式思考通道：DeepSeek 官方返回 reasoning_content；部分网关仅在流式下给。
     reasoning = msg.get("reasoning_content") or msg.get("reasoning") or None
     return norm(
@@ -123,6 +150,7 @@ def _stream_once(endpoint: dict, body: dict, sink: StreamSink, provider_label: s
     model = endpoint["model"]
     usage_raw = None
     start = time.monotonic()
+    start_ts = stream_checkpoint(payload_sid := sink.sid)  # R1：流式启动检查点（消费陈旧取消信号）
     try:
         with httpx.stream(
             "POST",
@@ -141,6 +169,12 @@ def _stream_once(endpoint: dict, body: dict, sink: StreamSink, provider_label: s
                 sink.error(payload["error"]["message"])
                 return payload
             for raw in resp.iter_lines():
+                # R1：逐帧取消检查——命中立即关流收敛（K499），不再消费剩余增量。
+                if abort_requested(payload_sid, start_ts):
+                    consume_abort(payload_sid)
+                    message = "已被用户取消"
+                    sink.error(message)
+                    return err(message, code="K499")
                 line = raw.strip() if isinstance(raw, str) else raw.decode("utf-8", "replace").strip()
                 if not line:
                     continue

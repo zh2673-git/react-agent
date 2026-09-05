@@ -16,12 +16,24 @@
 //!
 //! 预算口径：`CTX_BUDGET = LLM_CONTEXT_TOKENS × 0.7`（预留输出与工具 schema 开销）；
 //! `LLM_CONTEXT_TOKENS=0`（缺省）= token 闸禁用，向后兼容（只按条数管理）。
+//! 适用范围（L7）：仅本地窗口型 provider（ollama 等显存受限、需以窗口换速度的部署形态）；
+//! 云端 API 不消费 num_ctx 且窗口由服务端管理，本闸一并禁用——避免为本地调小的窗口值
+//! 误压云端历史。非名单 provider 一律视同 0（禁用）。
 
 use crate::contract::MemoryMsg;
 use serde_json::{json, Value};
 
-/// LLM 上下文窗口（token）：`LLM_CONTEXT_TOKENS`；0/缺省 = token 闸禁用。
+/// 本地窗口型 provider 名单：会消费 `options.num_ctx` 的部署形态（显存受限，常需调小窗口换速度）。
+/// 扩展方式：新本地部署后端（llama.cpp server / vLLM / LM Studio 等）接入后在此加名即可。
+const LOCAL_WINDOW_PROVIDERS: [&str; 1] = ["ollama"];
+
+/// LLM 上下文窗口（token）：`LLM_CONTEXT_TOKENS`；仅本地窗口型 provider 生效，
+/// 其余 provider 返回 0（token 闸禁用 + 不下发 num_ctx）。0/缺省 = 禁用。
 pub fn context_window_tokens() -> usize {
+    let provider = std::env::var("LLM_PROVIDER").unwrap_or_default();
+    if !LOCAL_WINDOW_PROVIDERS.contains(&provider.as_str()) {
+        return 0;
+    }
     std::env::var("LLM_CONTEXT_TOKENS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
 }
 
@@ -182,6 +194,7 @@ mod tests {
                 content: Some("SYS".into()),
                 tool_calls: None,
                 tool_call_id: None,
+                attachments: None,
             },
             MemoryMsg {
                 role: "assistant".into(),
@@ -192,6 +205,7 @@ mod tests {
                     arguments: json!({"query": "测试"}), // {"query":"测试"} ≈ 9 narrow + 2 wide → 3+2=5
                 }]),
                 tool_call_id: None,
+                attachments: None,
             },
         ];
         // system: 1 + 4 = 5；assistant: 0 + 4 + 3 + 5+... 实参 JSON 串含结构字符
@@ -206,6 +220,7 @@ mod tests {
             content: Some(c.into()),
             tool_calls: None,
             tool_call_id: None,
+            attachments: None,
         };
         // [sys, u1, a1, t1, t2, user] → 保留尾半 2 条 + sys；t1/t2 的配对 assistant（a1）
         // 已被裁掉 → 前缘孤儿 tool 全部丢弃
@@ -217,5 +232,42 @@ mod tests {
         let out = halve_window(vec![m("system", "SYS"), m("user", "u1"), m("tool", "t1")]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].role, "system");
+    }
+
+    // L7 回归：窗口值仅本地窗口型 provider 生效（env 全局，测试串行化避免多线程互踩）
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn window_only_applies_to_local_window_providers() {
+        let _g = env_lock().lock().unwrap();
+        let (prov, tok) =
+            (std::env::var("LLM_PROVIDER").ok(), std::env::var("LLM_CONTEXT_TOKENS").ok());
+
+        std::env::set_var("LLM_PROVIDER", "openai");
+        std::env::set_var("LLM_CONTEXT_TOKENS", "8192");
+        assert_eq!(context_window_tokens(), 0, "云端 provider 不消费窗口：token 闸禁用");
+        assert_eq!(ctx_budget(), 0);
+
+        std::env::set_var("LLM_PROVIDER", "ollama");
+        assert_eq!(context_window_tokens(), 8192, "ollama 读窗口值");
+        assert_eq!(ctx_budget(), 5734); // 8192 × 0.7
+
+        std::env::set_var("LLM_CONTEXT_TOKENS", "0");
+        assert_eq!(context_window_tokens(), 0, "0=禁用（向后兼容）");
+
+        std::env::remove_var("LLM_CONTEXT_TOKENS");
+        assert_eq!(context_window_tokens(), 0, "缺省=禁用");
+
+        match prov {
+            Some(v) => std::env::set_var("LLM_PROVIDER", v),
+            None => std::env::remove_var("LLM_PROVIDER"),
+        }
+        match tok {
+            Some(v) => std::env::set_var("LLM_CONTEXT_TOKENS", v),
+            None => std::env::remove_var("LLM_CONTEXT_TOKENS"),
+        }
     }
 }

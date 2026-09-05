@@ -1,4 +1,4 @@
-﻿//! react-agent 宿主：装配内核 → spawn guest → 注册（memory → llm-adapter → tools → agent-loop，
+//! react-agent 宿主：装配内核 → spawn guest → 注册（memory → llm-adapter → tools → agent-loop，
 //! provider 先探测）→ 按 `REACT_FRONTEND` 装配前端（repl / web）。
 //!
 //! 用法：
@@ -73,7 +73,7 @@ async fn assemble(kernel: &Kernel, cfg: &HostConfig) -> anyhow::Result<()> {
     let mem = spawn::spawn_node_ts(
         node,
         &mem_script,
-        manifests::guest_manifest("memory", &["memory.session", "session.trace"]),
+        manifests::guest_manifest("memory", &["memory.session", "session.trace"], false),
         &[],
     )
     .await
@@ -86,10 +86,14 @@ async fn assemble(kernel: &Kernel, cfg: &HostConfig) -> anyhow::Result<()> {
         bail!("python 未找到（guest 需要 grpcio；pip install grpcio httpx）");
     };
     let llm_script = cfg.plugins_dir.join("llm_adapter").join("llm_plugin.py");
+    // R1：Concurrent——abort op 必须能在流式 chat 进行中被并发受理（Serial = 插件级锁
+    // 排队到 chat 结束后，取消永远迟到）。安全性：Python guest gRPC 4 线程池天然并发；
+    // provider 均为请求时读 env 的无状态实现，configure 与 chat 的 env 读写竞争良性
+    // （最坏一次请求用旧/新模型，无跨调用可变态）。
     let llm = spawn::spawn_python(
         py,
         &llm_script,
-        manifests::guest_manifest("llm-adapter", &["llm.chat"]),
+        manifests::guest_manifest("llm-adapter", &["llm.chat"], true),
         &cfg.llm_env(),
     )
     .await
@@ -111,7 +115,7 @@ async fn assemble(kernel: &Kernel, cfg: &HostConfig) -> anyhow::Result<()> {
     let tools = spawn::spawn_python(
         py,
         &tools_script,
-        manifests::guest_manifest("tools", &["tools.exec"]),
+        manifests::guest_manifest("tools", &["tools.exec"], false),
         &tools_env,
     )
     .await
@@ -126,7 +130,7 @@ async fn assemble(kernel: &Kernel, cfg: &HostConfig) -> anyhow::Result<()> {
     match spawn::spawn_python(
         py,
         &assets_script,
-        manifests::guest_manifest("assets", &["assets.registry"]),
+        manifests::guest_manifest("assets", &["assets.registry"], false),
         &assets_env,
     )
     .await

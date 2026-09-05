@@ -63,7 +63,7 @@ react-agent 的大脑：把"用户一句话"变成"多轮感知 → 规划 → �
 |---|---|---|---|
 | 单条 | `TOOL_RESULT_LIMIT` | 8000 字符（`0`=禁用） | 工具结果回喂前按字符截断，追加 `…[truncated]` 标记（模型可感知被裁剪）；**发生在入 memory 之前**——memory 即上下文来源，全文不入库 |
 | 跨会话 | `COMPACT_TRIGGER` / `COMPACT_KEEP` | 40 / 10 条（`0`=禁用） | chat 开局按**全量历史**判断：超 TRIGGER 则旧史交 LLM 摘要，经 `memory.summarize` 落盘（防撕裂在 memory 侧）；任何失败 → 降级不压缩 |
-| token 闸 | `LLM_CONTEXT_TOKENS` | `0`=禁用 | 模型上下文窗口（token）。发送预算 = 窗口 × 0.7（预留输出与工具 schema）；**压缩双闸之二**：估算工作集（CJK ≈ 1 token/字、其余 ≈ 4 字符/token，保守高估）超预算即触发压缩——单条大结果在条数闸之前就能撑爆窗口（PLAN R6）。窗口值还随 `llm.chat` payload 透传 `num_ctx`（ollama native 映射 `options.num_ctx`，本地估算闸与服务端窗口对齐；0/缺省不下发） |
+| token 闸 | `LLM_CONTEXT_TOKENS` | `0`=禁用 | 模型上下文窗口（token）。**仅本地窗口型 provider 生效**（`LOCAL_WINDOW_PROVIDERS` 名单：ollama——显存受限、常需调小窗口换速度；新本地后端接入后加名；云端 API 窗口由服务端管理，本闸禁用、`num_ctx` 不下发，避免为本地调小的窗口误压云端历史）。发送预算 = 窗口 × 0.7（预留输出与工具 schema）；**压缩双闸之二**：估算工作集（CJK ≈ 1 token/字、其余 ≈ 4 字符/token，保守高估）超预算即触发压缩——单条大结果在条数闸之前就能撑爆窗口（PLAN R6）。窗口值还随 `llm.chat` payload 透传 `num_ctx`（ollama native 映射 `options.num_ctx`，本地估算闸与服务端窗口对齐；0/缺省不下发）。注意：provider 取 host 启动时 env，Web 热切换 provider 后判定滞后、重启校正 |
 | 单次发送 | `HISTORY_LIMIT` | 无限制 | 只裁剪发给 LLM 的工作集（保留最近 N 条），**发生在压缩判断之后**——若截断在前，LIMIT < TRIGGER 时压缩永不触发（PLAN R3） |
 
 - 压缩那次 LLM 调用**不带流式旁路**（不是给用户看的产出）。
@@ -109,8 +109,11 @@ ReAct 主循环在**轮次边界**轮询取消标志（PLAN P2/T1），运行中
   发 `error`（where=cancel）事件并以 K499 收敛。语义为 **Concurrent**——Serial 会让 cancel dispatch
   在 per-plugin 锁后排队到 chat 结束之后（取消永远迟到）；`max_inflight=8` 预留 cancel 通道余量。
 - **残留防护**：chat 开局 + 结束双保险清理同 session 残留标志——取消晚到（chat 已收敛）不误杀下轮对话。
-- **host**：`POST /api/chat/cancel?session=` 转发 `cancel` op，立即返回（不等 chat 收敛）。
+- **host（R1 双通道）**：`POST /api/chat/cancel?session=` 转发 `cancel` op 的**同时**并行 dispatch
+  llm-adapter `abort` op（该插件 Concurrent 语义可即时受理）——流式生成逐帧检查命中即关流，
+  **单轮长生成无需等轮次边界**；abort dispatch 失败仅 warn 降级（轮次边界取消仍有效）。
 - **前端**：发送期间显示「停止」按钮（与发送互斥），点击发取消请求并以状态条反馈。
 
-**粒度边界**：取消生效于轮次边界，半轮不中断——进行中的 LLM 流式与工具执行照常完成，随后不再进入下一轮。
+**粒度边界**：轮次边界取消（K499）+ 流式逐帧中断（R1）双通道后，进行中的 LLM 流式可即时中断；
+工具执行不中断——照常完成，随后不再进入下一轮。
 同族停车检查还有总预算（时长/token，K508，见「核心循环」）。

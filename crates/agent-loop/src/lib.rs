@@ -22,7 +22,7 @@
 mod context;
 mod contract;
 
-pub use contract::{ChatReq, LlmChatResp, MemoryMsg, StepRecord, ToolCall, ToolSpec};
+pub use contract::{Attachment, ChatReq, LlmChatResp, MemoryMsg, StepRecord, ToolCall, ToolSpec};
 
 use agent_kernel_sdk::*;
 use async_trait::async_trait;
@@ -54,6 +54,11 @@ const ASSETS_DEADLINE: Duration = Duration::from_secs(5);
 /// 工具结果回喂上限（字符数，PLAN R2）：防止单条大结果撑爆上下文与 memory。
 /// 0 = 禁用截断。可用 `TOOL_RESULT_LIMIT` 覆盖。
 const DEFAULT_TOOL_RESULT_CHARS: usize = 8000;
+
+/// 文本附件内嵌上限（字符，R3）：文本文件不进结构化 attachments（仅图片多模态），
+/// 而是拼入 user content——一次内嵌、后续轮次随历史自然参与上下文。
+/// 单文件超限截断并显式标注（模型必须能感知内容不完整）。可用 `TEXT_ATTACH_LIMIT` 覆盖。
+const DEFAULT_TEXT_ATTACH_CHARS: usize = 24000;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a capable agent working in a workspace. \
 Answer the user's request. When tools are provided and useful, call them (one batch per round); \
@@ -233,6 +238,65 @@ fn truncate_chars(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     out.push_str(&format!("\n…[truncated, {total} chars total, showing first {max}]"));
     out
+}
+
+/// 文本附件内嵌上限（字符）：0 = 禁用截断。
+fn text_attach_limit() -> usize {
+    std::env::var("TEXT_ATTACH_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_TEXT_ATTACH_CHARS)
+}
+
+/// R3：把用户附件装配进 user 消息。
+///
+/// - 图片（mime 以 image/ 开头）→ 结构化 `attachments` 字段，由 llm-adapter 按
+///   provider 协议映射（OpenAI 兼容 image_url data URI / ollama native images 数组）；
+/// - 文本文件 → 直接拼入 content（一次内嵌，超限截断并标注）——provider 无需感知；
+/// - 其他二进制类型 → 不内嵌内容，content 中注明名称与类型（不静默丢弃）。
+fn build_user_msg(user_text: &str, attachments: Option<&[Attachment]>) -> MemoryMsg {
+    let Some(list) = attachments else {
+        return MemoryMsg {
+            role: "user".into(),
+            content: Some(user_text.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+        };
+    };
+    let limit = text_attach_limit();
+    let mut content = String::from(user_text);
+    let mut images: Vec<Attachment> = Vec::new();
+    for a in list {
+        if a.mime.starts_with("image/") {
+            images.push(a.clone());
+            continue;
+        }
+        if a.mime.starts_with("text/") || a.mime == "application/json" {
+            let decoded = base64_decode_utf8(&a.data_b64);
+            let body = truncate_chars(&decoded, limit);
+            content.push_str(&format!("\n\n[附件: {}]\n```\n{}\n```", a.name, body));
+            continue;
+        }
+        content.push_str(&format!("\n\n[附件: {}]（类型 {}，内容未内嵌）", a.name, a.mime));
+    }
+    MemoryMsg {
+        role: "user".into(),
+        content: Some(content),
+        tool_calls: None,
+        tool_call_id: None,
+        attachments: if images.is_empty() { None } else { Some(images) },
+    }
+}
+
+/// 裸 base64 → UTF-8 字符串（尽力而为：解码失败按原样透传，由模型侧感知）。
+fn base64_decode_utf8(b64: &str) -> String {
+    use base64::Engine as _;
+    let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+    match base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes()) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => b64.to_string(),
+    }
 }
 
 /// 感知窗口（PLAN R3）：HISTORY_LIMIT 只裁剪**发给 LLM 的工作集**，且必须发生在
@@ -424,6 +488,7 @@ impl AgentLoopPlugin {
             )),
             tool_calls: None,
             tool_call_id: None,
+            attachments: None,
         }
     }
 
@@ -474,7 +539,8 @@ impl AgentLoopPlugin {
         let (older, recent) = history.split_at(split);
         let older = older.to_vec();
 
-        // LLM 摘要旧史（不带工具）
+        // LLM 摘要旧史（不带工具）。R3：摘要输入剥离附件（图片 b64 对文本摘要模型
+        // 无意义且易撑爆压缩调用；文件要点已可从 content 内嵌文本获得）。
         let mut sum_msgs: Vec<MemoryMsg> = vec![MemoryMsg {
             role: "system".into(),
             content: Some(
@@ -484,13 +550,21 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             ),
             tool_calls: None,
             tool_call_id: None,
+            attachments: None,
         }];
-        sum_msgs.extend(older.iter().cloned());
+        sum_msgs.extend(older.iter().map(|m| MemoryMsg {
+            role: m.role.clone(),
+            content: m.content.clone(),
+            tool_calls: m.tool_calls.clone(),
+            tool_call_id: m.tool_call_id.clone(),
+            attachments: None,
+        }));
         sum_msgs.push(MemoryMsg {
             role: "user".into(),
             content: Some("Summarize the above history now.".into()),
             tool_calls: None,
             tool_call_id: None,
+            attachments: None,
         });
         // 压缩摘要不是用户可见输出 → 不走流式旁路；瞬态失败同样重试（T3）
         let summary = match self.plan_with_retry(src, session_id, &mut sum_msgs, None, None).await {
@@ -550,9 +624,12 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
         stream: Option<(&str, &str)>,
     ) -> Result<LlmChatResp, KernelError> {
         let mut payload = json!({"op": "chat", "messages": messages});
-        // L2+L3：`LLM_CONTEXT_TOKENS` 语义升级为「上下文窗口」——随 payload 透传 num_ctx，
-        // ollama native 映射 options.num_ctx（本地估算闸与服务端窗口对齐，一处配置两侧生效）；
-        // openai_compat/anthropic 忽略。0（禁用）/缺省不下发，向后兼容。
+        // L2+L3：`LLM_CONTEXT_TOKENS` 语义为「上下文窗口」——随 payload 透传 num_ctx，
+        // ollama native 映射 options.num_ctx（本地估算闸与服务端窗口对齐，一处配置两侧生效）。
+        // L7：仅本地窗口型 provider 生效（context::context_window_tokens 内部判定 LLM_PROVIDER，
+        // 云端 API / 非名单 provider 返回 0 = 不下发且 token 闸禁用——避免为本地调小的窗口
+        // 误压云端历史）。注意 provider 取自 host 启动时 env：Web 热切换 provider 后本判定
+        // 滞后，重启校正（provider 切换低频，可接受）。
         let window = context::context_window_tokens();
         if window > 0 {
             payload["num_ctx"] = json!(window);
@@ -819,15 +896,16 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
     }
 
     async fn chat_run(&self, env: &Envelope, req: &ChatReq) -> Value {
-        // 用户消息先入记忆（持久化），随后拉取全量历史
-        let user_msg = MemoryMsg {
-            role: "user".into(),
-            content: Some(req.user_text.clone()),
-            tool_calls: None,
-            tool_call_id: None,
-        };
+        // 用户消息先入记忆（持久化），随后拉取全量历史。
+        // R3：文本附件拼入 content，图片附件走结构化字段（llm-adapter 按 provider 映射）。
+        let user_msg = build_user_msg(&req.user_text, req.attachments.as_deref());
         self.observe(env, &req.session_id, &[user_msg.clone()]).await;
-        self.trace(env, &req.session_id, json!({"type": "user", "text": req.user_text})).await;
+        // trace 带全量原始附件（含文本 b64）：UI 重放展示缩略图/文件条，重新生成需原始 data_b64 重发
+        let mut user_event = json!({"type": "user", "text": req.user_text});
+        if let Some(att) = req.attachments.as_deref() {
+            user_event["attachments"] = json!(att);
+        }
+        self.trace(env, &req.session_id, user_event).await;
 
         // 系统提示词 = 组装链（07 §2.1）+ 技能附录（软）
         let system = format!("{}{}", self.resolve_system_prompt(env).await, self.skills_appendix(env).await);
@@ -836,6 +914,7 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             content: Some(system),
             tool_calls: None,
             tool_call_id: None,
+            attachments: None,
         }];
         match self.perceive(env, &req.session_id).await {
             Ok(h) => {
@@ -940,6 +1019,7 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
                 content: resp.content.clone(),
                 tool_calls: Some(resp.tool_calls.clone()),
                 tool_call_id: None,
+                attachments: None,
             };
             let mut round_msgs = vec![assistant_msg];
             let limit = tool_result_limit();
@@ -957,6 +1037,7 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
                         content: Some(truncate_chars(&result.to_string(), limit)),
                         tool_calls: None,
                         tool_call_id: Some(tc.id.clone()),
+                        attachments: None,
                     });
                 }
             }
@@ -1032,6 +1113,7 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
                 content: Some(answer.clone()),
                 tool_calls: None,
                 tool_call_id: None,
+                attachments: None,
             }],
         )
         .await;
@@ -1125,6 +1207,64 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("WORKSPACE_ROOT", v),
             None => std::env::remove_var("WORKSPACE_ROOT"),
+        }
+    }
+
+    #[test]
+    fn build_user_msg_routes_attachments() {
+        // 隔离并行测试的 TEXT_ATTACH_LIMIT 串扰（截断行为由专项测试覆盖）
+        let saved_limit = std::env::var("TEXT_ATTACH_LIMIT").ok();
+        std::env::set_var("TEXT_ATTACH_LIMIT", "24000");
+
+        // R3：无附件 → 纯文本消息，attachments 不出现
+        let plain = build_user_msg("hi", None);
+        assert_eq!(plain.content.as_deref(), Some("hi"));
+        assert!(plain.attachments.is_none());
+
+        // 图片 → 结构化 attachments（不内嵌 content）；文本 → 内嵌 content；其他二进制 → 仅注明
+        let atts = vec![
+            Attachment { name: "a.png".into(), mime: "image/png".into(), data_b64: "QUJD".into() },
+            Attachment { name: "b.txt".into(), mime: "text/plain".into(), data_b64: "aGVsbG8=".into() }, // "hello"
+            Attachment { name: "c.bin".into(), mime: "application/octet-stream".into(), data_b64: "AAA=".into() },
+        ];
+        let m = build_user_msg("看图", Some(&atts));
+        let content = m.content.expect("content");
+        assert!(content.starts_with("看图"));
+        assert!(content.contains("[附件: b.txt]"), "文本附件内嵌 content");
+        assert!(content.contains("hello"));
+        assert!(content.contains("[附件: c.bin]"), "二进制附件注明类型不静默丢弃");
+        assert!(!content.contains("a.png"), "图片附件不内嵌 content");
+
+        let imgs = m.attachments.expect("images");
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].name, "a.png");
+        assert_eq!(imgs[0].data_b64, "QUJD");
+
+        match saved_limit {
+            Some(v) => std::env::set_var("TEXT_ATTACH_LIMIT", v),
+            None => std::env::remove_var("TEXT_ATTACH_LIMIT"),
+        }
+    }
+
+    #[test]
+    fn build_user_msg_truncates_oversized_text_attachment() {
+        // R3：文本附件超限 → 截断并显式标注（模型必须感知内容不完整）
+        let saved = std::env::var("TEXT_ATTACH_LIMIT").ok();
+        std::env::set_var("TEXT_ATTACH_LIMIT", "4");
+        let atts = [Attachment {
+            name: "big.txt".into(),
+            mime: "text/plain".into(),
+            // "abcdefghij"（10 字符，上限 4）
+            data_b64: "YWJjZGVmZ2hpag==".into(),
+        }];
+        let m = build_user_msg("q", Some(&atts));
+        let c = m.content.expect("content");
+        assert!(c.contains("truncated"), "截断必须标注: {c}");
+        assert!(c.contains("[附件: big.txt]"));
+        assert!(m.attachments.is_none(), "文本附件不进结构化字段");
+        match saved {
+            Some(v) => std::env::set_var("TEXT_ATTACH_LIMIT", v),
+            None => std::env::remove_var("TEXT_ATTACH_LIMIT"),
         }
     }
 }

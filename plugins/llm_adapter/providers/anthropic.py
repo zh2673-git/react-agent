@@ -29,7 +29,25 @@ def chat(payload: dict) -> dict:
             blocks += [{"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc.get("arguments", {})} for tc in m["tool_calls"]]
             messages.append({"role": "assistant", "content": blocks})
         else:
-            messages.append({"role": role or "user", "content": content or ""})
+            # R3：图片附件 → content 块数组（base64 source）。文本附件由 agent-loop
+            # 内嵌进 content，不在此处理。无附件保持纯字符串（不破坏既有请求形状）。
+            images = [
+                a
+                for a in (m.get("attachments") or [])
+                if isinstance(a, dict) and a.get("data_b64")
+            ]
+            if images:
+                blocks = [{"type": "text", "text": content or ""}]
+                blocks += [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": a.get("mime", "image/png"), "data": a["data_b64"]},
+                    }
+                    for a in images
+                ]
+                messages.append({"role": role or "user", "content": blocks})
+            else:
+                messages.append({"role": role or "user", "content": content or ""})
 
     body: dict = {"model": model, "max_tokens": 4096, "messages": messages}
     if system_parts:
