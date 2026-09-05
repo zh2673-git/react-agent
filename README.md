@@ -214,8 +214,6 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
   `crates/agent-loop/README.md`「运行中断（停止）」与 `plugins/llm_adapter/README.md`「abort」。
 - **sid 跨对话不保证唯一**：同 round 的不同对话回合生成相同 sid，极端情况下后一回合的流式动画被去重逻辑误忽略
   （直接显示最终答案，无打字效果）。细节与修复建议见 `crates/agent-loop/README.md`「流式编排」。
-- **markdown 表格渲染**：工具结果 / 答案中的 markdown 表格在前端显示异常（列对不齐、样式未按表格语义渲染）。
-  已知显示问题，留待后续版本随工具 / 技能插件的丰富完善一并修复（前端渲染层独立迭代，不影响数据正确性）。
 - SSE 增量续传、刷新恢复、断线不重绘不重复的完整数据流设计见 `crates/host/README.md`「数据流设计要点」。
 
 ## Roadmap（后续方向）

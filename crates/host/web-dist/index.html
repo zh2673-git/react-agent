@@ -188,7 +188,8 @@
   .md a:hover { text-decoration: underline; }
   .md blockquote { border-left: 3px solid var(--border); padding-left: 12px; color: var(--muted); margin: 8px 0; }
   .md table { border-collapse: collapse; margin: 8px 0; }
-  .md th, .md td { border: 1px solid var(--border); padding: 5px 10px; }
+  .md th, .md td { border: 1px solid var(--border); padding: 5px 10px; font-size: 13px; text-align: left; }
+  .md th { background: var(--card-2); font-weight: 600; }
   .md .result-pre { background: var(--code-bg); border-radius: 8px; padding: 10px 12px; overflow-x: auto;
     font: 12.5px/1.5 Consolas, monospace; white-space: pre-wrap; word-break: break-all; color: #e8e4da; margin-top: 4px; }
 
@@ -416,6 +417,16 @@ function md(src) {
     blocks.push({ lang: lang || "text", body: body.replace(/\n$/, "") });
     return `\u0000B${i}\u0000`;
   });
+  // 表格：| a | b | 行 + |---|---| 分隔行 + 数据行。在行级规则前整块替换，
+  // 单元格内容仍走后续 inline 规则（bold/code/link），语义不丢。
+  text = text.replace(/(?:^\|.*\|$\n?)+/gm, (block) => {
+    const rows = block.trim().split("\n").map((l) => l.trim());
+    if (rows.length < 2 || !/^\|?[\s:|-]+\|?$/.test(rows[1]) || !rows[1].includes("-")) return block;
+    const cells = (l) => l.replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+    const th = cells(rows[0]).map((c) => `<th>${c}</th>`).join("");
+    const trs = rows.slice(2).map((l) => "<tr>" + cells(l).map((c) => `<td>${c}</td>`).join("") + "</tr>").join("");
+    return `<table><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table>\n`;
+  });
   text = text
     .replace(/^###### (.*)$/gm, "<h3>$1</h3>")
     .replace(/^##### (.*)$/gm, "<h3>$1</h3>")
@@ -439,7 +450,7 @@ function md(src) {
     if (/^\u0000B\d+\u0000$/.test(t)) { flushPara(); flushList(); html += t; continue; }
     if ((m = t.match(/^[-*] (.*)$/))) { flushPara(); if (list !== "ul") { flushList(); html += "<ul>"; list = "ul"; } html += `<li>${m[1]}</li>`; continue; }
     if ((m = t.match(/^\d+[.)] (.*)$/))) { flushPara(); if (list !== "ol") { flushList(); html += "<ol>"; list = "ol"; } html += `<li>${m[1]}</li>`; continue; }
-    if (/^<(h\d|blockquote|ul|ol)/.test(t)) { flushPara(); flushList(); html += t; continue; }
+    if (/^<(h\d|blockquote|ul|ol|table)/.test(t)) { flushPara(); flushList(); html += t; continue; }
     flushList(); para.push(t);
   }
   flushPara(); flushList();
@@ -499,6 +510,7 @@ function applyStats(node, usage, elapsedMs) {
 // 帧序如何（ollama 逐帧前置 / 部分网关把 reasoning 攒到最后），呈现顺序都稳定。
 // 生命周期：user 事件重置；首个 reasoning/tool_call 时创建；assistant 最终事件收起。
 let processBox = null, processBody = null, processThink = null;
+let roundCards = []; // 本回合每轮流产生的答案卡；最终事件到达时中间卡收进过程框（严格模式必须声明）
 
 function ensureProcessBox() {
   if (processBox) return;
@@ -523,6 +535,8 @@ function ensureAnswerCard() {
   streamBody = streamCard.querySelector(".md");
   streamStats = streamCard.querySelector(".stats");
   feed.appendChild(streamCard);
+  streamCard._anchor = processThink; // 记录本轮思考段：最终收纳时插回其后，保持框内时序（思考→中间文本→工具）
+  roundCards.push(streamCard);
   bindRegen(streamCard);
 }
 
@@ -571,6 +585,19 @@ function renderAssistant(ev, ts) {
     applyStats(streamStats, ev.usage ?? null, ev.elapsed_ms ?? null);
     if (ev.reasoning && processThink) processThink.textContent = ev.reasoning; // 兜底：流式思考帧缺失（网关攒帧）时补全
     if (ev.sid) doneSids.add(ev.sid); // 标记已完成：后续同 sid 的重连 stream_* 帧忽略
+    // 多轮中间卡收进过程框（中间轮文本不是最终答案）：去掉重答按钮、标注「中间轮」，
+    // 按各自锚点（本轮思考段）插回框内保持时序，只留最后一张（最终答案）在框外。
+    // 单轮/纯文本对话（roundCards.length ≤ 1）不动。
+    if (roundCards.length > 1 && processBody) {
+      for (const c of roundCards.slice(0, -1)) {
+        c.querySelector(".rg-btn")?.remove();
+        const lbl = c.querySelector(".meta span:nth-child(2)");
+        if (lbl) lbl.textContent = "中间轮";
+        const anchor = c._anchor;
+        if (anchor && processBody.contains(anchor)) anchor.after(c); else processBody.appendChild(c);
+      }
+    }
+    roundCards = [];
     if (processBox) processBox.open = false;
     streamSid = streamCard = streamBody = streamStats = null;
     return;
@@ -602,6 +629,7 @@ function render(ev) {
     case "user": {
       doneSids.clear(); // 新回合开始：作废上一回合标记，防止同 round sid 碰撞误伤新回合流式
       processBox = processBody = processThink = null; // 过程链框按用户回合划分
+      roundCards = []; // 答案卡按用户回合累积，新回合清空
       const idx = userTurns.length;
       userTurns.push({ idx, text: ev.text ?? "", atts: ev.attachments ?? [] });
       // R3 附件重放：图片缩略图 / 文件条（trace user 事件带全量 b64）
