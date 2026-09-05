@@ -35,6 +35,8 @@ pub struct HostConfig {
     /// openai 兼容端点（openai provider 用；可指 DeepSeek 等）
     pub llm_base_url: String,
     pub ollama_host: String,
+    /// ollama 传输通道：native（/api/chat，缺省）| v1（OpenAI 兼容层回退）
+    pub ollama_endpoint: String,
     pub max_rounds: usize,
     /// 内核仓库 checkout（供 PYTHONPATH / TS shim 解析）
     pub kernel_repo: PathBuf,
@@ -78,6 +80,7 @@ impl HostConfig {
             llm_model: env_or("LLM_MODEL", model_default),
             llm_base_url: env_or("LLM_BASE_URL", "https://api.openai.com/v1"),
             ollama_host: env_or("OLLAMA_HOST", "localhost:11434"),
+            ollama_endpoint: env_or("OLLAMA_ENDPOINT", "native"),
             max_rounds: env_or("MAX_ROUNDS", "8").parse().unwrap_or(8),
             kernel_repo,
             plugins_dir,
@@ -91,6 +94,7 @@ impl HostConfig {
             ("LLM_MODEL".into(), self.llm_model.clone()),
             ("LLM_BASE_URL".into(), self.llm_base_url.clone()),
             ("OLLAMA_HOST".into(), self.ollama_host.clone()),
+            ("OLLAMA_ENDPOINT".into(), self.ollama_endpoint.clone()),
         ];
         if let Some(k) = std::env::var_os("OPENAI_API_KEY") {
             env.push(("OPENAI_API_KEY".into(), k.to_string_lossy().into()));
@@ -178,9 +182,14 @@ pub fn skills_dir() -> PathBuf {
 
 // ───────────────────────── config.json（08 §2.2 活配置持久态） ─────────────────────────
 //
-// 形状：{"llm":{"provider","model","base_url","api_key"},"tools":{"enabled":[...]}}
-// 持久通道：启动时 apply → env（spawn 下发复用现有机制，零改动）；热通道：PUT /api/config
-// 转发 configure op 成功后落盘。api_key 明文落 config.json（本机文件），线上回显只给尾 4 位。
+// 形状：{"llm":{...},"tools":{"enabled":[...]},"agent":{...}}
+//   agent 段（P5/E1 收编）：{"max_rounds","system_prompt","prompt","history_limit",
+//   "compact_trigger","compact_keep","tool_result_limit","budget_secs","token_budget",
+//   "retry_attempts","retry_base_ms","llm_context_tokens"} —— 键名即 agent-loop 运行参数，
+//   应用为同名 env。
+// 持久通道：启动时 apply → env（agent-loop InProcess 自读，spawn 下发复用现有机制，零改动）；
+// 热通道：PUT /api/config 转发成功后 env 热应用（下轮对话生效）+ 落盘。
+// api_key 明文落 config.json（本机文件），线上回显只给尾 4 位。
 
 /// config.json 路径（CONFIG_FILE env 或 `<项目根>/config.json`）。
 pub fn config_file() -> PathBuf {
@@ -206,6 +215,23 @@ pub fn persist_config(v: &Value) -> anyhow::Result<()> {
     std::fs::write(&path, serde_json::to_string_pretty(v)? + "\n")?;
     Ok(())
 }
+
+/// agent 段键 → env 名映射（P5/E1）。单一事实来源：持久通道（启动 apply）
+/// 与热通道（PUT /api/config）共用。
+pub const AGENT_ENV_MAP: &[(&str, &str)] = &[
+    ("max_rounds", "MAX_ROUNDS"),
+    ("system_prompt", "AGENT_SYSTEM_PROMPT"),
+    ("prompt", "PROMPT"),
+    ("history_limit", "HISTORY_LIMIT"),
+    ("compact_trigger", "COMPACT_TRIGGER"),
+    ("compact_keep", "COMPACT_KEEP"),
+    ("tool_result_limit", "TOOL_RESULT_LIMIT"),
+    ("budget_secs", "CHAT_BUDGET_SECS"),
+    ("token_budget", "CHAT_TOKEN_BUDGET"),
+    ("retry_attempts", "LLM_RETRY_ATTEMPTS"),
+    ("retry_base_ms", "LLM_RETRY_BASE_MS"),
+    ("llm_context_tokens", "LLM_CONTEXT_TOKENS"),
+];
 
 /// 启动时把 config.json 应用为 env（spawn 下发走既有机制）。返回应用的键数。
 pub fn apply_config_file_to_env() -> usize {
@@ -240,6 +266,21 @@ pub fn apply_config_file_to_env() -> usize {
             set("TOOLS_ENABLED", names.join(","));
         }
     }
+    // agent 段（P5/E1）：键名即 agent-loop 参数，字符串原样、其余 JSON 标量转串。
+    if let Some(agent) = cfg.get("agent").filter(|v| v.is_object()) {
+        if let Some(obj) = agent.as_object() {
+            for (key, env) in AGENT_ENV_MAP {
+                if let Some(v) = obj.get(*key) {
+                    let s = match v {
+                        Value::String(s) => s.clone(),
+                        Value::Null => continue,
+                        other => other.to_string(),
+                    };
+                    set(env, s);
+                }
+            }
+        }
+    }
     n
 }
 
@@ -270,5 +311,39 @@ mod tests {
     #[test]
     fn bash_sandbox_illegal_value_denied() {
         assert!(matches!(resolve_bash_sandbox("strict", None), BashSandbox::Denied(m) if m.contains("strict")));
+    }
+
+    #[test]
+    fn config_agent_section_applies_to_env() {
+        // P5/E1：config.json agent 段经持久通道应用为 agent-loop 运行参数 env。
+        // 本测试操作进程 env 与 CONFIG_FILE——host 单测进程内无其他用例读这些键，存取后即还原。
+        let tmp = std::env::temp_dir().join("ra-agent-config-test.json");
+        std::fs::write(
+            &tmp,
+            r#"{"agent":{"max_rounds":12,"history_limit":7,"budget_secs":1.5,"token_budget":500,"system_prompt":"CUSTOM P5","retry_attempts":3,"llm_context_tokens":8192}}"#,
+        )
+        .unwrap();
+        let keys = ["MAX_ROUNDS", "HISTORY_LIMIT", "CHAT_BUDGET_SECS", "CHAT_TOKEN_BUDGET", "AGENT_SYSTEM_PROMPT", "LLM_RETRY_ATTEMPTS", "LLM_CONTEXT_TOKENS", "CONFIG_FILE"];
+        let saved: Vec<(String, Option<String>)> = keys.iter().map(|k| (k.to_string(), std::env::var(k).ok())).collect();
+        std::env::set_var("CONFIG_FILE", &tmp);
+
+        let n = apply_config_file_to_env();
+
+        assert!(n >= 5, "agent 段 5 个键应被应用: n={n}");
+        assert_eq!(std::env::var("MAX_ROUNDS").unwrap(), "12");
+        assert_eq!(std::env::var("HISTORY_LIMIT").unwrap(), "7");
+        assert_eq!(std::env::var("CHAT_BUDGET_SECS").unwrap(), "1.5");
+        assert_eq!(std::env::var("CHAT_TOKEN_BUDGET").unwrap(), "500");
+        assert_eq!(std::env::var("AGENT_SYSTEM_PROMPT").unwrap(), "CUSTOM P5");
+        assert_eq!(std::env::var("LLM_RETRY_ATTEMPTS").unwrap(), "3");
+        assert_eq!(std::env::var("LLM_CONTEXT_TOKENS").unwrap(), "8192");
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
     }
 }

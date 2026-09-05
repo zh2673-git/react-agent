@@ -97,6 +97,7 @@ Web 前端是单文件 `crates/host/web-dist/index.html`（内联 CSS/JS，无�
 | `LLM_MODEL` | 按 provider | 模型名 |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | openai 兼容端点 |
 | `OLLAMA_HOST` | `localhost:11434` | ollama 地址（Web 设置面板「ollama 地址」栏可改，默认即此值；ollama 免 key，api_key 无效） |
+| `OLLAMA_ENDPOINT` | `native` | ollama 传输通道：native（原生 `/api/chat`，per-request `options.num_ctx` + NDJSON 流式）/ v1（回退 OpenAI 兼容层 `/v1`） |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | 密钥（经子进程 env 传递，不落 manifest） |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic 端点 |
 | `MOCK_SCRIPT` | — | mock provider 脚本（JSON 数组，逐次弹出） |
@@ -114,6 +115,7 @@ Web 前端是单文件 `crates/host/web-dist/index.html`（内联 CSS/JS，无�
 | `AGENT_SYSTEM_PROMPT` / `SYSTEM.md` / `PROMPT` | 内置缺省 | 提示词覆盖优先级：env > SYSTEM.md > 具名模板 > 内置 |
 | `HISTORY_LIMIT` | 不限 | 每轮回传历史条数上限 |
 | `COMPACT_TRIGGER` / `COMPACT_KEEP` | `40` / `10` | 上下文压缩触发阈值（0=禁用）/ 保留最近条数 |
+| `LLM_CONTEXT_TOKENS` | `0`（禁用） | 模型上下文窗口（token）：压缩 token 闸 + 发送前逐级收紧（超限收敛为 CONTEXT_OVERFLOW）；并随 `llm.chat` 透传 `num_ctx`（ollama native 映射 `options.num_ctx`，两侧窗口对齐），见 agent-loop README「上下文体积管理」 |
 | `BASH_SANDBOX` | `on` | on=sandbox-run 受限令牌沙箱（探测失败 fail-closed 移除 bash）；off=显式豁免直跑 |
 | `REACT_FRONTEND` | `repl` | 前端选择：repl / web |
 | `WEB_ADDR` | `127.0.0.1:8710` | web 网关监听地址 |
@@ -141,12 +143,12 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 - 保留工具名（不进 tools.list，由 agent-loop 路由）：`load_skill`→assets `skills.load`；`task`→子代理（新 session 复用 agent.chat，深度防嵌套）
 
 **llm-adapter**（`llm.chat`）
-- req `{"op":"chat","provider"?:"openai"|"anthropic"|"ollama"|"mock","messages":[Msg],"tools"?:[ToolSpec]}`
+- req `{"op":"chat","provider"?:"openai"|"anthropic"|"ollama"|"mock","messages":[Msg],"tools"?:[ToolSpec],"stream_path"?,"sid"?,"num_ctx"?:int}`（`num_ctx` 源自 `LLM_CONTEXT_TOKENS`，0/缺省不下发；仅 ollama native 映射 `options.num_ctx`）
 - Msg = `{"role":"system"|"user"|"assistant"|"tool","content":str|null,"tool_calls"?:[{"id","name","arguments":object}],"tool_call_id"?:str}`
 - ToolSpec = `{"name","description","parameters":json-schema}`
 - resp `{"ok":true,"content":str|null,"tool_calls":[{"id","name","arguments":object}],"model":str,"finish_reason":"stop"|"tool_calls"}`
 - 扩展 `{"op":"configure","provider"?,"model"?,"base_url"?,"api_key"?}` → `{"ok":true,"applied":{...}}`（08 运行时热配置：更新本进程 env；api_key 只回 api_key_set）
-- 扩展 `{"op":"models.list","provider"?}` → `{"ok":true,"models":[str]}`（openai/deepseek 走 `/v1/models`；ollama 走 `/api/tags`；anthropic/mock 走静态清单；失败 `{"ok":false,"error":{...}}`）
+- 扩展 `{"op":"models.list","provider"?}` → `{"ok":true,"models":[str],"models_meta"?}`（openai/deepseek 走 `/v1/models`；ollama 走 `/api/tags` + 逐模型 `/api/show` 探测原生窗口；anthropic/mock 走静态清单；`models_meta` 为可选扩展 `[{"name","ctx_limit"?}]`——模型原生上下文窗口，取不到省略键，其他 provider 不带；失败 `{"ok":false,"error":{...}}`）
 
 **tools**（`tools.exec`）
 - `{"op":"list"}` → `{"ok":true,"tools":[ToolSpec]}`（生产级 7 件：read_file / write_file / edit_file / list_dir / bash / web_search / web_read，受 `TOOLS_ENABLED` 裁剪）
@@ -173,11 +175,11 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 - Event 建议形状 `{type, ts, ...}`；存储 `<MEMORY_DATA_DIR>/traces/<session>.jsonl`
 
 **web 网关**（host 级，非插件）
-- `GET /` → 单页（DeepSeek 风格事件流式会话：左侧会话栏持久化、工具调用状态点卡片、富 markdown 代码块复制 + ⚙ 设置面板：LLM / 工具 / 技能）
+- `GET /` → 单页（Cursor 暖色系事件流式会话：米色纸感底 + 半透明炭黑 CTA，主题 token 见 crates/host/PLAN.md W1；左侧会话栏持久化、工具调用状态点卡片、富 markdown 代码块复制 + ⚙ 设置面板：LLM / 工具 / 技能 / Agent）
 - `GET /api/events?session=&after=` → SSE（从 0 全量重放 + 实时增量）
 - `POST /api/chat` body `{"session_id":str,"message":str}` → 阻塞至收敛，回 agent.chat 响应
 - `GET /api/config` → 配置视图（llm：config.json > env 缺省，key 只回 key_set+尾 4 位；tools 全集+enabled；skills_count）
-- `GET /api/models` → 转发 llm-adapter `models.list`，返回当前 provider 可用模型 id（前端「拉取模型」按钮；配好 base_url/key 后自动填充 model 下拉）
+- `GET /api/models` → 转发 llm-adapter `models.list`，返回当前 provider 可用模型 id（前端「拉取模型」按钮；配好 base_url/key 后自动填充 model 下拉；ollama 额外透传 `models_meta` 原生窗口元数据——前端下拉展示 `模型名 · 256k`，Agent 页 `llm_context_tokens` 提示原生窗口并可一键填入）
 - `PUT /api/config` body `{"llm"?:{...},"tools"?":{"enabled":[...]}}` → 逐项转发 configure op（任一失败 400 不落盘，重启即回滚）；全成落 config.json
 - `GET /api/skills` → assets skills.list（实时目录）
 - `GET /api/skills/{name}` → `{"ok":true,"name","content"}`（SKILL.md 原文，编辑用）
@@ -201,8 +203,8 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 
 ## 已知限制（摘要）
 
-- **运行中断未支持**：Web 前端无「停止」按钮，运行中的一轮无法中途打断（关闭页面 / 杀进程即整体终止）。
-  改造涉及 agent-loop + host + 前端三处，路线图见 `crates/agent-loop/README.md`「运行中断」。
+- **运行中断（停止）**：已支持。`POST /api/chat/cancel?session=` 置位取消标志，循环在轮次边界以 K499 收敛
+  （半轮不中断）；前端发送期间显示「停止」按钮。机制详见 `crates/agent-loop/README.md`「运行中断（停止）」。
 - **sid 跨对话不保证唯一**：同 round 的不同对话回合生成相同 sid，极端情况下后一回合的流式动画被去重逻辑误忽略
   （直接显示最终答案，无打字效果）。细节与修复建议见 `crates/agent-loop/README.md`「流式编排」。
 - SSE 增量续传、刷新恢复、断线不重绘不重复的完整数据流设计见 `crates/host/README.md`「数据流设计要点」。

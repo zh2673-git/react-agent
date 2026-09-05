@@ -5,39 +5,41 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>react-agent</title>
 <style>
-  /* ── DeepSeek 风格设计 token ── */
+  /* ── Cursor 暖色系设计 token（cursor.com/cn 官方实测：--color-theme-* 真值）──
+     主 CTA = 炭黑 #26251e（官方「下载」按钮做法）；橙 #f54e00 仅小面积点缀，
+     大面积用橙会刺眼（2026-09-06 用户反馈修正） */
   :root {
-    --bg: #0f1115;          /* 最底（侧栏） */
-    --panel: #16181d;       /* 面板 / header / 抽屉 */
-    --card: #1c1f26;        /* 消息卡 / 工具卡 */
-    --card-2: #21252e;      /* 输入 / 悬浮 */
-    --border: #2a2e37;
-    --border-soft: #23272f;
-    --text: #e6e8eb;
-    --muted: #969ba3;
-    --faint: #6b7280;
-    --accent: #4d6bfe;      /* DeepSeek 蓝 */
-    --accent-2: #6d83ff;
-    --accent-soft: rgba(77,107,254,.14);
-    --ok: #4caf7d;
-    --err: #ef6b6b;
-    --warn: #e0a458;
-    --user-bubble: #2a3350;
-    --code-bg: #14161b;
-    --radius: 14px;
-    --shadow: 0 8px 30px rgba(0,0,0,.35);
+    --bg: #f7f7f4;          /* 最底（侧栏）＝官方 --color-theme-bg */
+    --panel: #f7f7f4;       /* 面板 / header / 抽屉 */
+    --card: #f2f1ed;        /* 消息卡 / 工具卡 ＝官方 card-hex */
+    --card-2: #ebeae5;      /* 输入 / 悬浮 ＝官方 card-hover-hex */
+    --border: rgba(38,37,30,.18);   /* 官方 border-02：炭黑透明度分级 */
+    --border-soft: rgba(38,37,30,.10);
+    --text: #26251e;        /* 炭黑 */
+    --muted: #6e6a61;
+    --faint: #99948a;
+    --accent: rgba(38,37,30,.8);   /* 主 CTA：半透明炭黑（纯黑突兀，2026-09-06 反馈） */
+    --accent-2: rgba(24,23,19,.92); /* CTA hover 略实 */
+    --point: #c26a45;       /* 点缀色：陶土（官方橙 #f54e00 降饱和柔化，仅小字） */
+    --accent-soft: rgba(38,37,30,.06);
+    --ok: #3d8a5f;
+    --err: #c94f4f;
+    --warn: #a8762a;
+    --code-bg: #1b1913;     /* 代码块深底 ＝官方暗色 card-hex */
+    --radius: 10px;
+    --shadow: 0 8px 30px rgba(38,37,29,.06);
     font-synthesis: none;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
   body {
     background: var(--bg); color: var(--text);
-    font: 14.5px/1.65 "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font: 14.5px/1.65 "Segoe UI", system-ui, -apple-system, "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
     display: flex; overflow: hidden;
   }
   ::-webkit-scrollbar { width: 10px; height: 10px; }
-  ::-webkit-scrollbar-thumb { background: #2c313b; border-radius: 8px; border: 2px solid transparent; background-clip: content-box; }
-  ::-webkit-scrollbar-thumb:hover { background: #3a414e; background-clip: content-box; }
+  ::-webkit-scrollbar-thumb { background: #cfc8b8; border-radius: 8px; border: 2px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background: #bdb5a2; background-clip: content-box; }
   button { font: inherit; cursor: pointer; }
   input, textarea, select { font: inherit; color: var(--text); }
 
@@ -79,7 +81,7 @@
   header .title small { color: var(--faint); font-weight: 400; margin-left: 8px; font-size: 12px; }
   header .spacer { flex: 1; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); transition: background .2s; }
-  .dot.live { background: var(--ok); box-shadow: 0 0 0 3px rgba(76,175,125,.18); }
+  .dot.live { background: var(--ok); box-shadow: 0 0 0 3px rgba(61,138,95,.18); }
   header .status { color: var(--muted); font-size: 12.5px; }
   header .gear { background: none; border: 1px solid var(--border); color: var(--muted);
     border-radius: 8px; padding: 6px 12px; }
@@ -90,19 +92,19 @@
 
   /* ── 消息 ── */
   .ev.user { display: flex; justify-content: flex-end; }
-  .ev.user .bubble { background: var(--user-bubble); padding: 10px 15px; border-radius: 16px 16px 4px 16px;
+  .ev.user .bubble { background: var(--card-2); color: var(--text); border: 1px solid var(--border-soft); padding: 10px 15px; border-radius: 16px 16px 4px 16px;
     max-width: 78%; white-space: pre-wrap; word-break: break-word; line-height: 1.6; }
   .ev.assistant .card { background: var(--card); border: 1px solid var(--border-soft); border-radius: var(--radius);
     padding: 14px 18px; }
   .ev.assistant .meta { color: var(--faint); font-size: 11.5px; margin-bottom: 8px; display: flex; align-items: center; gap: 7px; }
-  .ev.assistant .meta .who { color: var(--accent-2); font-weight: 600; }
-  .ev.error .banner { background: rgba(239,107,107,.1); border: 1px solid rgba(239,107,107,.4); color: var(--err);
+  .ev.assistant .meta .who { color: var(--point); font-weight: 600; }
+  .ev.error .banner { background: rgba(201,79,79,.08); border: 1px solid rgba(201,79,79,.4); color: var(--err);
     border-radius: 10px; padding: 9px 14px; font-family: Consolas, monospace; font-size: 12.5px; white-space: pre-wrap; }
   .ev.compaction { text-align: center; color: var(--faint); font-size: 12px; }
   .ev.compaction .line { display: inline-block; padding: 3px 14px; border: 1px dashed var(--border); border-radius: 12px; }
-  .ev.subagent .card { background: linear-gradient(0deg, var(--accent-soft), transparent); border: 1px solid rgba(77,107,254,.3);
+  .ev.subagent .card { background: linear-gradient(0deg, var(--accent-soft), transparent); border: 1px solid rgba(38,37,30,.2);
     border-radius: var(--radius); padding: 10px 16px; color: var(--muted); }
-  .ev.subagent .card b { color: var(--accent-2); }
+  .ev.subagent .card b { color: var(--point); }
 
   /* ── 思考块 / 统计条（流式）── */
   details.think { margin: 0 0 10px; background: var(--accent-soft); border: 1px solid var(--border-soft);
@@ -115,7 +117,7 @@
   .ev.assistant .stats { margin-top: 9px; padding-top: 8px; border-top: 1px dashed var(--border-soft);
     color: var(--faint); font-size: 11.5px; display: flex; gap: 14px; flex-wrap: wrap; }
   .ev.assistant .stats[hidden] { display: none; }
-  .ev.assistant.streaming .md::after { content: "\2588"; color: var(--accent-2); animation: blink 1s step-end infinite; }
+  .ev.assistant.streaming .md::after { content: "\2588"; color: var(--point); animation: blink 1s step-end infinite; }
   @keyframes blink { 50% { opacity: 0; } }
 
   /* ── 工具卡片 ── */
@@ -139,27 +141,27 @@
   @keyframes pulse { 0% { transform: scale(.8); opacity: .7; } 100% { transform: scale(1.6); opacity: 0; } }
 
   /* ── 代码块 + markdown ── */
-  pre.code { background: var(--code-bg); border: 1px solid var(--border-soft); border-radius: 10px; margin: 10px 0; overflow: hidden; }
-  pre.code .cb-head { display: flex; align-items: center; padding: 6px 12px; border-bottom: 1px solid var(--border-soft); }
-  pre.code .cb-lang { color: var(--faint); font-size: 11.5px; font-family: Consolas, monospace; }
-  pre.code .cb-copy { margin-left: auto; background: none; border: 1px solid var(--border); color: var(--muted);
+  pre.code { background: var(--code-bg); border: 1px solid var(--border-soft); border-radius: 10px; margin: 10px 0; overflow: hidden; color: #e8e4da; }
+  pre.code .cb-head { display: flex; align-items: center; padding: 6px 12px; border-bottom: 1px solid #3a382f; }
+  pre.code .cb-lang { color: #a39e92; font-size: 11.5px; font-family: Consolas, monospace; }
+  pre.code .cb-copy { margin-left: auto; background: none; border: 1px solid #4a463c; color: #a39e92;
     border-radius: 6px; padding: 2px 9px; font-size: 11.5px; }
-  pre.code .cb-copy:hover { color: var(--text); border-color: var(--accent); }
-  pre.code pre { margin: 0; padding: 12px 14px; overflow-x: auto; font: 12.5px/1.55 Consolas, "SF Mono", monospace; white-space: pre; }
+  pre.code .cb-copy:hover { color: #e8e4da; border-color: var(--accent); }
+  pre.code pre { margin: 0; padding: 12px 14px; overflow-x: auto; font: 12.5px/1.55 Consolas, "SF Mono", monospace; white-space: pre; color: #e8e4da; }
   .md h1, .md h2, .md h3 { margin: 14px 0 8px; line-height: 1.3; }
-  .md h1 { font-size: 1.45em; } .md h2 { font-size: 1.25em; } .md h3 { font-size: 1.1em; }
+  .md h1 { font-size: 1.45em; font-weight: 600; } .md h2 { font-size: 1.25em; font-weight: 600; } .md h3 { font-size: 1.1em; }
   .md p { margin: 8px 0; }
   .md ul, .md ol { margin: 8px 0 8px 24px; }
   .md li { margin: 3px 0; }
-  .md code { background: var(--accent-soft); border: 1px solid rgba(77,107,254,.25); border-radius: 5px; padding: 1px 5px; font: 12.5px Consolas, monospace; color: #cdd6ff; }
+  .md code { background: var(--card-2); border: 1px solid var(--border-soft); border-radius: 5px; padding: 1px 5px; font: 12.5px Consolas, monospace; color: var(--text); }
   .md pre code { border: none; background: none; padding: 0; color: inherit; }
-  .md a { color: var(--accent-2); text-decoration: none; }
+  .md a { color: var(--point); text-decoration: none; }
   .md a:hover { text-decoration: underline; }
   .md blockquote { border-left: 3px solid var(--border); padding-left: 12px; color: var(--muted); margin: 8px 0; }
   .md table { border-collapse: collapse; margin: 8px 0; }
   .md th, .md td { border: 1px solid var(--border); padding: 5px 10px; }
   .md .result-pre { background: var(--code-bg); border-radius: 8px; padding: 10px 12px; overflow-x: auto;
-    font: 12.5px/1.5 Consolas, monospace; white-space: pre-wrap; word-break: break-all; color: var(--text); margin-top: 4px; }
+    font: 12.5px/1.5 Consolas, monospace; white-space: pre-wrap; word-break: break-all; color: #e8e4da; margin-top: 4px; }
 
   /* ── composer ── */
   footer { border-top: 1px solid var(--border-soft); background: var(--panel); padding: 14px 16px; }
@@ -225,12 +227,13 @@
     <span class="spacer"></span>
     <span class="dot" id="conn"></span>
     <span class="status" id="status"></span>
-    <button class="gear" id="gear" title="配置中心：LLM / 工具 / 技能">⚙ 设置</button>
+    <button class="gear" id="gear" title="配置中心：LLM / 工具 / 技能 / Agent">⚙ 设置</button>
   </header>
   <div id="stream"><div class="wrap" id="feed"></div></div>
   <footer>
     <div class="composer">
       <textarea id="input" placeholder="输入消息，Enter 发送（Shift+Enter 换行）"></textarea>
+      <button id="stop" hidden style="background: var(--card-2); color: var(--text);">停止</button>
       <button id="send">发送</button>
     </div>
   </footer>
@@ -242,6 +245,7 @@
     <button data-tab="llm" class="on">LLM</button>
     <button data-tab="tools">工具</button>
     <button data-tab="skills">技能</button>
+    <button data-tab="agent">Agent</button>
   </div>
   <div class="body">
     <div id="tab-llm">
@@ -278,13 +282,33 @@
         <p class="hint">frontmatter 需含 name（与目录名一致）与非空 description。保存后下轮对话自动可见；模型也可在对话中用 write_file 自建技能（技能自扩展）。</p>
       </div>
     </div>
+    <div id="tab-agent" hidden>
+      <p class="hint">agent-loop 运行参数（保存即下轮对话生效 + 落盘 config.json）。0 的语义见各标签。</p>
+      <div class="field"><label>max_rounds（单次对话最大轮次）</label><input id="agent-max-rounds" type="number" min="1" max="64"></div>
+      <div class="field"><label>budget_secs（单次对话总时长预算，秒，支持小数；0=不限）</label><input id="agent-budget-secs" type="number" min="0" step="0.5"></div>
+      <div class="field"><label>token_budget（单次对话 token 预算，input+output 累计；0=不限）</label><input id="agent-token-budget" type="number" min="0"></div>
+      <div class="field"><label>history_limit（发给 LLM 的历史窗口条数；0=不限）</label><input id="agent-history-limit" type="number" min="0"></div>
+      <div class="field"><label>compact_trigger（历史超过此条数触发压缩；0=禁用）</label><input id="agent-compact-trigger" type="number" min="0"></div>
+      <div class="field"><label>compact_keep（压缩后保留最近条数）</label><input id="agent-compact-keep" type="number" min="0"></div>
+      <div class="field"><label>tool_result_limit（单条工具结果回喂字符上限；0=禁用）</label><input id="agent-tool-result-limit" type="number" min="0"></div>
+      <div class="field"><label>retry_attempts（LLM 瞬态失败重试次数，0=不重试）</label><input id="agent-retry-attempts" type="number" min="0" max="6"></div>
+      <div class="field"><label>retry_base_ms（重试退避基数毫秒，指数递增、单次封顶 8s）</label><input id="agent-retry-base-ms" type="number" min="0"></div>
+      <div class="field"><label>llm_context_tokens（模型上下文窗口 token 数；0=禁用 token 闸，仅按条数管理）</label><input id="agent-llm-context-tokens" type="number" min="0"></div>
+      <div class="row" style="margin:-8px 0 14px; justify-content:space-between">
+        <span class="hint" id="ctx-hint" style="margin:0">原生窗口：未拉取模型列表（LLM 页「拉取模型」后可用）</span>
+        <button type="button" class="btn ghost" id="ctx-fill" hidden style="padding:4px 12px; font-size:12px">填入原生值</button>
+      </div>
+      <div class="field"><label>system_prompt（自定义系统提示词，留空 = 用内置组装链）</label><textarea id="agent-system-prompt" style="min-height:110px" spellcheck="false"></textarea></div>
+      <div class="row"><button class="btn" id="agent-save">保存</button><span class="flash" id="agent-flash"></span></div>
+      <p class="hint">PROMPT 具名模板仍由 REPL /prompt 管理；预算耗尽以 K508 收敛（时长/token 分开提示），子代理继承衰减后的剩余预算；上下文超限以 CONTEXT_OVERFLOW 收敛（发送前逐级收紧 → 仍超限即失败，provider 终审超限则降级重试一次）。</p>
+    </div>
   </div>
 </aside>
 
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const feed = $("feed"), input = $("input"), sendBtn = $("send"), statusEl = $("status"), connEl = $("conn");
+const feed = $("feed"), input = $("input"), sendBtn = $("send"), stopBtn = $("stop"), statusEl = $("status"), connEl = $("conn");
 
 // ── session 管理（localStorage）──
 const SKEY = "ra.sessions", CKEY = "ra.session";
@@ -447,6 +471,7 @@ function pushStream(ev) {
   if (ev.kind === "reasoning") {
     streamBuf.reasoning += ev.text || "";
     streamThink.hidden = false;
+    streamThink.open = true; // 思考进行中自动展开
     streamThinkBody.textContent = streamBuf.reasoning;
   } else {
     streamBuf.text += ev.text || "";
@@ -457,6 +482,7 @@ function pushStream(ev) {
 function endStream(ev) {
   if (!streamCard) return;
   streamCard.classList.remove("streaming");
+  if (streamThink) streamThink.open = false; // 思考结束自动收起（用户仍可点开回看）
   if (streamBuf.text) streamBody.innerHTML = md(streamBuf.text);
   applyStats(streamStats, ev ? ev.usage : null, ev ? ev.elapsed_ms : null);
 }
@@ -470,6 +496,7 @@ function renderAssistant(ev, ts) {
     if (tsSpan) tsSpan.textContent = ts || "完成";
     if (ev.reasoning) {
       streamThink.hidden = false;
+      streamThink.open = false; // 最终渲染收起，与 endStream 行为一致
       streamThinkBody.textContent = ev.reasoning;
     }
     streamBody.innerHTML = md(ev.answer || "");
@@ -529,6 +556,7 @@ function render(ev) {
         feed.appendChild(card);
       }
       card.classList.add("done", ev.ok ? "ok" : "fail");
+      card.open = false; // 执行结束自动收起（用户仍可点开看参数与结果）
       const ms = card.querySelector(".ms"); if (ms) ms.textContent = `${ev.ms ?? "?"}ms`;
       const rs = card.querySelector(".result-sec"); if (rs) rs.style.display = "";
       const rb = card.querySelector(".result-body"); if (rb) rb.textContent = ev.result_truncated ?? "";
@@ -580,7 +608,7 @@ async function send() {
   const text = input.value.trim();
   if (!text) return;
   input.value = ""; input.style.height = "48px";
-  sendBtn.disabled = true; setStatus("思考中…");
+  sendBtn.disabled = true; stopBtn.hidden = false; setStatus("思考中…");
   touchSession(session);
   try {
     const r = await fetch("/api/chat", {
@@ -591,9 +619,21 @@ async function send() {
     if (!v.ok) setStatus("失败: " + (v.error?.message ?? r.status));
     else setStatus("");
   } catch (e) { setStatus("请求失败: " + e); }
-  finally { sendBtn.disabled = false; input.focus(); }
+  finally { sendBtn.disabled = false; stopBtn.hidden = true; input.focus(); }
 }
 sendBtn.onclick = send;
+
+// P2/T1 停止：发送期间可见。置位取消信号（agent-loop 在轮次边界收敛为 K499），
+// 与发送互斥——stopBtn 仅在 sendBtn.disabled 时出现。
+stopBtn.onclick = async () => {
+  stopBtn.disabled = true;
+  try {
+    const r = await fetch(`/api/chat/cancel?session=${encodeURIComponent(session)}`, { method: "POST" });
+    const v = await r.json();
+    setStatus(v.ok ? "正在停止…" : "停止失败: " + (v.error?.message ?? r.status));
+  } catch (e) { setStatus("停止失败: " + e); }
+  finally { stopBtn.disabled = false; }
+};
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
@@ -609,7 +649,7 @@ $("gear").onclick = () => { drawer.classList.add("open"); loadConfig(); loadSkil
 $("dclose").onclick = () => drawer.classList.remove("open");
 document.querySelectorAll("#drawer .tabs button").forEach((b) => b.onclick = () => {
   document.querySelectorAll("#drawer .tabs button").forEach((x) => x.classList.toggle("on", x === b));
-  for (const t of ["llm", "tools", "skills"]) $("tab-" + t).hidden = t !== b.dataset.tab;
+  for (const t of ["llm", "tools", "skills", "agent"]) $("tab-" + t).hidden = t !== b.dataset.tab;
 });
 
 function flash(id, ok, msg) {
@@ -647,36 +687,82 @@ async function loadConfig() {
     $("llm-key").placeholder = c.llm.key?.key_set ? `已设置（尾号 ${c.llm.key.key_tail}，留空不修改）` : "未设置";
     cfgTools = c.tools ?? [];
     syncLlmFields();
+    const a = c.agent ?? {};
+    for (const [id, v] of [
+      ["agent-max-rounds", a.max_rounds], ["agent-budget-secs", a.budget_secs], ["agent-token-budget", a.token_budget],
+      ["agent-history-limit", a.history_limit], ["agent-compact-trigger", a.compact_trigger], ["agent-compact-keep", a.compact_keep],
+      ["agent-tool-result-limit", a.tool_result_limit], ["agent-retry-attempts", a.retry_attempts], ["agent-retry-base-ms", a.retry_base_ms],
+      ["agent-llm-context-tokens", a.llm_context_tokens],
+    ]) $(id).value = v ?? "";
+    $("agent-system-prompt").value = a.system_prompt ?? "";
   } catch (e) { flash("llm-flash", false, "加载失败: " + e.message); }
 }
-$("llm-fetch-models").onclick = fetchModels;
-async function fetchModels() {
+$("llm-fetch-models").onclick = () => fetchModels(false);
+// models_meta：/api/models 可选扩展（ollama 原生窗口探测），其他 provider 为空数组——零硬编码
+let modelsMeta = [];
+function fmtCtx(n) { return n >= 1024 ? Math.round(n / 1024) + "k" : String(n); }
+function curModelName() {
+  const msel = $("llm-model");
+  return msel.value === "__custom__" ? $("llm-model-custom").value.trim() : msel.value;
+}
+// Agent 页 llm_context_tokens 的原生窗口提示 + 「填入原生值」
+function updateCtxHint() {
+  const hit = modelsMeta.find((m) => m.name === curModelName() && m.ctx_limit);
+  const hint = $("ctx-hint"), fill = $("ctx-fill");
+  if (hit) {
+    hint.textContent = `当前模型原生窗口 ${fmtCtx(hit.ctx_limit)} tokens`;
+    fill.hidden = false;
+  } else if (modelsMeta.length) {
+    hint.textContent = "未探测到该模型的原生窗口（自定义模型或响应缺失）";
+    fill.hidden = true;
+  } else {
+    hint.textContent = $("llm-provider").value === "ollama"
+      ? "原生窗口：未拉取模型列表（LLM 页「拉取模型」后可用）"
+      : "原生窗口探测仅 ollama 支持；其余 provider 请按官方文档填写";
+    fill.hidden = true;
+  }
+}
+$("ctx-fill").onclick = () => {
+  const hit = modelsMeta.find((m) => m.name === curModelName() && m.ctx_limit);
+  if (hit) $("agent-llm-context-tokens").value = hit.ctx_limit;
+};
+async function fetchModels(silent) {
   const btn = $("llm-fetch-models");
   const prev = btn.textContent;
-  btn.disabled = true; btn.textContent = "拉取中…";
+  if (!silent) { btn.disabled = true; btn.textContent = "拉取中…"; }
   try {
     const v = await api("GET", "/api/models?provider=" + encodeURIComponent($("llm-provider").value));
     if (v && v.ok && Array.isArray(v.models) && v.models.length) {
       const sel = $("llm-model");
       const cur = sel.value && sel.value !== "__custom__" ? sel.value : "";
+      modelsMeta = Array.isArray(v.models_meta) ? v.models_meta : [];
+      const ctxByName = new Map(modelsMeta.filter((m) => m.ctx_limit).map((m) => [m.name, m.ctx_limit]));
       sel.innerHTML = "";
       for (const m of v.models) {
         const o = document.createElement("option");
-        o.value = m; o.textContent = m; sel.appendChild(o);
+        o.value = m;
+        o.textContent = ctxByName.has(m) ? `${m} · ${fmtCtx(ctxByName.get(m))}` : m;
+        sel.appendChild(o);
       }
       const oc = document.createElement("option");
       oc.value = "__custom__"; oc.textContent = "（自定义…）"; sel.appendChild(oc);
       sel.value = (cur && v.models.includes(cur)) ? cur : (v.models[0] || "__custom__");
       syncModelField();
-      flash("llm-flash", true, `已拉取 ${v.models.length} 个模型，点 model 下拉选择`);
-    } else {
+      if (!silent) flash("llm-flash", true, `已拉取 ${v.models.length} 个模型，点 model 下拉选择`);
+    } else if (!silent) {
       flash("llm-flash", false, "未返回模型列表：" + (v?.error?.message || "空"));
     }
   } catch (e) {
-    flash("llm-flash", false, "拉取失败: " + e.message);
+    if (!silent) flash("llm-flash", false, "拉取失败: " + e.message);
   } finally {
-    btn.disabled = false; btn.textContent = prev;
+    if (!silent) { btn.disabled = false; btn.textContent = prev; }
+    updateCtxHint();
   }
+}
+// 打开设置时静默拉一次（仅 ollama）：Agent 页原生窗口提示开箱可用，失败不打扰
+async function ensureModelsMeta() {
+  if (modelsMeta.length || $("llm-provider").value !== "ollama") return;
+  await fetchModels(true);
 }
 function syncModelField() {
   const isCustom = $("llm-model").value === "__custom__";
@@ -685,7 +771,8 @@ function syncModelField() {
   ci.style.display = isCustom ? "" : "none";
   if (isCustom && !ci.value) ci.focus();
 }
-$("llm-model").addEventListener("change", syncModelField);
+$("llm-model").addEventListener("change", () => { syncModelField(); updateCtxHint(); });
+$("llm-model-custom").addEventListener("input", updateCtxHint);
 $("llm-provider").addEventListener("change", syncLlmFields);
 function syncLlmFields() {
   const p = $("llm-provider").value;
@@ -738,6 +825,26 @@ $("tools-save").onclick = async () => {
     flash("tools-flash", true, "白名单已更新");
     await loadConfig();
   } catch (e) { flash("tools-flash", false, e.message); }
+};
+
+// P5/E1 Agent 参数：空字段 = 不修改；system_prompt 总是提交（允许清空回内置链）
+$("agent-save").onclick = async () => {
+  const agent = {};
+  for (const [k, id] of [
+    ["max_rounds", "agent-max-rounds"], ["budget_secs", "agent-budget-secs"], ["token_budget", "agent-token-budget"],
+    ["history_limit", "agent-history-limit"], ["compact_trigger", "agent-compact-trigger"], ["compact_keep", "agent-compact-keep"],
+    ["tool_result_limit", "agent-tool-result-limit"], ["retry_attempts", "agent-retry-attempts"], ["retry_base_ms", "agent-retry-base-ms"],
+    ["llm_context_tokens", "agent-llm-context-tokens"],
+  ]) {
+    const raw = $(id).value.trim();
+    if (raw !== "") agent[k] = Number(raw);
+  }
+  agent.system_prompt = $("agent-system-prompt").value;
+  try {
+    await api("PUT", "/api/config", { agent });
+    flash("agent-flash", true, "已保存，下轮对话生效");
+    loadConfig();
+  } catch (e) { flash("agent-flash", false, e.message); }
 };
 
 let skillsCache = [], curSkill = null;

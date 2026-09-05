@@ -7,7 +7,7 @@ react-agent 的大脑：把"用户一句话"变成"多轮感知 → 规划 → �
 
 | 文件 | 职责 |
 |---|---|
-| `lib.rs` | 编排主循环、ReAct 状态机、事件发射、上下文压缩、技能自扩展、流式 `sid` / 旁路编排 |
+| `lib.rs` | 编排主循环、ReAct 状态机、事件发射、上下文压缩、取消 / 重试 / 预算、技能自扩展、流式 `sid` / 旁路编排 |
 | `contract.rs` | 跨边界数据形状：`MemoryMsg` / `ChatReq` / `LlmChatResp` / `ToolCall` / `ToolSpec` / `StepRecord` |
 
 ## 契约与依赖
@@ -22,26 +22,55 @@ react-agent 的大脑：把"用户一句话"变成"多轮感知 → 规划 → �
 
 每轮一次 `llm.chat`（带当前 memory 全量历史 + 可用工具）：
 
-- 返回 `tool_calls` → 逐条分发执行（`load_skill` 路由 assets，其余路由 tools），结果写回 memory，进入下一轮；
-- 返回纯文本 → 收敛，发 `assistant` 事件给用户，结束。
+- 返回 `tool_calls` → **并行**执行（`load_skill` 路由 assets，其余路由 tools，保留名 `task` 委派子代理）：
+  全部 `tool_call` 事件按声明顺序先发，再按波次（`manifest.max_inflight`，缺省 4）并发执行，
+  结果按声明顺序截断后写回 memory（`tool_call_id` 对应与 steps 顺序不变），进入下一轮；
+- 返回纯文本 → 收敛，发 `assistant` 事件给用户，结束。**空答案视为失败**：`ok:true + answer:""`
+  是假收敛，按错误 payload 收敛、不落 memory（PLAN R4）。
 
-- `max_rounds` 来自构造参数（默认见 `main.rs`），超过则强制收敛并返回错误 payload（不抛异常）。
-- **保留名路由**（03 §3）：`load_skill`（→ assets `skills.load`）、`task`（→ 子会话 `agent.chat`，委派深度 >1 拒绝再嵌套）。
+- `max_rounds` 来自构造参数（`MAX_ROUNDS` env 可每轮覆盖，默认见 `main.rs`），超过则强制收敛并返回错误
+  payload（不抛异常）。
+- **保留名路由**（03 §3）：`load_skill`（→ assets `skills.load`）、`task`（→ 子会话 `agent.chat`）。
+- **委派深度随链传播**：`ChatReq.depth`（`0`=顶层会话，`1`=子代理，缺省 `0`）。子代理链内（depth ≥ 1）
+  拒绝再嵌套 `task`；深度不是插件级共享计数——并发会话互不挤占委派额度（PLAN R1）。
+- **瞬态重试（PLAN T3）**：`llm.chat` 失败若属瞬态（限流 429 / 超时 / 5xx / 连接类；内核 deadline 超时同判），
+  按指数退避重试（`LLM_RETRY_ATTEMPTS` 次，基数 `LLM_RETRY_BASE_MS`，单次封顶 8s）；K400 等确定性失败立即返回。
+  重试经 `retry` 事件落审计日志。
+- **超限降级重试（PLAN P8）**：`CONTEXT_OVERFLOW`（上下文超限，确定性但可行动；provider 侧经 llm-adapter
+  归一化，见 `plugins/llm_adapter/README.md`）特判——未降级过则窗口/限额减半重试**一次**
+  （trace 落 `retry`，`reason=CONTEXT_OVERFLOW, degraded=true`）；再超 → 原错误收敛，不进重试风暴。
+- **轮次边界停车检查**：每轮开头 / 工具波次后 / 强制收敛轮前依次检查「用户取消（`cancel` op 置位，K499）→
+  时长预算 → token 预算（K508）」，命中即收敛返回。
+- **总预算（PLAN T4）**：单次 chat 有墙钟（`CHAT_BUDGET_SECS`，缺省 300s，`0`=禁用）与 token
+  （`CHAT_TOKEN_BUDGET`，input+output 累计，`0`=禁用）上限。子代理继承**衰减后**的剩余
+  （`ChatReq.budget_ms_left` / `tokens_left` 随链携带）；轮内超支由单步 deadline（5s/60s/120s）封顶。
 
 ## 事件（发到 `memory.session.trace`，`type` 字段）
 
 浏览器 SSE 就是轮询这些 trace 事件。**新增 / 改事件类型要同步前端 `render()`**：
 
 - `chat_start` / `user` / `thinking`（规划摘要）/ `plan` / `tool_call` / `tool_result` / `assistant` / `error`
+- `retry`（PLAN T3）：LLM 瞬态失败重试观测，带 `attempt` / `delay_ms` / `reason`；前端未知类型按前向兼容忽略。
+- `tool_call` / `tool_result` 事件带 `id`（tool_call_id，审计对位）；`tool_result` 另带 `ms`（该工具
+  自身耗时）、`ok`、`result_truncated`（2000 字符）、`memory_truncated`（回喂进 memory 的内容是否被截断）。
 - 最终 `assistant` 事件承载完整答案，并附 `reasoning` / `usage` / `elapsed_ms`（多轮累计；
   字段缺省即 provider 未提供，旧消费者无感知）。
 - `error` 事件含人类可读原因，前端据此以红条收尾。
 
-## 上下文压缩（summarize）
+## 上下文体积管理（截断 + 压缩 + 窗口 + token 闸，四层）
 
-- 历史超过 `COMPACT_TRIGGER`（默认 40 条，`0` = 禁用）且本次 LLM 调用返回 `tool_calls` 时触发。
-- 调 `memory.summarize`，保留最近 `COMPACT_KEEP`（默认 10）条；防撕裂逻辑在 memory 插件侧。
+| 层 | 闸门 | 默认 | 说明 |
+|---|---|---|---|
+| 单条 | `TOOL_RESULT_LIMIT` | 8000 字符（`0`=禁用） | 工具结果回喂前按字符截断，追加 `…[truncated]` 标记（模型可感知被裁剪）；**发生在入 memory 之前**——memory 即上下文来源，全文不入库 |
+| 跨会话 | `COMPACT_TRIGGER` / `COMPACT_KEEP` | 40 / 10 条（`0`=禁用） | chat 开局按**全量历史**判断：超 TRIGGER 则旧史交 LLM 摘要，经 `memory.summarize` 落盘（防撕裂在 memory 侧）；任何失败 → 降级不压缩 |
+| token 闸 | `LLM_CONTEXT_TOKENS` | `0`=禁用 | 模型上下文窗口（token）。发送预算 = 窗口 × 0.7（预留输出与工具 schema）；**压缩双闸之二**：估算工作集（CJK ≈ 1 token/字、其余 ≈ 4 字符/token，保守高估）超预算即触发压缩——单条大结果在条数闸之前就能撑爆窗口（PLAN R6）。窗口值还随 `llm.chat` payload 透传 `num_ctx`（ollama native 映射 `options.num_ctx`，本地估算闸与服务端窗口对齐；0/缺省不下发） |
+| 单次发送 | `HISTORY_LIMIT` | 无限制 | 只裁剪发给 LLM 的工作集（保留最近 N 条），**发生在压缩判断之后**——若截断在前，LIMIT < TRIGGER 时压缩永不触发（PLAN R3） |
+
 - 压缩那次 LLM 调用**不带流式旁路**（不是给用户看的产出）。
+- 顺序固定：全量拉取 → 压缩判断（双闸：条数 **或** token，可落盘）→ HISTORY_LIMIT 窗口 →
+  **发送前逐级收紧**（PLAN P7：token 闸启用且估算仍超预算 → 窗口条数减半 → tool_result 限额减半 →
+  仍超则返回 `CONTEXT_OVERFLOW` 错误 payload，**正文请求不发出**；ctx 元数据含 limit/budget/estimated）→
+  进本轮循环。收紧只影响本轮工作集，memory 全量历史不受影响。
 
 ## 技能自扩展
 
@@ -71,16 +100,17 @@ react-agent 的大脑：把"用户一句话"变成"多轮感知 → 规划 → �
 - 旁路路径规则 ↔ `crates/host/src/config.rs::stream_file`。
 - 新增硬依赖 capability ↔ host 注册顺序（`crates/host/src/main.rs`）。
 
-## 运行中断（停止）—— 当前未支持
+## 运行中断（停止）
 
-ReAct 主循环从 `llm.chat` 阻塞直到收敛，循环内**没有取消检查**；`chat` 事件发射完才结束。
-`POST /api/chat` 也是阻塞式（host 侧等 agent.chat 返回）。因此运行中的一轮**无法中途打断**——
-关闭页面或杀进程即整体终止。要支持「停止」按钮，需要三处联动改造：
+ReAct 主循环在**轮次边界**轮询取消标志（PLAN P2/T1），运行中的对话可被用户中止：
 
-1. **agent-loop**：引入取消令牌（如 `Arc<AtomicBool>` 或 `oneshot::Receiver`），在每轮迭代开头、
-   LLM 流式 `delta` 消费处、以及 `tools.exec`（长命令）处轮询；置位即中断循环、发 `error`/截断 `assistant` 事件。
-2. **host**：增加取消接口（如 `POST /api/chat/cancel?session=` 写全局/按 session 的取消标志，
-   或持有 `JoinHandle` 改为可中止），让取消信号能穿透到阻塞的 `agent.chat`。
-3. **前端**：`index.html` 加「停止」按钮（与发送互斥），点击发取消请求，并撤销 / 标灰该轮未完成的流式气泡。
+- **agent-loop**：`cancels: Mutex<HashSet<String>>` 存被请求取消的 session id。`cancel` op 置位
+  （缺 `session_id` → K400）；循环在轮次边界（每轮开头 / 工具波次后 / 强制收敛轮前）**take 命中即清**，
+  发 `error`（where=cancel）事件并以 K499 收敛。语义为 **Concurrent**——Serial 会让 cancel dispatch
+  在 per-plugin 锁后排队到 chat 结束之后（取消永远迟到）；`max_inflight=8` 预留 cancel 通道余量。
+- **残留防护**：chat 开局 + 结束双保险清理同 session 残留标志——取消晚到（chat 已收敛）不误杀下轮对话。
+- **host**：`POST /api/chat/cancel?session=` 转发 `cancel` op，立即返回（不等 chat 收敛）。
+- **前端**：发送期间显示「停止」按钮（与发送互斥），点击发取消请求并以状态条反馈。
 
-这是一个独立功能，不在当前增量 SSE 修复范围内。
+**粒度边界**：取消生效于轮次边界，半轮不中断——进行中的 LLM 流式与工具执行照常完成，随后不再进入下一轮。
+同族停车检查还有总预算（时长/token，K508，见「核心循环」）。

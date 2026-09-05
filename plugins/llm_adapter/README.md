@@ -11,7 +11,7 @@
 | `providers/base.py` | pack 协议 + 公共工具：`err` / `norm` / `as_object` / `require_httpx` / `map_usage` / `StreamSink` |
 | `providers/registry.py` | 导入期自动发现 `providers/*.py`，校验 `PROVIDER` 形状，重名即拒 |
 | `providers/openai_compat.py` | OpenAI 兼容族共享实现（openai / DeepSeek / Moonshot…），`_chat_with` 是唯一入口 |
-| `providers/ollama.py` | ollama：复用 `openai_compat._chat_with`，只换端点解析（`OLLAMA_HOST` → `/v1`），本地免 key |
+| `providers/ollama.py` | ollama：**原生 `/api/chat` 传输**（NDJSON 流式 + `options.num_ctx` 窗口控制，缺省）；`OLLAMA_ENDPOINT=v1` 回退复用 `openai_compat._chat_with`（`OLLAMA_HOST` → `/v1`）。本地免 key |
 | `providers/anthropic.py` | Anthropic 原生协议 |
 | `providers/mock.py` | `MOCK_SCRIPT` 脚本化响应（测试 / 演示） |
 
@@ -19,19 +19,29 @@
 
 ```jsonc
 // chat
-{"op":"chat","provider"?,"messages":[...],"tools"?:[...],"stream_path"?,"sid"?}
+{"op":"chat","provider"?,"messages":[...],"tools"?:[...],"stream_path"?,"sid"?,"num_ctx"?:int}
 → {"ok":true,"content":str|null,"tool_calls":[{"id","name","arguments":object}],
    "model":str,"finish_reason":str,
    // 追加可选字段：缺省即 provider 未提供，旧消费者无感知
    "reasoning"?:str, "usage"?:{...}, "elapsed_ms"?:int}
 → {"ok":false,"error":{"code","message"}}
+//   HTTP ≥ 400 经 err_from_resp 归一化（base.py）：响应体命中「上下文超限」特征
+//   （ollama exceed_context_size_error / OpenAI context_length_exceeded / Anthropic prompt is too long）
+//   且 status ∈ (400,413) → code=CONTEXT_OVERFLOW，并尽力附带 "ctx":{"limit"?,"required"?}
+//   （ollama n_ctx/n_prompt_tokens 等，provider 给了才带）；ollama 500
+//   「no user query found in messages」（前缀截断连锁：输入超窗口，服务端从前往后截断把
+//   user 消息截没了）同归 CONTEXT_OVERFLOW；其余错误维持 LLM_ERROR 原文透传。
+// num_ctx：agent-loop 从 LLM_CONTEXT_TOKENS 下发（0/缺省不带，向后兼容）；仅 ollama native
+//   映射 options.num_ctx，openai_compat / anthropic 忽略（窗口由服务端模型决定）。
 
 // configure（运行时热配置）
 {"op":"configure","provider"?,"model"?,"base_url"?,"api_key"?}
 → {"ok":true,"applied":{...}}   // api_key 只回 api_key_set:true，明文不回显、不落日志
 
 // models.list
-{"op":"models.list","provider"?} → {"ok":true,"models":[str]}
+{"op":"models.list","provider"?} → {"ok":true,"models":[str],"models_meta"?}
+// models_meta 为可选扩展（ollama 独有）：[{"name","ctx_limit"?}]，ctx_limit 来自 native
+// /api/show 的 <family>.context_length（模型原生上下文窗口），取不到省略键；其他 provider 不带。
 ```
 
 ## 新增一个 provider（标准步骤）
@@ -62,6 +72,9 @@ provider 优先级：**请求 `payload["provider"]` > 环境变量 `LLM_PROVIDER
 | `openai` 兼容（可指 DeepSeek 等） | `LLM_BASE_URL` | `OPENAI_API_KEY` |
 | `anthropic` | `ANTHROPIC_BASE_URL` | `ANTHROPIC_API_KEY` |
 | `ollama` | `OLLAMA_HOST`（默认 `localhost:11434`） | 不接受（传了报字段级 400） |
+
+ollama 另有传输通道开关 `OLLAMA_ENDPOINT`：`native`（缺省，走原生 `/api/chat`，
+支持 per-request `options.num_ctx` 与 NDJSON 流式）| `v1`（回退 OpenAI 兼容层 `/v1`）。
 
 ## 流式旁路
 
@@ -95,7 +108,8 @@ llm-adapter（子进程）                              host（本进程）
 
 ### SSE 解析规则（改这里前先看 deepseek-harness 的约定）
 
-- 思考通道字段：`reasoning_content`（DeepSeek）或 `reasoning`（部分网关）。
+- 思考通道字段：`reasoning_content`（DeepSeek）或 `reasoning`（部分网关）；
+  ollama native 为 `message.thinking`（NDJSON 帧级字段，同样只在有内容时才发 delta）。
 - **首 chunk 常带空串 `reasoning_content: ""`，不得据此开思考块**——空值一律跳过。
 - 顺序：思考先、正文后；各自独立块。
 - `finish` 以 `[DONE]` 为准，不是见 `finish_reason` 就结束。
@@ -127,4 +141,6 @@ llm-adapter（子进程）                              host（本进程）
 3. **非思考模型没有 `reasoning_content`**：完全没该字段 = 非思考模式，不开思考块，属正常现象，不是 bug。
 4. **reasoning-only 的 assistant 消息**：回传历史时 `content` 必须是 `""` 不能用 `null`
    （deepseek-harness 的血泪教训：`null` 会毒化会话日志，后续每轮都废）。
-5. **ollama 的 OpenAI 兼容端点**：`base_url` 是 `http://<OLLAMA_HOST>/v1`，本地免 key。
+5. **ollama 传输通道**：缺省走**原生 `/api/chat`**（`options.num_ctx` 窗口控制 + NDJSON 流式；
+   native 无 tool_call_id，tool 消息按 `tool_name` 对位）；设 `OLLAMA_ENDPOINT=v1` 回退
+   OpenAI 兼容层（`http://<OLLAMA_HOST>/v1`，语义损失见 `providers/ollama.py` 模块注释）。本地免 key。

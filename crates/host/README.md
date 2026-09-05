@@ -26,7 +26,7 @@ react-agent 的运行时：拉起全部 guest 插件、暴露 Web UI 与 SSE、�
 ## 配置
 
 - 来源优先级：CLI `--local` / `--port` / `--session` > env > `config.json`（持久项，宿主启动时会写回 3 项）。
-- `config.rs::llm_env()` / `passthrough_env()`：`LLM_*`、`OLLAMA_HOST`、`ANTHROPIC_*`、`SEARCH_*`、`BASH_SANDBOX` 等，
+- `config.rs::llm_env()` / `passthrough_env()`：`LLM_*`、`OLLAMA_HOST`、`OLLAMA_ENDPOINT`、`ANTHROPIC_*`、`SEARCH_*`、`BASH_SANDBOX` 等，
   **新增 provider 环境变量要在这里下发**（否则 guest 收不到）。
 - `config.json` 持久化项与前端 `/api/config` 读写对应（工具白名单、模型、provider 等）。
 
@@ -70,9 +70,8 @@ react-agent 的运行时：拉起全部 guest 插件、暴露 Web UI 与 SSE、�
 
 ## 已知限制
 
-- **运行中断（停止）未支持**：前端无「停止」按钮，`POST /api/chat` 阻塞至收敛；agent-loop 循环内也无
-  取消检查。想中途打断只能关闭页面 / 杀进程（即直接终止）。如需支持，需三处联动——
-  ① agent-loop 在每轮 + LLM 流式生成处检查取消令牌；② host 增加取消接口（中断阻塞的 chat）；
-  ③ 前端加停止按钮并撤销未完成的流式气泡（详见 agent-loop README「运行中断」）。
+- **运行中断（停止）**：已支持（P2/T1）。`POST /api/chat/cancel?session=` 转发 agent-loop `cancel` op
+  （置位取消标志，立即返回）；前端发送期间显示「停止」按钮；循环在轮次边界命中即以 K499 收敛
+  （半轮不中断——进行中的 LLM 流式与工具执行照常完成）。详见 agent-loop README「运行中断（停止）」。
 - **sid 跨对话不保证唯一**：同 round 的不同对话回合 sid 相同，重连去重（`doneSids`）可能误忽略后一回合的
   流式动画（直接显示最终答案）。属已知退化，不影响最终内容完整性。

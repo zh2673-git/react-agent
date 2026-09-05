@@ -25,13 +25,75 @@
 
 import json
 import os
+import re
 import time
-
-import json
 
 
 def err(message: str, code: str = "LLM_ERROR") -> dict:
     return {"ok": False, "error": {"code": code, "message": message}}
+
+
+# 「上下文超限」类失败特征（L1/R8）：确定性但可行动——agent-loop 据此降级重试而非直接失败。
+_OVERFLOW_MARKERS = (
+    "exceed_context_size_error",           # ollama 结构化 code
+    "exceeds the available context size",  # ollama 文案
+    "context_length_exceeded",             # OpenAI 兼容族结构化 code
+    "maximum context length",              # OpenAI 兼容族文案
+    "prompt is too long",                  # Anthropic
+)
+
+
+def _is_context_overflow(resp_text: str) -> bool:
+    low = resp_text.lower()
+    return any(m in low for m in _OVERFLOW_MARKERS)
+
+
+# ollama 前缀截断连锁（L2）：输入超窗口时服务端从前往后截断（system/user 先被丢弃），
+# 报 500「no user query found in messages」——文案指向「缺 user 消息」，真实原因是窗口装不下。
+# 该文案是 ollama 特有形态，仅对 ollama + 精确匹配放行 500（避免 OpenAI 500 误判泛滥）。
+_OLLAMA_TRUNCATION_MARKER = "no user query found in messages"
+
+
+def err_from_resp(provider: str, status: int, resp_text: str) -> dict:
+    """HTTP ≥ 400 响应 → 归一化错误 payload（L1/R8，归属 adapter：形状归一化的错误侧对齐）。
+
+    命中「上下文超限」类（ollama exceed_context_size_error / OpenAI context_length_exceeded /
+    Anthropic prompt is too long 等）→ code=CONTEXT_OVERFLOW（+ limit/required 元数据，尽力而为）；
+    另对 ollama 放行一条 500 特例（前缀截断连锁，L2）→ 同归 CONTEXT_OVERFLOW；
+    未命中 → 维持既有形状原文透传（code=LLM_ERROR），消费方行为不变。
+    """
+    message = f"{provider} HTTP {status}: {resp_text[:500]}"
+    overflow = status in (400, 413) and _is_context_overflow(resp_text)
+    if not overflow and provider == "ollama" and status == 500 and _OLLAMA_TRUNCATION_MARKER in resp_text.lower():
+        overflow = True
+    if overflow:
+        error = {"code": "CONTEXT_OVERFLOW", "message": message}
+        ctx = _extract_ctx(resp_text)
+        if ctx:
+            error["ctx"] = ctx
+        return {"ok": False, "error": error}
+    return err(message)
+
+
+def _extract_ctx(resp_text: str) -> dict:
+    """尽力提取窗口元数据（provider 给了才带，不做猜测）。
+
+    ollama /v1 的错误 message 内还嵌套一层 JSON 字符串（引号带反斜杠转义），
+    故数字模式须兼容 `\"n_ctx\":4096` 形态。
+    """
+    ctx: dict = {}
+    low = resp_text.lower()
+    m = re.search(r'n_ctx\\?"?\s*[:=]\s*(\d+)', resp_text) or re.search(r"maximum context length is (\d+)", low)
+    if m:
+        ctx["limit"] = int(m.group(1))
+    m = (
+        re.search(r'n_prompt_tokens\\?"?\s*[:=]\s*(\d+)', resp_text)
+        or re.search(r"you requested (\d+) tokens", low)
+        or re.search(r"too long:\s*(\d+)\s*tokens", low)
+    )
+    if m:
+        ctx["required"] = int(m.group(1))
+    return ctx
 
 
 def norm(content, calls, model, finish_reason, reasoning=None, usage=None, elapsed_ms=None) -> dict:

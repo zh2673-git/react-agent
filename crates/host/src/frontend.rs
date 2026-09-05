@@ -1,7 +1,8 @@
 //! 前端装配（Phase 3-2，01 §Phase3）：`trait Frontend` 两实现。
 //!
 //! - `ReplFrontend`：终端交互（REPL / 单轮），斜杠命令见 `repl_command`。
-//! - `WebFrontend`：DeepSeek 风格「事件流式会话」——静态单页（web-dist/index.html 运行时 serve）+ SSE 实时渲染 + 日志重放恢复。
+//! - `WebFrontend`：Cursor 暖色系「事件流式会话」（主题 token 真值见 host PLAN W1）——
+//!   静态单页（web-dist/index.html 运行时 serve）+ SSE 实时渲染 + 日志重放恢复。
 //!
 //! host 是组合根：前端是**入口组件**而非 guest 能力——网关需调 `agent.chat` + `session.trace`，
 //! 而 guest 不可互调（内核物理约束）；前端切换必伴随重启，热插拔无收益。
@@ -197,6 +198,7 @@ async fn assets(kernel: &Kernel, payload: Value) -> Option<Value> {
 ///   GET  /                      → 单页（web-dist/index.html，运行时读取，改样式刷新即生效）
 ///   GET  /api/events?session=&after= → SSE：增量轮询 memory trace.read，逐事件推送
 ///   POST /api/chat              → {"session_id","message"} → agent.chat（阻塞到收敛）
+///   POST /api/chat/cancel?session= → agent-loop cancel op（置位取消标志，立即返回）
 pub struct WebFrontend {
     addr: String,
 }
@@ -355,6 +357,25 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
         ("DELETE", r) if r.starts_with("/api/skills/") => {
             delete_skill(&mut stream, r.trim_start_matches("/api/skills/")).await
         }
+        ("POST", "/api/chat/cancel") => {
+            // P2/T1：取消运行中的 chat。转发 agent-loop `cancel` op（置位取消标志，
+            // 循环在轮次边界收敛为 K499）。不等待 chat 结束，立即返回。
+            let session = parse_query(query).get("session").cloned().unwrap_or_default();
+            if session.is_empty() {
+                return json_resp(&mut stream, 400, bad_request("缺 session 参数", Some("session"))).await;
+            }
+            match dispatch_or_err(&kernel, "agent-loop", json!({"op": "cancel", "session_id": session})).await {
+                Ok(_) => {
+                    json_resp(
+                        &mut stream,
+                        200,
+                        json!({"ok": true, "session_id": session, "note": "取消信号已置位；当前轮完成后中断"}),
+                    )
+                    .await
+                }
+                Err(e) => json_resp(&mut stream, 502, e).await,
+            }
+        }
         ("POST", "/api/chat") => {
             let req: Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
@@ -424,7 +445,8 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
 // ── 配置中心与技能 CRUD（08 §2.2）──
 
 /// GET /api/models：转发 llm-adapter `models.list`，返回该 provider 当前可用模型 id 列表
-/// （openai/deepseek 走 `/v1/models`；ollama 走 `/api/tags`；anthropic/mock 走静态清单）。
+/// （openai/deepseek 走 `/v1/models`；ollama 走 `/api/tags` + 逐模型 `/api/show` 探测原生窗口；
+/// anthropic/mock 走静态清单）。models_meta 为可选扩展（原生窗口 ctx_limit），存在才透传。
 async fn get_models(stream: &mut TcpStream, kernel: &Kernel, query: &str) -> anyhow::Result<()> {
     // 前端可经 ?provider= 覆盖（未保存设置时也能拉对应 provider 的模型清单）
     let provider = parse_query(query).get("provider").cloned().unwrap_or_default();
@@ -435,7 +457,11 @@ async fn get_models(stream: &mut TcpStream, kernel: &Kernel, query: &str) -> any
     match dispatch_or_err(kernel, "llm-adapter", op).await {
         Ok(v) => {
             let models = v.get("models").and_then(Value::as_array).cloned().unwrap_or_default();
-            json_resp(stream, 200, json!({"ok": true, "models": models})).await
+            let mut out = json!({ "ok": true, "models": models });
+            if let Some(meta) = v.get("models_meta") {
+                out["models_meta"] = meta.clone();
+            }
+            json_resp(stream, 200, out).await
         }
         Err(e) => json_resp(stream, 502, e).await,
     }
@@ -451,6 +477,71 @@ fn bad_request(msg: impl Into<String>, field: Option<&str>) -> Value {
         error["field"] = json!(f);
     }
     json!({"ok": false, "error": error})
+}
+
+/// agent 段数值键（P5/E1）：非法值（非数字）直接 400，防垃圾配置静默失效。
+const AGENT_NUMERIC_KEYS: &[&str] = &[
+    "max_rounds",
+    "history_limit",
+    "compact_trigger",
+    "compact_keep",
+    "tool_result_limit",
+    "budget_secs",
+    "token_budget",
+    "retry_attempts",
+    "retry_base_ms",
+    "llm_context_tokens",
+];
+
+/// agent 段设置热应用（P5/E1）：逐键 set env（agent-loop InProcess 在本进程自读，
+/// 下轮对话即生效；MAX_ROUNDS 每轮读取，同样热生效）。返回应用的键数。
+fn apply_agent_to_env(agent: &Value) -> Result<usize, String> {
+    let Some(obj) = agent.as_object() else {
+        return Err("agent 需为对象".into());
+    };
+    let mut n = 0;
+    for (k, v) in obj {
+        if v.is_null() {
+            continue;
+        }
+        if AGENT_NUMERIC_KEYS.contains(&k.as_str()) {
+            let ok = v.is_number() || v.as_str().map(|s| s.trim().parse::<f64>().is_ok()).unwrap_or(false);
+            if !ok {
+                return Err(format!("{k} 需为数字"));
+            }
+        }
+        let Some((_, env)) = config::AGENT_ENV_MAP.iter().find(|(k2, _)| k2 == k) else {
+            continue; // 未知键忽略（前向兼容），不落 env
+        };
+        let s = match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        std::env::set_var(env, s);
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// agent 段回显视图（P5/E1）：env 当前值（含缺省语义）。system_prompt 在面板编辑；
+/// PROMPT 具名模板仍由 REPL /prompt 管理，不在此回显。
+fn agent_config_view() -> Value {
+    fn env_num(k: &str, d: i64) -> i64 {
+        std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d)
+    }
+    json!({
+        "max_rounds": env_num("MAX_ROUNDS", 8),
+        "system_prompt": std::env::var("AGENT_SYSTEM_PROMPT").unwrap_or_default(),
+        "history_limit": env_num("HISTORY_LIMIT", 0),
+        "compact_trigger": env_num("COMPACT_TRIGGER", 40),
+        "compact_keep": env_num("COMPACT_KEEP", 10),
+        "tool_result_limit": env_num("TOOL_RESULT_LIMIT", 8000),
+        "budget_secs": env_num("CHAT_BUDGET_SECS", 300),
+        "token_budget": env_num("CHAT_TOKEN_BUDGET", 0),
+        "retry_attempts": env_num("LLM_RETRY_ATTEMPTS", 2),
+        "retry_base_ms": env_num("LLM_RETRY_BASE_MS", 500),
+        "llm_context_tokens": env_num("LLM_CONTEXT_TOKENS", 0),
+    })
 }
 
 /// guest 调用便捷封装：ok → Ok(v)；业务失败/传输失败 → Err（错误 payload）。
@@ -538,22 +629,25 @@ async fn get_config(stream: &mut TcpStream, kernel: &Kernel) -> anyhow::Result<(
                 "llm": {"provider": provider, "model": model, "base_url": base_url, "ollama_host": ollama_host, "key": key_view},
                 "tools": tools,
                 "skills_count": skills_count,
+                "agent": agent_config_view(),
             },
         }),
     )
     .await
 }
 
-/// PUT /api/config：llm → llm-adapter configure（env 热应用）；tools → tools configure（白名单替换）。
-/// 全成后 merge 落 config.json（重启由持久通道还原）；任一失败 → 字段级 400 且不落盘（重启即回滚）。
+/// PUT /api/config：llm → llm-adapter configure（env 热应用）；tools → tools configure（白名单替换）；
+/// agent → env 热应用（agent-loop InProcess 自读，下轮对话生效）。全成后 merge 落 config.json
+/// （重启由持久通道还原）；任一失败 → 字段级 400 且不落盘（重启即回滚）。
 async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[u8]) -> anyhow::Result<()> {
     let Ok(req) = serde_json::from_slice::<Value>(body) else {
         return json_resp(stream, 400, bad_request("body 非法 JSON", None)).await;
     };
     let llm = req.get("llm").filter(|v| v.is_object());
     let tools = req.get("tools").filter(|v| v.is_object());
-    if llm.is_none() && tools.is_none() {
-        return json_resp(stream, 400, bad_request("body 需含 llm 或 tools 对象", None)).await;
+    let agent = req.get("agent").filter(|v| v.is_object());
+    if llm.is_none() && tools.is_none() && agent.is_none() {
+        return json_resp(stream, 400, bad_request("body 需含 llm / tools / agent 对象", None)).await;
     }
     if let Some(llm) = llm {
         let mut payload = json!({"op": "configure"});
@@ -572,6 +666,12 @@ async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[u8]) -> any
         };
         if let Err(e) = dispatch_or_err(kernel, "tools", json!({"op": "configure", "enabled": enabled})).await {
             return json_resp(stream, 400, e).await;
+        }
+    }
+    // agent 段（P5/E1）：数值轻校验 → env 热应用（失败即 400 不落盘）
+    if let Some(agent) = agent {
+        if let Err(msg) = apply_agent_to_env(agent) {
+            return json_resp(stream, 400, bad_request(msg, Some("agent"))).await;
         }
     }
     // 全成 → merge 落盘（llm 逐字段合并保留未改字段如 api_key；tools.enabled 整体替换）
@@ -597,6 +697,16 @@ async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[u8]) -> any
         let mut cur = cfg.get("tools").cloned().unwrap_or_else(|| json!({}));
         cur["enabled"] = enabled;
         cfg["tools"] = cur;
+    }
+    // agent 段 merge（P5/E1）：逐字段替换（null 不覆盖），未知键原样保留（前向兼容）
+    if let Some(agent) = agent.and_then(|a| a.as_object().cloned()) {
+        let mut cur = cfg.get("agent").cloned().unwrap_or_else(|| json!({}));
+        for (k, v) in agent {
+            if !v.is_null() {
+                cur[k] = v;
+            }
+        }
+        cfg["agent"] = cur;
     }
     match config::persist_config(&cfg) {
         Ok(()) => json_resp(
@@ -947,5 +1057,35 @@ mod tests {
         assert_eq!(q.get("after").unwrap(), "7");
         assert_eq!(q.get("x").unwrap(), "");
         assert!(q.get("missing").is_none());
+    }
+
+    #[test]
+    fn agent_config_applies_to_env_and_validates_numbers() {
+        // P5/E1：agent 段热通道——合法键落 env、数值键轻校验、未知键忽略。
+        let keys = ["MAX_ROUNDS", "CHAT_TOKEN_BUDGET", "AGENT_SYSTEM_PROMPT", "COMPACT_TRIGGER"];
+        let saved: Vec<(String, Option<String>)> = keys.iter().map(|k| (k.to_string(), std::env::var(k).ok())).collect();
+
+        let ok = serde_json::json!({"max_rounds": 12, "token_budget": 500, "system_prompt": "P5 PROMPT", "unknown_key": 1});
+        let n = apply_agent_to_env(&ok).expect("valid agent");
+        assert_eq!(n, 3, "3 个已知键生效，未知键忽略: n={n}");
+        assert_eq!(std::env::var("MAX_ROUNDS").unwrap(), "12");
+        assert_eq!(std::env::var("CHAT_TOKEN_BUDGET").unwrap(), "500");
+        assert_eq!(std::env::var("AGENT_SYSTEM_PROMPT").unwrap(), "P5 PROMPT");
+
+        // 数值键传字符串数字 → 放行（面板可能以字符串提交）
+        let s = serde_json::json!({"compact_trigger": "20"});
+        assert!(apply_agent_to_env(&s).is_ok());
+        assert_eq!(std::env::var("COMPACT_TRIGGER").unwrap(), "20");
+
+        // 数值键传垃圾 → 400 语义
+        let bad = serde_json::json!({"max_rounds": "abc"});
+        assert!(apply_agent_to_env(&bad).is_err());
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 }

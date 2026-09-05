@@ -8,7 +8,7 @@ import json
 import os
 import time
 
-from .base import StreamSink, as_object, err, map_usage, norm, require_httpx
+from .base import StreamSink, as_object, err, err_from_resp, map_usage, norm, require_httpx
 
 
 def resolve_openai() -> dict:
@@ -70,7 +70,7 @@ def _chat_once(endpoint: dict, body: dict, provider_label: str) -> dict:
     resp = httpx.post(f"{endpoint['base_url']}/chat/completions", json=body, headers=endpoint["headers"], timeout=120.0)
     elapsed_ms = int((time.monotonic() - start) * 1000)
     if resp.status_code >= 400:
-        return err(f"{provider_label} HTTP {resp.status_code}: {resp.text[:500]}")
+        return err_from_resp(provider_label, resp.status_code, resp.text)
     data = resp.json()
     msg = data["choices"][0]["message"]
     calls = [
@@ -137,9 +137,9 @@ def _stream_once(endpoint: dict, body: dict, sink: StreamSink, provider_label: s
                     # 部分兼容层（自托管网关等）不认 stream_options → 去掉重试一次。
                     # 复用同一 sink：start 行不重复写，前端不会重开气泡。
                     return _stream_once(endpoint, body, sink, provider_label, False)
-                message = f"{provider_label} HTTP {resp.status_code}: {resp.text[:500]}"
-                sink.error(message)
-                return err(message)
+                payload = err_from_resp(provider_label, resp.status_code, resp.text)
+                sink.error(payload["error"]["message"])
+                return payload
             for raw in resp.iter_lines():
                 line = raw.strip() if isinstance(raw, str) else raw.decode("utf-8", "replace").strip()
                 if not line:

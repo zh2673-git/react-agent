@@ -64,6 +64,7 @@
 | `PLUGINS_DIR` | 插件目录 | host |
 | `LLM_PROVIDER` / `LLM_MODEL` / `LLM_BASE_URL` | LLM 选路与端点 | llm-adapter |
 | `OLLAMA_HOST` | ollama 地址（默认 `localhost:11434`） | llm-adapter |
+| `OLLAMA_ENDPOINT` | ollama 传输通道：native（原生 `/api/chat`，缺省）/ v1（回退 OpenAI 兼容层） | llm-adapter |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | 鉴权与端点 | llm-adapter |
 | `MOCK_SCRIPT` | mock provider 脚本化响应 | llm-adapter |
 | `AGENT_STREAM_DIR` | 流式旁路目录（默认 `<项目根>/.stream`） | host 下发 → agent-loop |

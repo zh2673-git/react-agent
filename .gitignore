@@ -6,3 +6,5 @@ plugins/memory/data/
 *.log
 .stream/
 config.json
+PLAN.md
+project-development-prompt.md

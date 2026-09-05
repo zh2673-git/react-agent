@@ -57,6 +57,19 @@ pub struct ChatReq {
     #[serde(default = "default_session")]
     pub session_id: String,
     pub user_text: String,
+    /// 委派深度，随调用链传播（非插件级共享状态）：0=顶层会话；1=子代理。
+    /// 子代理链内（depth >= 1）拒绝再调 task，嵌套上限由此收敛；
+    /// 缺省 0 向后兼容既有调用方（host/e2e 无需携带）。
+    #[serde(default)]
+    pub depth: u32,
+    /// 剩余预算（T4，随链继承）：单次 chat 墙钟剩余毫秒。顶层请求缺省
+    /// （读 env 缺省值）；子代理由父链传入**衰减后**的剩余，防「子代理继承
+    /// 同预算无衰减」——每层委派都在消耗同一份总预算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_ms_left: Option<u64>,
+    /// 剩余 token 预算（T4）：input+output 累计口径。继承语义同上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_left: Option<u64>,
 }
 
 fn default_session() -> String {

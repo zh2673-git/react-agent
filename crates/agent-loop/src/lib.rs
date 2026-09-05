@@ -2,7 +2,11 @@
 //!
 //! 时间契约：主执行流为**状态机循环**（感知→规划→行动→观察→回跳），收敛于最终答案
 //! 或 `max_rounds` 强制收敛。循环状态全部存于局部变量与会话记忆（memory 插件），
-//! 本体 `&self` 无跨调用可变态（A1）。
+//! 本体 `&self` 无跨调用可变态（A1）。委派深度随调用链传播（`ChatReq.depth`），
+//! 非插件级共享状态——并发下各链互不挤占委派额度。
+//! 取消（P2/T1）：`cancel` op 置位会话标志，循环在轮次边界（每轮开头/工具波次后）
+//! 轮询命中即收敛为 K499；语义为 Concurrent——否则 cancel 会在 per-plugin 锁后排队、
+//! 迟到到 chat 结束之后。
 //!
 //! 空间契约：跨插件通信一律走 `HostApi::call_plugin`（按 `Envelope.target` 路由），
 //! 不直接触碰任何其他插件的状态。
@@ -15,6 +19,7 @@
 //! 保留名路由（03 §3）：工具调用名 `load_skill` 不进 tools 分发，由本插件路由到
 //! assets `skills.load`。它不出现在 tools.list——模型可见性来自系统提示词附录。
 
+mod context;
 mod contract;
 
 pub use contract::{ChatReq, LlmChatResp, MemoryMsg, StepRecord, ToolCall, ToolSpec};
@@ -22,8 +27,9 @@ pub use contract::{ChatReq, LlmChatResp, MemoryMsg, StepRecord, ToolCall, ToolSp
 use agent_kernel_sdk::*;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -45,6 +51,10 @@ const TOOLS_DEADLINE: Duration = Duration::from_secs(60);
 const LLM_DEADLINE: Duration = Duration::from_secs(120);
 const ASSETS_DEADLINE: Duration = Duration::from_secs(5);
 
+/// 工具结果回喂上限（字符数，PLAN R2）：防止单条大结果撑爆上下文与 memory。
+/// 0 = 禁用截断。可用 `TOOL_RESULT_LIMIT` 覆盖。
+const DEFAULT_TOOL_RESULT_CHARS: usize = 8000;
+
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a capable agent working in a workspace. \
 Answer the user's request. When tools are provided and useful, call them (one batch per round); \
 after receiving tool results, continue reasoning until you can produce the final answer in plain text. \
@@ -54,10 +64,11 @@ pub struct AgentLoopPlugin {
     max_rounds: usize,
     manifest: Manifest,
     host: OnceLock<Arc<dyn HostApi>>,
-    /// 委派深度（0=空闲；顶层 chat=1；子代理 chat=2）。>1 时拒绝再嵌套 task。
-    depth: AtomicU32,
-    /// 子会话计数（session_id 唯一性）。
+    /// 子会话计数（sub_session id 唯一性；并发下各链父会话 id 不同，全局递增即可）。
     sub_counter: AtomicU64,
+    /// 取消令牌（P2/T1）：被请求取消的 session id 集合。`cancel` op 置位，循环在
+    /// 轮次边界 take（命中即清）；chat 结束时兜底清理，防残留标志误杀同 session 下轮对话。
+    cancels: Mutex<HashSet<String>>,
 }
 
 /// 构造插件实例（`Arc<dyn Plugin>`）。
@@ -74,9 +85,12 @@ pub fn new(max_rounds: usize) -> PluginInstance {
             DependencySpec { capability: Capability::new("tools.exec"), hard: true },
         ],
         domain: Domain::InProcess,
-        semantics: Semantics::Serial,
+        // Concurrent（P2/T1）：本体 &self 无跨调用可变态（A1），并发安全由构造保证；
+        // Serial 会让 cancel dispatch 在 per-plugin 锁后排队到 chat 结束之后（取消永远迟到）。
+        semantics: Semantics::Concurrent,
         priority: 1,
-        max_inflight: Some(4),
+        // 8 = 并发 chat 槽位 + cancel 通道余量（cancel 不应被满载 chat 挤掉）。
+        max_inflight: Some(8),
         fuel_limit: None,
         host_timeout_ms: None,
         epoch_interval_ms: None,
@@ -86,23 +100,9 @@ pub fn new(max_rounds: usize) -> PluginInstance {
         max_rounds,
         manifest,
         host: OnceLock::new(),
-        depth: AtomicU32::new(0),
         sub_counter: AtomicU64::new(0),
+        cancels: Mutex::new(HashSet::new()),
     })
-}
-
-/// 委派深度守卫：构造时 depth+1，退出（含早退）自动 -1。
-struct DepthGuard<'a>(&'a AtomicU32);
-impl<'a> DepthGuard<'a> {
-    fn new(d: &'a AtomicU32) -> Self {
-        d.fetch_add(1, Ordering::SeqCst);
-        Self(d)
-    }
-}
-impl Drop for DepthGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 /// 路径前缀包含判断（L1 可达性探测）：分隔符归一 + Windows 大小写不敏感。
@@ -154,6 +154,101 @@ fn stream_file_for(session: &str) -> Option<String> {
     Some(dir.join(format!("{session}.jsonl")).to_string_lossy().into_owned())
 }
 
+/// 工具结果回喂上限（字符）：0 = 禁用。
+fn tool_result_limit() -> usize {
+    std::env::var("TOOL_RESULT_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_TOOL_RESULT_CHARS)
+}
+
+/// 单次 chat 总时长预算（T4）：`CHAT_BUDGET_SECS`（秒，支持小数便于测试；0=禁用，缺省 300）。
+/// 这是轮次边界的护栏——轮内超支由单步 deadline（5s/60s/120s）封顶，不追求精确。
+fn budget_secs() -> Option<Duration> {
+    let v: f64 = std::env::var("CHAT_BUDGET_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(300.0);
+    if v <= 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(v).ok()
+}
+
+/// 单次 chat 总 token 预算（T4）：`CHAT_TOKEN_BUDGET`（input+output 累计；0=禁用）。
+fn token_budget() -> Option<u64> {
+    match std::env::var("CHAT_TOKEN_BUDGET").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(n) if n > 0 => Some(n),
+        _ => None,
+    }
+}
+
+/// LLM 瞬态失败重试次数（T3）：`LLM_RETRY_ATTEMPTS`（缺省 2，上限 6）。
+fn retry_attempts() -> u32 {
+    std::env::var("LLM_RETRY_ATTEMPTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2).min(6)
+}
+
+/// 重试退避基数毫秒（T3）：`LLM_RETRY_BASE_MS`（缺省 500；0 用于测试立即重试）。
+fn retry_base_ms() -> u64 {
+    std::env::var("LLM_RETRY_BASE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(500)
+}
+
+/// 瞬态判定（T3）：限流/超时/网关类错误值得重试；参数/鉴权类重试无益。
+/// llm-adapter 的 provider 异常统一为 code=LLM_ERROR + message="{ExcType}: {exc}"，
+/// 故按 message 关键词匹配（429/rate limit/timeout/5xx/连接类）；K400 是确定性失败。
+fn is_transient_llm_error(err: &Value) -> bool {
+    let code = err.get("code").and_then(Value::as_str).unwrap_or("");
+    if code == "K400" {
+        return false;
+    }
+    let msg = err.get("message").and_then(Value::as_str).unwrap_or("");
+    let hay = format!("{code} {msg}").to_ascii_lowercase();
+    [
+        "429", "rate limit", "ratelimit", "timeout", "timed out", "502", "503", "504", "overloaded", "connection",
+        "temporarily",
+    ]
+    .iter()
+    .any(|k| hay.contains(k))
+}
+
+/// 内核层瞬态判定（T3）：deadline 超时值得重试；panic/取消/路由失败重试无益。
+fn is_transient_kernel_err(e: &KernelError) -> bool {
+    matches!(e, KernelError::DeadlineExceeded(_))
+}
+
+/// 单次 chat 的剩余预算（T4）。顶层 chat 取 env 缺省；子代理继承父链衰减后的剩余。
+#[derive(Debug, Clone, Copy, Default)]
+struct ChatBudget {
+    deadline: Option<Instant>,
+    tokens_left: Option<u64>,
+}
+
+/// 按字符截断（UTF-8 安全）。超限时追加省略标记——模型必须能感知结果被裁剪，
+/// 而非把残缺内容当作完整事实。
+fn truncate_chars(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if max == 0 || total <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str(&format!("\n…[truncated, {total} chars total, showing first {max}]"));
+    out
+}
+
+/// 感知窗口（PLAN R3）：HISTORY_LIMIT 只裁剪**发给 LLM 的工作集**，且必须发生在
+/// 压缩判断之后——修复前截断在前，LIMIT < TRIGGER 时压缩永不触发（memory 无限增长
+/// 且旧史被静默丢弃）。
+fn apply_history_limit(mut msgs: Vec<MemoryMsg>) -> Vec<MemoryMsg> {
+    if let Ok(lim) = std::env::var("HISTORY_LIMIT") {
+        if let Ok(n) = lim.trim().parse::<usize>() {
+            if n > 0 && msgs.len() > n {
+                msgs = msgs.split_off(msgs.len() - n);
+            }
+        }
+    }
+    msgs
+}
+
 /// 多轮累计用量：ReAct 一轮可能多次调用 LLM，用户要的是总消耗而非单轮。
 #[derive(Default)]
 struct UsageAcc {
@@ -174,6 +269,11 @@ impl UsageAcc {
         self.reasoning += u.get("reasoning_tokens").and_then(Value::as_u64).unwrap_or(0);
     }
 
+    /// 计费口径（T4 预算）：input+output（cache_read 是折扣而非独立产出，不计入）。
+    fn total(&self) -> u64 {
+        self.input + self.output
+    }
+
     /// provider 未上报用量时返回 Null（前端据此不显示统计条，而非显示 0）。
     fn to_value(&self) -> Value {
         if !self.seen {
@@ -189,6 +289,16 @@ impl UsageAcc {
 }
 
 impl AgentLoopPlugin {
+    /// 生效轮次上限（E1 收编）：构造值兜底，`MAX_ROUNDS` env 每轮可热改
+    /// （web 设置面板保存即下轮对话生效，无需重启）。
+    fn max_rounds(&self) -> usize {
+        std::env::var("MAX_ROUNDS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(self.max_rounds)
+    }
+
     /// 跨插件调用便捷封装：复制 trace_id/priority，附 deadline。
     async fn call(
         &self,
@@ -294,20 +404,14 @@ impl AgentLoopPlugin {
         )
     }
 
-    /// 感知：拉取会话历史，并按 HISTORY_LIMIT 截断（保留最近 N 条）。
+    /// 感知：拉取会话**全量**历史（不做窗口裁剪）。
+    /// 窗口与压缩的顺序见 `apply_history_limit`（PLAN R3：先压缩判断，后窗口裁剪）。
     async fn perceive(&self, src: &Envelope, session_id: &str) -> Result<Vec<MemoryMsg>, KernelError> {
         let v = self
             .call(src, ID_MEMORY, json!({"op": "get", "session_id": session_id}), MEM_DEADLINE)
             .await?;
-        let mut msgs: Vec<MemoryMsg> =
+        let msgs: Vec<MemoryMsg> =
             serde_json::from_value(v.get("messages").cloned().unwrap_or(Value::Null)).unwrap_or_default();
-        if let Ok(lim) = std::env::var("HISTORY_LIMIT") {
-            if let Ok(n) = lim.trim().parse::<usize>() {
-                if n > 0 && msgs.len() > n {
-                    msgs = msgs.split_off(msgs.len() - n);
-                }
-            }
-        }
         Ok(msgs)
     }
 
@@ -348,7 +452,8 @@ impl AgentLoopPlugin {
     }
 
     /// 上下文压缩（Phase 2-2，dsh：压缩是独立可选能力，不焊进 Loop 状态机）：
-    /// 历史超过 COMPACT_TRIGGER（默认 40；0=禁用）时，把除最近 COMPACT_KEEP（默认 10）条
+    /// 历史超过 COMPACT_TRIGGER（默认 40；0=禁用）**或**估算 token 超发送预算
+    /// （P7/R6 token 闸，LLM_CONTEXT_TOKENS>0 时启用）时，把除最近 COMPACT_KEEP（默认 10）条
     /// 之外的旧史交 LLM 摘要，经 memory `summarize` op 持久化（含孤儿 tool 消息防撕裂），
     /// 并就地替换本轮工作集。任何失败（llm/memory）→ 降级为不压缩（warn），主流程不受影响。
     async fn maybe_compact(&self, src: &Envelope, session_id: &str, history: Vec<MemoryMsg>) -> Vec<MemoryMsg> {
@@ -357,7 +462,12 @@ impl AgentLoopPlugin {
         }
         let trigger = env_num("COMPACT_TRIGGER", 40);
         let keep = env_num("COMPACT_KEEP", 10).min(history.len());
-        if trigger == 0 || history.len() <= trigger {
+        // 双闸（PLAN P7/R6）：条数闸 **或** token 闸任一命中即压缩——
+        // 单条大结果在条数闸（40 条）之前就能撑爆 LLM 窗口。
+        let count_gate = trigger > 0 && history.len() > trigger;
+        let budget = context::ctx_budget();
+        let token_gate = budget > 0 && context::estimate_messages(&history) > budget;
+        if !count_gate && !token_gate {
             return history;
         }
         let split = history.len() - keep;
@@ -382,8 +492,8 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             tool_calls: None,
             tool_call_id: None,
         });
-        // 压缩摘要不是用户可见输出 → 不走流式旁路
-        let summary = match self.plan(src, &sum_msgs, None, None).await {
+        // 压缩摘要不是用户可见输出 → 不走流式旁路；瞬态失败同样重试（T3）
+        let summary = match self.plan_with_retry(src, session_id, &mut sum_msgs, None, None).await {
             Ok(r) if r.ok => r.content.unwrap_or_default(),
             Ok(r) => {
                 tracing::warn!(target: ID, "compaction llm failed, keeping full history: {:?}", r.error);
@@ -440,6 +550,13 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
         stream: Option<(&str, &str)>,
     ) -> Result<LlmChatResp, KernelError> {
         let mut payload = json!({"op": "chat", "messages": messages});
+        // L2+L3：`LLM_CONTEXT_TOKENS` 语义升级为「上下文窗口」——随 payload 透传 num_ctx，
+        // ollama native 映射 options.num_ctx（本地估算闸与服务端窗口对齐，一处配置两侧生效）；
+        // openai_compat/anthropic 忽略。0（禁用）/缺省不下发，向后兼容。
+        let window = context::context_window_tokens();
+        if window > 0 {
+            payload["num_ctx"] = json!(window);
+        }
         if let Some(t) = tools {
             if !t.is_empty() {
                 payload["tools"] = json!(t);
@@ -463,21 +580,98 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
         }))
     }
 
-    /// 行动：保留名 `task` 路由子代理（07 §2.2），`load_skill` 路由 assets（07 §2.2），
-    /// 其余走 tools.exec。失败合成 ok:false 结果回喂（不中断循环）。
-    /// 逐轮 tracing 事件供 host 实时回显。返回 (工具结果, 耗时ms)。
-    async fn act(&self, src: &Envelope, session_id: &str, round: u32, tc: &ToolCall) -> (Value, u64) {
-        let started = Instant::now();
-        tracing::info!(target: "react_progress", round, tool = %tc.name, "▶ round {round}: {}", tc.name);
-        self.trace(src, session_id, json!({"type": "tool_call", "round": round, "name": tc.name, "args": tc.arguments}))
+    /// 规划 + 重试（T3 + P8）。消息按 `&mut Vec` 传入：P8 降级时在原缓冲上收缩窗口，
+    /// 调用方（chat_run）随即可见，不引入每轮克隆。
+    ///
+    /// - T3 瞬态重试：限流/超时/网关类失败按指数退避重试（base×2^n，单次封顶 8s），
+    ///   成功或确定性失败立即返回；重试经 trace 落审计日志（type=retry）。
+    /// - P8 超限降级（R7/R8）：provider 侧 `CONTEXT_OVERFLOW`（确定性但可行动，估算闸漏网
+    ///   时的 provider 终审）→ 未降级过则窗口/额度减半（`context::degrade`）重试一次；
+    ///   再超 → 原错误收敛，不进入重试风暴。与 T3 正交：一个接瞬态退避，一个接超限降级。
+    async fn plan_with_retry(
+        &self,
+        src: &Envelope,
+        session_id: &str,
+        messages: &mut Vec<MemoryMsg>,
+        tools: Option<&[ToolSpec]>,
+        stream: Option<(&str, &str)>,
+    ) -> Result<LlmChatResp, KernelError> {
+        let attempts = retry_attempts();
+        let base = retry_base_ms();
+        let mut attempt: u32 = 0;
+        let mut degraded = false; // P8：本轮 chat 是否已做过超限降级（只做一次）
+        loop {
+            let res = self.plan(src, messages, tools, stream).await;
+            if !degraded {
+                let overflow = matches!(&res, Ok(r) if
+                    r.error.as_ref().and_then(|e| e.get("code")).and_then(Value::as_str) == Some("CONTEXT_OVERFLOW"));
+                if overflow {
+                    degraded = true;
+                    let taken = std::mem::take(messages);
+                    *messages = context::degrade(taken);
+                    tracing::warn!(target: ID, session = %session_id, "llm context overflow, halving window/limits and retrying once");
+                    self.trace(
+                        src,
+                        session_id,
+                        json!({"type": "retry", "where": "llm.chat", "reason": "CONTEXT_OVERFLOW", "degraded": true}),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+            let transient = match &res {
+                Err(e) => is_transient_kernel_err(e),
+                Ok(r) => !r.ok && r.error.as_ref().map(is_transient_llm_error).unwrap_or(false),
+            };
+            if !transient || attempt >= attempts {
+                return res;
+            }
+            let delay = base.saturating_mul(1u64 << attempt.min(4)).min(8000);
+            let reason = match &res {
+                Err(e) => e.to_string(),
+                Ok(r) => r.error.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+            };
+            tracing::warn!(target: ID, session = %session_id, attempt, delay, "llm transient failure, retrying: {reason}");
+            self.trace(
+                src,
+                session_id,
+                json!({"type": "retry", "where": "llm.chat", "attempt": attempt + 1, "delay_ms": delay, "reason": reason}),
+            )
             .await;
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            attempt += 1;
+        }
+    }
+
+    /// 行动前奏：登记 tool_call 观测（trace + tracing 日志）。
+    /// 并行波次开始前由 chat_body 按**声明顺序**统一发出（trace 顺序稳定）。
+    async fn act_begin(&self, src: &Envelope, session_id: &str, round: u32, tc: &ToolCall) {
+        tracing::info!(target: "react_progress", round, tool = %tc.name, "▶ round {round}: {}", tc.name);
+        self.trace(src, session_id, json!({"type": "tool_call", "round": round, "name": tc.name, "id": tc.id, "args": tc.arguments}))
+            .await;
+    }
+
+    /// 行动执行：保留名 `task` 路由子代理（07 §2.2），`load_skill` 路由 assets（07 §2.2），
+    /// 其余走 tools.exec。失败合成 ok:false 结果回喂（不中断循环）。
+    /// 不含事件发射——并行执行时事件顺序由 chat_body 统一编排（声明顺序，稳定）。
+    /// 返回 (工具结果, 耗时ms)。`depth` 为当前链上的委派深度（0=顶层，随链传播）；
+    /// `budget_snap` 为传给子代理的剩余预算快照 (剩余ms, 剩余token)（T4，随链衰减）。
+    async fn act_exec(
+        &self,
+        src: &Envelope,
+        session_id: &str,
+        depth: u32,
+        tc: &ToolCall,
+        budget_snap: Option<(Option<u64>, Option<u64>)>,
+    ) -> (Value, u64) {
+        let started = Instant::now();
         let result = if tc.name == RESERVED_TASK {
             // 子代理委派（Phase 3-3）：全新会话复用 agent.chat 全链路，仅回传最终答案
             let task_text = tc.arguments.get("task").and_then(Value::as_str).unwrap_or("");
             if task_text.trim().is_empty() {
                 json!({"ok": false, "error": {"code": "K400", "field": "task", "message": "task 工具需非空参数 {\"task\": str}（子任务自包含描述）"}})
             } else {
-                self.run_subagent(src, session_id, task_text).await
+                self.run_subagent(src, session_id, task_text, depth, budget_snap).await
             }
         } else {
             let (payload, target, deadline) = if tc.name == RESERVED_LOAD_SKILL {
@@ -491,23 +685,29 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
                 Err(e) => json!({"ok": false, "error": {"code": e.code(), "message": e.to_string()}}),
             }
         };
-        let ms = started.elapsed().as_millis() as u64;
+        (result, started.elapsed().as_millis() as u64)
+    }
+
+    /// 行动收尾：tool_result 观测。`ms` 为该工具自身耗时（并行下与墙钟无关）；
+    /// `memory_truncated` 表明回喂进 memory 的内容是否被截断（PLAN R2 后全文不再入库）。
+    async fn act_end(&self, src: &Envelope, session_id: &str, round: u32, tc: &ToolCall, result: &Value, ms: u64) {
         tracing::info!(target: "react_progress", round, tool = %tc.name, ms, "✓ round {round}: {} ({}ms)", tc.name, ms);
-        // 事件日志：结果截断（防大输出撑爆审计文件），完整结果仍在 memory 会话消息里
+        // 事件日志：结果截断（防大输出撑爆审计文件），memory 侧另有 8000 字符预算
         let result_str = result.to_string();
+        let full_chars = result_str.chars().count();
+        let limit = tool_result_limit();
         let truncated: String = result_str.chars().take(2000).collect();
         self.trace(
             src,
             session_id,
             json!({
-                "type": "tool_result", "round": round, "name": tc.name, "ms": ms,
+                "type": "tool_result", "round": round, "name": tc.name, "id": tc.id, "ms": ms,
                 "ok": result.get("ok") == Some(&json!(true)),
                 "result_truncated": truncated,
-                "result_full_in_memory": true,
+                "memory_truncated": limit > 0 && full_chars > limit,
             }),
         )
         .await;
-        (result, ms)
     }
 
     /// 观察：写入记忆（尽力而为，失败不致命）。
@@ -521,21 +721,37 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
     }
 
     /// 子代理（Phase 3-3）：新 session_id 复用 agent.chat 全链路（提示词组装/记忆/工具/事件日志）。
-    /// 深度 > 1（子代理内再委派）→ 字段级拒绝；子会话事件日志独立（session_id 关联可追溯）。
-    async fn run_subagent(&self, src: &Envelope, parent_session: &str, task_text: &str) -> Value {
-        if self.depth.load(Ordering::SeqCst) >= 2 {
+    /// 委派深度随链传播：`depth >= 1`（已在子代理内）→ 字段级拒绝再嵌套；
+    /// 子会话事件日志独立（session_id 关联可追溯）。
+    /// 预算随链衰减（T4）：`budget_snap` = (剩余ms, 剩余token) 写入子 chat 请求；
+    /// 预算未启用（两者皆 None）→ 不携带，子链退化为各自的 env 缺省（同为禁用）。
+    async fn run_subagent(
+        &self,
+        src: &Envelope,
+        parent_session: &str,
+        task_text: &str,
+        depth: u32,
+        budget_snap: Option<(Option<u64>, Option<u64>)>,
+    ) -> Value {
+        if depth >= 1 {
             return json!({"ok": false, "error": {"code": "K400", "message": "task 不支持嵌套委派（子代理内不可再调用 task）"}});
         }
         let n = self.sub_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let sub_session = format!("{parent_session}#sub-{n}");
         self.trace(src, parent_session, json!({"type": "subagent", "sub_session": sub_session, "task": task_text}))
             .await;
-        let env = Envelope::new(
-            PluginId::new(ID),
-            json!({"op": "chat", "session_id": sub_session, "user_text": task_text}),
-        );
-        // 递归委派：Box::pin 打断未来大小的无限递归（深度由 DepthGuard 硬限）
-        let resp = Box::pin(self.handle_chat(&env)).await;
+        let mut payload = json!({"op": "chat", "session_id": sub_session, "user_text": task_text, "depth": depth + 1});
+        if let Some((ms_left, toks_left)) = budget_snap {
+            if let Some(ms) = ms_left {
+                payload["budget_ms_left"] = json!(ms);
+            }
+            if let Some(toks) = toks_left {
+                payload["tokens_left"] = json!(toks);
+            }
+        }
+        let env = Envelope::new(PluginId::new(ID), payload);
+        // 递归委派：Box::pin 打断未来大小的无限递归（嵌套上限由随链 depth 硬性收敛）
+        let resp = Box::pin(self.chat_body(&env)).await;
         if resp.get("ok") == Some(&json!(true)) {
             json!({
                 "ok": true,
@@ -543,21 +759,66 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
                 "sub_session": sub_session,
             })
         } else {
-            json!({"ok": false, "error": {"code": "SUBAGENT_FAILED", "message": format!("子代理失败: {resp}")}})
+            // 错误消息瘦身（PLAN E2）：只取 error.message，不再把整个响应 JSON 塞进错误
+            let emsg = resp
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误");
+            json!({"ok": false, "error": {"code": "SUBAGENT_FAILED", "message": format!("子代理失败: {emsg}")}})
         }
     }
 
-    /// ReAct 主循环。深度守卫包裹整个循环体（含子代理递归）。
-    async fn handle_chat(&self, env: &Envelope) -> Value {
-        let _guard = DepthGuard::new(&self.depth);
-        self.chat_body(env).await
+    /// 取消检查（P2/T1）：轮次边界轮询。take 语义（命中即清）。
+    /// 返回 Some(error payload) = 已取消，调用方立即收敛返回。
+    async fn check_cancel(&self, env: &Envelope, session_id: &str) -> Option<Value> {
+        if !self.cancels.lock().unwrap().remove(session_id) {
+            return None;
+        }
+        tracing::info!(target: ID, session = %session_id, "cancelled at round boundary");
+        self.trace(env, session_id, json!({"type": "error", "where": "cancel", "message": "已被用户取消"})).await;
+        Some(json!({"ok": false, "error": {"code": "K499", "message": "已被用户取消"}}))
     }
 
+    /// 轮次边界统一停车检查（P2 取消 + T4 预算）：取消优先（用户意愿最高），
+    /// 其次时长、再次 token。命中即返回错误 payload 立即收敛。
+    /// token 口径 input+output（usage.total()）；超支边界 = 当前轮已发生的消耗，
+    /// 轮内超支由单步 deadline 封顶（护栏语义，不追求精确）。
+    async fn check_stop(&self, env: &Envelope, session_id: &str, budget: &ChatBudget, usage: &UsageAcc) -> Option<Value> {
+        if let Some(v) = self.check_cancel(env, session_id).await {
+            return Some(v);
+        }
+        if let Some(dl) = budget.deadline {
+            if Instant::now() >= dl {
+                tracing::info!(target: ID, session = %session_id, "budget exhausted: wall clock");
+                self.trace(env, session_id, json!({"type": "error", "where": "budget", "message": "chat 预算耗尽：时长超限"})).await;
+                return Some(json!({"ok": false, "error": {"code": "K508", "message": "chat 预算耗尽：时长超限"}}));
+            }
+        }
+        if let Some(left) = budget.tokens_left {
+            if usage.total() >= left {
+                tracing::info!(target: ID, session = %session_id, used = usage.total(), budget = left, "budget exhausted: tokens");
+                self.trace(env, session_id, json!({"type": "error", "where": "budget", "message": "chat 预算耗尽：token 超限"})).await;
+                return Some(json!({"ok": false, "error": {"code": "K508", "message": "chat 预算耗尽：token 超限"}}));
+            }
+        }
+        None
+    }
+
+    /// ReAct 主循环。委派深度由 `ChatReq.depth` 随链携带（0=顶层），
+    /// 不使用插件级共享计数——并发下各链深度互不挤占。
     async fn chat_body(&self, env: &Envelope) -> Value {
         let Ok(req) = serde_json::from_value::<ChatReq>(env.payload.clone()) else {
             return json!({"ok": false, "error": {"code": "K400", "message": "chat 请求需 {session_id, user_text}"}});
         };
+        // 开局清残留取消标志（chat 结束时也会清理——双保险，防误杀同 session 下轮对话）
+        self.cancels.lock().unwrap().remove(&req.session_id);
+        let out = self.chat_run(env, &req).await;
+        self.cancels.lock().unwrap().remove(&req.session_id);
+        out
+    }
 
+    async fn chat_run(&self, env: &Envelope, req: &ChatReq) -> Value {
         // 用户消息先入记忆（持久化），随后拉取全量历史
         let user_msg = MemoryMsg {
             role: "user".into(),
@@ -577,7 +838,12 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             tool_call_id: None,
         }];
         match self.perceive(env, &req.session_id).await {
-            Ok(h) => messages.extend(self.maybe_compact(env, &req.session_id, h).await),
+            Ok(h) => {
+                // 双闸顺序（PLAN R3）：先对全量历史做压缩判断（超 TRIGGER 则摘要落盘），
+                // 再对（可能已压缩的）工作集应用 HISTORY_LIMIT 窗口。
+                let compacted = self.maybe_compact(env, &req.session_id, h).await;
+                messages.extend(apply_history_limit(compacted));
+            }
             Err(e) => {
                 self.trace(env, &req.session_id, json!({"type": "error", "where": "memory.get", "message": e.to_string()})).await;
                 return json!({"ok": false, "error": {"code": e.code(), "message": format!("memory.get failed: {e}")}});
@@ -600,11 +866,35 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
         let stream_path = stream_file_for(&req.session_id);
         let mut usage = UsageAcc::default();
         let mut llm_ms: u64 = 0;
-        for _round in 0..self.max_rounds {
+        // 总预算（T4）：顶层取 env 缺省；子代理继承父链衰减后的剩余（req.*_left）。
+        let budget = ChatBudget {
+            deadline: req
+                .budget_ms_left
+                .map(|ms| Instant::now() + Duration::from_millis(ms))
+                .or_else(|| budget_secs().map(|d| Instant::now() + d)),
+            tokens_left: req.tokens_left.or_else(token_budget),
+        };
+        let max_rounds = self.max_rounds();
+        for _round in 0..max_rounds {
             rounds += 1;
+            // 停车检查点①：每轮开头（取消 > 时长 > token）
+            if let Some(v) = self.check_stop(env, &req.session_id, &budget, &usage).await {
+                return v;
+            }
             let sid = format!("{}-r{}", req.session_id, rounds);
             let stream = stream_path.as_deref().map(|p| (p, sid.as_str()));
-            let resp = match self.plan(env, &messages, Some(&tools), stream).await {
+            // P7/R5：发送前逐级收紧（token 闸启用且工作集超发送预算时）——窗口减半 →
+            // tool_result 限额减半 → 仍超限即 CONTEXT_OVERFLOW，请求不发出。
+            // 裁剪只影响本轮工作集，memory 全量历史不受影响。
+            messages = match context::tighten_for_context(messages) {
+                Ok(m) => m,
+                Err(v) => {
+                    let msg = v["error"]["message"].as_str().unwrap_or_default().to_string();
+                    self.trace(env, &req.session_id, json!({"type": "error", "where": "context", "message": msg})).await;
+                    return v;
+                }
+            };
+            let resp = match self.plan_with_retry(env, &req.session_id, &mut messages, Some(&tools), stream).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.trace(env, &req.session_id, json!({"type": "error", "where": "llm.chat", "message": e.to_string()})).await;
@@ -627,7 +917,24 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
                 return self.finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms).await;
             }
 
-            // 行动 + 观察：assistant(tool_calls) + 每个 tool 结果各一条消息
+            // 子代理预算快照（T4）：父链已用部分扣除后才传给子——随链衰减，多子代理共享同一剩余。
+            let budget_snap = if budget.deadline.is_some() || budget.tokens_left.is_some() {
+                Some((
+                    budget.deadline.map(|d| d.saturating_duration_since(Instant::now()).as_millis() as u64),
+                    budget.tokens_left.map(|t| t.saturating_sub(usage.total())),
+                ))
+            } else {
+                None
+            };
+
+            // 行动 + 观察（P4/T2 并行）：
+            // ① 全部 tool_call 事件按声明顺序先发（trace 顺序稳定，前端同轮卡片齐出）；
+            // ② 按波次并发执行（波宽 = 自身 manifest.max_inflight，与内核在途许可对齐）；
+            // ③ 结果按声明顺序回喂——tool_call_id 对应与 steps 顺序不变。
+            // memory 即上下文来源，截断（PLAN R2）必须在入 memory 之前。
+            for tc in &resp.tool_calls {
+                self.act_begin(env, &req.session_id, rounds, tc).await;
+            }
             let assistant_msg = MemoryMsg {
                 role: "assistant".into(),
                 content: resp.content.clone(),
@@ -635,25 +942,49 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
                 tool_call_id: None,
             };
             let mut round_msgs = vec![assistant_msg];
-            for tc in &resp.tool_calls {
-                let (result, ms) = self.act(env, &req.session_id, rounds, tc).await;
-                steps.push(StepRecord { round: rounds, tool: tc.name.clone(), ms });
-                round_msgs.push(MemoryMsg {
-                    role: "tool".into(),
-                    content: Some(result.to_string()),
-                    tool_calls: None,
-                    tool_call_id: Some(tc.id.clone()),
-                });
+            let limit = tool_result_limit();
+            let wave = self.manifest.max_inflight.unwrap_or(4).max(1);
+            for group in resp.tool_calls.chunks(wave) {
+                let execs = group
+                    .iter()
+                    .map(|tc| self.act_exec(env, &req.session_id, req.depth, tc, budget_snap));
+                let done = futures::future::join_all(execs).await;
+                for (tc, (result, ms)) in group.iter().zip(done) {
+                    steps.push(StepRecord { round: rounds, tool: tc.name.clone(), ms });
+                    self.act_end(env, &req.session_id, rounds, tc, &result, ms).await;
+                    round_msgs.push(MemoryMsg {
+                        role: "tool".into(),
+                        content: Some(truncate_chars(&result.to_string(), limit)),
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                    });
+                }
             }
             self.observe(env, &req.session_id, &round_msgs).await;
             messages.extend(round_msgs);
+            // 停车检查点②：工具波次完成后（不必等下一轮 LLM 调用才知道要停）
+            if let Some(v) = self.check_stop(env, &req.session_id, &budget, &usage).await {
+                return v;
+            }
         }
 
-        // 轮次耗尽：最后一轮不带工具，强制收敛
+        // 停车检查点③：轮次耗尽前的强制收敛轮（预算可能恰在此间耗尽）
+        if let Some(v) = self.check_stop(env, &req.session_id, &budget, &usage).await {
+            return v;
+        }
+        // 轮次耗尽：最后一轮不带工具，强制收敛（同样先过发送前收紧）
         rounds += 1;
         let sid = format!("{}-r{}", req.session_id, rounds);
         let stream = stream_path.as_deref().map(|p| (p, sid.as_str()));
-        let resp = match self.plan(env, &messages, None, stream).await {
+        messages = match context::tighten_for_context(messages) {
+            Ok(m) => m,
+            Err(v) => {
+                let msg = v["error"]["message"].as_str().unwrap_or_default().to_string();
+                self.trace(env, &req.session_id, json!({"type": "error", "where": "context", "message": msg})).await;
+                return v;
+            }
+        };
+        let resp = match self.plan_with_retry(env, &req.session_id, &mut messages, None, stream).await {
             Ok(r) => r,
             Err(e) => {
                 self.trace(env, &req.session_id, json!({"type": "error", "where": "llm.chat", "message": e.to_string()})).await;
@@ -665,8 +996,8 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
         if resp.ok && resp.tool_calls.is_empty() {
             return self.finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms).await;
         }
-        self.trace(env, &req.session_id, json!({"type": "error", "where": "max_rounds", "message": format!("agent loop exhausted max_rounds={}", self.max_rounds)})).await;
-        json!({"ok": false, "error": {"code": "K502", "message": format!("agent loop exhausted max_rounds={}", self.max_rounds)}})
+        self.trace(env, &req.session_id, json!({"type": "error", "where": "max_rounds", "message": format!("agent loop exhausted max_rounds={max_rounds}")})).await;
+        json!({"ok": false, "error": {"code": "K502", "message": format!("agent loop exhausted max_rounds={max_rounds}")}})
     }
 
     /// 收敛：最终答案入记忆并返回（含 steps）。
@@ -687,6 +1018,12 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
         llm_ms: u64,
     ) -> Value {
         let answer = resp.content.clone().unwrap_or_default();
+        if answer.trim().is_empty() {
+            // PLAN R4：空答案视为失败——ok:true + answer:"" 是假收敛；不落 memory、
+            // 不发 assistant 事件，按错误 payload 收敛。
+            self.trace(env, session_id, json!({"type": "error", "where": "finish", "message": "llm 返回了空答案"})).await;
+            return json!({"ok": false, "error": {"code": "K502", "message": "llm 返回了空答案"}});
+        }
         self.observe(
             env,
             session_id,
@@ -732,7 +1069,18 @@ impl Plugin for AgentLoopPlugin {
     async fn on_event(&self, env: Envelope) -> KernelResult<Value> {
         let op = env.payload.get("op").and_then(|v| v.as_str()).unwrap_or("");
         match op {
-            "chat" => Ok(self.handle_chat(&env).await),
+            "chat" => Ok(self.chat_body(&env).await),
+            "cancel" => {
+                // P2/T1：置位取消标志。Concurrent 语义保证本调用不被在途 chat 的锁阻塞。
+                let sid = env.payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+                if sid.is_empty() {
+                    Ok(json!({"ok": false, "error": {"code": "K400", "message": "cancel 需 session_id"}}))
+                } else {
+                    self.cancels.lock().unwrap().insert(sid.to_string());
+                    tracing::info!(target: ID, session = %sid, "cancel requested");
+                    Ok(json!({"ok": true, "session_id": sid, "note": "取消信号已置位；当前轮完成后中断"}))
+                }
+            }
             other => Ok(json!({"ok": false, "error": {"code": "K400", "message": format!("unknown op: {other}")}})),
         }
     }

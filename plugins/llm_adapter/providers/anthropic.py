@@ -2,7 +2,7 @@
 
 import os
 
-from .base import err, norm, require_httpx
+from .base import err_from_resp, norm, require_httpx
 
 
 def chat(payload: dict) -> dict:
@@ -40,7 +40,7 @@ def chat(payload: dict) -> dict:
 
     resp = httpx.post(f"{base}/v1/messages", json=body, headers=headers, timeout=120.0)
     if resp.status_code >= 400:
-        return err(f"anthropic HTTP {resp.status_code}: {resp.text[:500]}")
+        return err_from_resp("anthropic", resp.status_code, resp.text)
     data = resp.json()
     text, calls = [], []
     for block in data.get("content", []):
