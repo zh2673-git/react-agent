@@ -1,4 +1,4 @@
-//! e2e：web 网关全链路（Phase 3-2 / Phase 4）——真实 memory/llm(mock)/tools guest + 真 agent-loop。
+﻿//! e2e：web 网关全链路（Phase 3-2 / Phase 4）——真实 memory/llm(mock)/tools guest + 真 agent-loop。
 //! POST /api/chat → agent.chat 收敛；GET /api/events → SSE 从 0 重放全量事件；
 //! 非法请求 → 400 字段级错误。HTTP 客户端用裸 TcpStream（不引测试依赖）。
 //! Phase 4（08）：/api/config 读写（llm 热应用 + 落盘 + tools 白名单）、/api/skills CRUD。
@@ -76,7 +76,7 @@ async fn web_gateway_serves_chat_and_sse_replay() {
     let addr = listener.local_addr().expect("local_addr");
     let server_kernel = kernel.clone();
     tokio::spawn(async move {
-        let _ = react_agent_host::frontend::WebFrontend::serve_listener(listener, server_kernel).await;
+        let _ = react_agent_host::web::WebFrontend::serve_listener(listener, server_kernel).await;
     });
 
     // 1. POST /api/chat：阻塞到 agent 收敛
@@ -186,7 +186,7 @@ async fn web_config_center_and_skills_crud() {
     let addr = listener.local_addr().expect("local_addr");
     let server_kernel = kernel.clone();
     tokio::spawn(async move {
-        let _ = react_agent_host::frontend::WebFrontend::serve_listener(listener, server_kernel).await;
+        let _ = react_agent_host::web::WebFrontend::serve_listener(listener, server_kernel).await;
     });
 
     // 1. GET /api/config：初始视图（spawn env 为真相；未落盘前 tools 全启用）

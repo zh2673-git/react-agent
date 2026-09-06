@@ -26,7 +26,7 @@
 
 ```
 crates/agent-loop        ReAct 编排插件（InProcess，仅依赖 agent-kernel-sdk）
-crates/host              宿主二进制：装配、spawn、探测、双前端、sandbox-run 助手；web-dist/ 为 web 前端单页（运行时 serve，非内嵌）
+crates/host              宿主二进制：装配、spawn、探测、双前端（frontend repl + web/ 网关）、sandbox-run 助手；web-dist/ 为 web 前端三文件 index.html+style.css+app.js（运行时 serve，非内嵌）
 plugins/llm_adapter      LLM 适配器（Python guest，providers/ 按 vendor 分 pack）
 plugins/tools            工具注册与执行（Python guest，纯 stdlib，files/bash/web/grep 分文件）
 plugins/assets           skills/prompts 注册表（Python guest，开放标准 SKILL.md）
@@ -86,8 +86,8 @@ Web 前端是单文件 `crates/host/web-dist/index.html`（内联 CSS/JS，无�
   ```bash
   cd crates/host/web-dist && npm install && npm run dev   # 默认 http://localhost:5173
   ```
-  浏览器开 5173 即前端（热重载），`/api/*` 经代理转发到 8710，无需跨域配置。仅改样式也可直接编辑 `index.html` 后刷新，不必起 vite。
-  > 没有构建/HMR 需求时不必分离：单文件前端改完刷新即生效，「一体启动」已是最简工作流。
+  浏览器开 5173 即前端（热重载），`/api/*` 经代理转发到 8710，无需跨域配置。仅改样式也可直接编辑 `web-dist/` 文件后刷新，不必起 vite。
+  > 没有构建/HMR 需求时不必分离：改完刷新即生效，「一体启动」已是最简工作流。
 
 ## 环境变量
 
