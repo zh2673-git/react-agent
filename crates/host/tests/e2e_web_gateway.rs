@@ -267,6 +267,29 @@ async fn web_config_center_and_skills_crud() {
     assert_eq!(status, 200);
     assert!(!body.contains("e2e-skill"), "列表不应再含已删技能: {body}");
 
+    // 8. reveal 白名单与校验：未知 target → 400；非法技能名 → 400；不存在的技能 → 404。
+    //    仅测错误路径（成功路径会 spawn 真实资源管理器窗口，不入自动化）。
+    let (status, _) = http(addr, "POST", "/api/reveal?target=nope", None).await;
+    assert_eq!(status, 400, "未知 target 应 400");
+    let (status, _) = http(addr, "POST", "/api/reveal?target=skill&name=a%2Fb", None).await;
+    assert_eq!(status, 400, "路径注入名应 400");
+    let (status, _) = http(addr, "POST", "/api/reveal?target=skill&name=ghost-skill", None).await;
+    assert_eq!(status, 404, "不存在的技能应 404");
+
+    // 9. /files 服务：路径穿越 → 400；不存在 → 404；工作区内真实文件 → 200 且内容一致
+    let (status, _) = http(addr, "GET", "/files/../config.json", None).await;
+    assert_eq!(status, 400, "路径穿越应 400");
+    let (status, _) = http(addr, "GET", "/files/definitely-missing.txt", None).await;
+    assert_eq!(status, 404, "缺失文件应 404");
+    let ws = react_agent_host::config::workspace_dir();
+    let probe_rel = format!("target/artifact-e2e-{}.txt", nanos());
+    let probe = ws.join(&probe_rel);
+    std::fs::write(&probe, b"artifact-bytes").expect("write probe file");
+    let (status, body) = http(addr, "GET", &format!("/files/{probe_rel}"), None).await;
+    assert_eq!(status, 200, "产物文件应 200");
+    assert_eq!(body, "artifact-bytes", "内容应一致");
+    let _ = std::fs::remove_file(&probe);
+
     let _ = std::fs::remove_file(&cfg_file);
     let _ = std::fs::remove_dir_all(&skills_dir);
     for (k, v) in saved_keys {

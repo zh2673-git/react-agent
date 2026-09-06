@@ -137,15 +137,26 @@
     color: var(--muted); display: flex; align-items: center; gap: 7px; user-select: none; }
   details.think .think-body { padding: 2px 12px 11px; color: var(--faint); font-size: 12.5px;
     white-space: pre-wrap; word-break: break-word; line-height: 1.65; max-height: 320px; overflow: auto; }
-  /* 过程链框：思考段 + 工具卡统一收纳（回合级），最终答案在框外 */
-  details.process { margin: 0; background: var(--accent-soft); border: 1px solid var(--border-soft);
+  /* 过程链框：思考段 + 工具卡统一收纳（回合级），最终答案在框外。
+     固定宽度不随屏幕延伸；pbody 定高内部滚动（内容再多框不变长）。
+     W9.5 高度减半（32vh→16vh，用户反馈框太高）：主工具卡与子代理框同层级平铺在
+     pbody 内（各自是独立 details 下拉，工具卡执行完自动收成一条、点开回看），
+     回看靠 pbody 滚动条。 */
+  details.process { margin: 0; max-width: 820px; background: var(--accent-soft); border: 1px solid var(--border-soft);
     border-radius: 10px; overflow: hidden; }
   details.process summary { cursor: pointer; padding: 7px 12px; list-style: none; font-size: 12.5px;
     color: var(--muted); display: flex; align-items: center; gap: 7px; user-select: none; }
   details.process .plabel { font-weight: 600; color: var(--text); }
-  details.process .pbody { padding: 2px 10px 10px; display: flex; flex-direction: column; gap: 8px; }
-  details.process .think-body { padding: 2px 4px 0; color: var(--faint); font-size: 12.5px;
-    white-space: pre-wrap; word-break: break-word; line-height: 1.65; max-height: 320px; overflow: auto; }
+  details.process .pbody { padding: 2px 10px 10px; display: flex; flex-direction: column; gap: 8px;
+    max-height: 16vh; overflow-y: auto; }
+  /* W9.4 关键修复：pbody 为纵向 flex 容器，子项默认 flex-shrink:1——内容超过 max-height
+     时子项被等比压扁（工具卡挤成 2px 横条、看不到溢出滚动条）。flex-shrink:0 让子项保持
+     自然高度，超出部分交由 overflow-y: auto 滚动。 */
+  details.process .pbody > * { flex-shrink: 0; }
+  details.process .think-body { padding: 2px 4px 0; color: var(--muted); font-size: 12.5px;
+    white-space: pre-wrap; word-break: break-word; line-height: 1.65; }
+  details.process .think-label, details.subagent .think-label { padding: 2px 4px 0; font-size: 11.5px;
+    color: var(--point); font-weight: 600; }
   details.process details.tool { background: var(--card); }
   .ev.assistant .stats { margin-top: 9px; padding-top: 8px; border-top: 1px dashed var(--border-soft);
     color: var(--faint); font-size: 11.5px; display: flex; gap: 14px; flex-wrap: wrap; }
@@ -247,6 +258,49 @@
   .skillitem:hover { border-color: var(--accent); }
   .skillitem .name { font-weight: 600; white-space: nowrap; }
   .skillitem .desc { color: var(--muted); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .skillitem .rev { cursor: pointer; opacity: .55; font-size: 13px; }
+  .skillitem .rev:hover { opacity: 1; }
+  /* 产物文件卡片 */
+  .artcard { display: flex; align-items: center; gap: 8px; max-width: 620px; margin: 6px 0; padding: 8px 12px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px; font-size: 13px; }
+  .artcard .ico { line-height: 1; }
+  .artcard .nm { font-weight: 600; }
+  .artcard .src { color: var(--muted); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .artcard .open { color: var(--accent); cursor: pointer; white-space: nowrap; }
+  .artcard .open:hover { text-decoration: underline; }
+  /* 来源 chip（信息溯源）：回合内引用折叠为一张小卡，点击侧边抽屉展开全部引用源 */
+  .srcchip { display: inline-flex; align-items: center; gap: 6px; max-width: 620px; margin: 6px 0; padding: 6px 14px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 999px; font-size: 13px; cursor: pointer; }
+  .srcchip:hover { border-color: var(--accent); }
+  .srcchip .cnt { font-weight: 600; }
+  /* 来源侧边抽屉：点 chip 从右侧滑出，逐条列出引用标题与链接 */
+  .sd-overlay { position: fixed; inset: 0; background: rgba(31,31,29,.35); z-index: 95; display: none; }
+  .sd-overlay.open { display: block; }
+  .sd-panel { position: absolute; top: 0; right: 0; height: 100%; width: min(440px, 92vw);
+    background: var(--paper, #fff); border-left: 1px solid var(--line); box-shadow: -12px 0 32px rgba(31,31,29,.12);
+    display: flex; flex-direction: column; animation: sd-in .18s ease-out; }
+  @keyframes sd-in { from { transform: translateX(24px); opacity: .5; } to { transform: none; opacity: 1; } }
+  .sd-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px;
+    border-bottom: 1px solid var(--line); font-weight: 600; }
+  .sd-body { flex: 1; overflow: auto; padding: 6px 16px 16px; }
+  .sd-item { padding: 10px 0; border-bottom: 1px dashed var(--border-soft); line-height: 1.5; }
+  .sd-item .sd-idx { display: inline-block; min-width: 20px; height: 20px; line-height: 20px; text-align: center;
+    border-radius: 50%; background: var(--card-2); font-size: 12px; margin-right: 8px; }
+  .sd-item a { color: var(--accent); text-decoration: none; font-size: 13px; font-weight: 600; }
+  .sd-item a:hover { text-decoration: underline; }
+  .sd-item .u { display: block; color: var(--muted); font-size: 12px; word-break: break-all; margin: 2px 0 0 28px; }
+  /* 收纳区：产物/来源卡挂过程框外的页面流（W9.1），答案出现后移至答案下方置底 */
+  .turn-tail { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; align-items: flex-start; }
+  /* 文件预览浮层 */
+  .fp-overlay { display: none; position: fixed; inset: 0; background: rgba(31,31,29,.45); z-index: 90;
+    align-items: center; justify-content: center; }
+  .fp-box { display: flex; flex-direction: column; width: min(860px, 92vw); height: min(640px, 88vh);
+    background: var(--paper, #fff); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .fp-head { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  .fp-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fp-body { flex: 1; overflow: auto; padding: 16px 20px; }
+  .fp-body pre { white-space: pre-wrap; word-break: break-word; font-size: 13px; }
   /* R9/W6：技能 tab 配套工具区 + skill_installed 内联卡 */
   .skilltools { margin: -2px 0 8px 14px; display: flex; flex-direction: column; gap: 4px; }
   .skilltool { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border: 1px dashed var(--border-soft);
@@ -322,16 +376,16 @@
       <div class="field"><label>model</label><select id="llm-model" style="flex:1"></select><input id="llm-model-custom" placeholder="自定义模型名" style="flex:1; display:none"><button type="button" class="btn ghost" id="llm-fetch-models">拉取模型</button></div>
       <div class="field"><label>base_url</label><input id="llm-base" placeholder="https://api.deepseek.com/v1"></div>
       <div class="field"><label>api_key</label><input id="llm-key" type="password" autocomplete="off"></div>
-      <div class="row"><button class="btn" id="llm-save">保存</button><span class="flash" id="llm-flash"></span></div>
+      <div class="row"><button class="btn" id="llm-save">保存</button><button class="btn ghost" id="llm-reveal" title="在文件管理器中定位 config.json">📂 源文件</button><span class="flash" id="llm-flash"></span></div>
       <p class="hint">保存即热生效（env 更新 + 落盘 config.json，重启自动还原）。api_key 留空 = 不修改；回显只显示尾 4 位。</p>
     </div>
     <div id="tab-tools" hidden>
       <p class="hint">勾选启用工具（整体替换白名单，保存即热生效）。</p>
       <div id="tools-list"></div>
-      <div class="row"><button class="btn" id="tools-save">保存</button><span class="flash" id="tools-flash"></span></div>
+      <div class="row"><button class="btn" id="tools-save">保存</button><button class="btn ghost" id="tools-reveal" title="打开 plugins/tools 目录（内置工具源码）">📂 源文件</button><span class="flash" id="tools-flash"></span></div>
     </div>
     <div id="tab-skills" hidden>
-      <div class="row" style="margin-bottom:12px"><button class="btn ghost" id="skill-new">＋ 新建技能</button></div>
+      <div class="row" style="margin-bottom:12px"><button class="btn ghost" id="skill-new">＋ 新建技能</button><button class="btn ghost" id="skills-reveal" title="打开技能根目录（plugins/assets/skills）">📂 源文件</button></div>
       <div id="skills-list"></div>
       <div id="skill-editor" hidden>
         <div class="field"><label>名称（= 目录名 = frontmatter name）</label><input id="skill-name" placeholder="my-skill"></div>
@@ -347,6 +401,7 @@
     <div id="tab-agent" hidden>
       <p class="hint">agent-loop 运行参数（保存即下轮对话生效 + 落盘 config.json）。0 的语义见各标签。</p>
       <div class="field"><label>max_rounds（单次对话最大轮次）</label><input id="agent-max-rounds" type="number" min="1" max="64"></div>
+      <div class="field"><label>产物输出目录（agent 产出的成品文件统一写入此目录，工作区内相对路径）</label><input id="agent-output-dir" placeholder="outputs"></div>
       <div class="field"><label>budget_secs（单次对话总时长预算，秒，支持小数；0=不限）</label><input id="agent-budget-secs" type="number" min="0" step="0.5"></div>
       <div class="field"><label>token_budget（单次对话 token 预算，input+output 累计；0=不限）</label><input id="agent-token-budget" type="number" min="0"></div>
       <div class="field"><label>history_limit（发给 LLM 的历史窗口条数；0=不限）</label><input id="agent-history-limit" type="number" min="0"></div>
@@ -529,6 +584,15 @@ feed.addEventListener("click", (e) => {
 
 function el(html) { const d = document.createElement("div"); d.innerHTML = html; return d.firstElementChild; }
 function scroll() { const s = $("stream"); s.scrollTop = s.scrollHeight; }
+// 页面级跟随（R12）：事件流增长时 #stream 贴底滚动；用户上滚即暂停，距底 <64px 视为
+// 回到底部自动恢复。scrollFeed 供事件驱动路径调用（过程框内滑动、产物/来源卡追加、
+// 正文流式），与 scroll()（强制置底，用于发送消息等用户主动动作）区分。
+let feedPinned = true;
+$("stream").addEventListener("scroll", () => {
+  const s = $("stream");
+  feedPinned = s.scrollHeight - s.scrollTop - s.clientHeight < 64;
+}, { passive: true });
+function scrollFeed() { if (feedPinned) scroll(); }
 function setStatus(t) { statusEl.textContent = t || ""; }
 
 // ── 流式渲染：思考与正文分块，结束显示用量与耗时 ──
@@ -569,12 +633,53 @@ function applyStats(node, usage, elapsedMs) {
 // 生命周期：user 事件重置；首个 reasoning/tool_call 时创建；assistant 最终事件收起。
 let processBox = null, processBody = null, processThink = null;
 let roundCards = []; // 本回合每轮流产生的答案卡；最终事件到达时中间卡收进过程框（严格模式必须声明）
+const subBoxes = new Map(); // R11 子代理实时框：key = sub 标签（"sub-1"），value = {box, body, think, text}
 
 function ensureProcessBox() {
   if (processBox) return;
   processBox = el(`<details class="ev process" open><summary><span class="plabel">思考与工具</span><span class="chev">›</span></summary><div class="pbody"></div></details>`);
   processBody = processBox.querySelector(".pbody");
+  // R11 内容自动滑动：内容追加/增长时贴底滚动显示最新（所有内容仍按序留存，可上滚回看）。
+  // 用户上滚即暂停跟随，距底 <48px 视为回到底部自动恢复；MutationObserver 同时覆盖
+  // 文本增长（characterData）与卡片追加（childList），一处挂接全量生效。
+  let pinned = true;
+  processBody.addEventListener("scroll", () => {
+    pinned = processBody.scrollHeight - processBody.scrollTop - processBody.clientHeight < 48;
+  }, { passive: true });
+  new MutationObserver(() => {
+    if (pinned) processBody.scrollTop = processBody.scrollHeight;
+    scrollFeed(); // 框内内容增长时页面同步跟随：工具卡/思考段始终保持在视口内
+  }).observe(processBody, { childList: true, subtree: true, characterData: true });
   feed.appendChild(processBox);
+}
+
+// R11 子代理框：task 工具委派的过程在过程框内的专属嵌套子框实时呈现——
+// 流式帧（网关 tail 子旁路文件打 sub 标签）与镜像 trace 事件（agent-loop 透传）双源同框。
+function ensureSubBox(sub, task) {
+  ensureProcessBox();
+  let s = subBoxes.get(sub);
+  if (!s || !processBody.contains(s.box)) {
+    const box = el(`<details class="subagent" open><summary><span class="statedot"></span><span class="name">🔁 子代理 · ${esc(task ? String(task).slice(0, 60) : sub)}</span><span class="chev">›</span></summary><div class="subbody"></div></details>`);
+    processBody.appendChild(box);
+    s = { box, body: box.querySelector(".subbody"), think: null, text: null, rbuf: "", tbuf: "", titled: !!task };
+    subBoxes.set(sub, s);
+  } else if (task && !s.titled) {
+    s.box.querySelector(".name").textContent = `🔁 子代理 · ${String(task).slice(0, 60)}`;
+    s.titled = true;
+  }
+  return s;
+}
+
+// 产物/来源卡收纳区：W9.1 改挂「框外」页面流——过程框内只留思考/工具的滑动窗口，
+// 卡片随到达序排在过程框下方（不占框内视口、不被自动滚动钉死），答案出现后由
+// settleTurnEnd 移到答案之后置底。回合切换/重放清空后旧引用不在 feed 内 → 重建。
+function ensureTurnTail() {
+  ensureProcessBox();
+  if (!turnTail || !feed.contains(turnTail)) {
+    turnTail = el(`<div class="turn-tail"></div>`);
+    feed.appendChild(turnTail);
+  }
+  return turnTail;
 }
 
 // R2 重新生成：绑定到该卡对应的 user 轮次（渲染时的最后一轮）。回滚到该问题
@@ -600,19 +705,37 @@ function ensureAnswerCard() {
 
 function startStream(sid) {
   if (streamCard) endStream(null); // 上一轮异常收尾（未等到最终事件）
+  // W9.4 中间轮即时收纳：新一轮流一开始，此前各轮的文本卡即刻转入过程框（标注
+  // 「中间轮」）——此前要等最终答案事件才收纳，运行中途看起来像"答案被包进框里"。
+  if (roundCards.length && processBody) {
+    for (const c of roundCards) {
+      c.querySelector(".rg-btn")?.remove();
+      const lbl = c.querySelector(".meta span:nth-child(2)");
+      if (lbl) lbl.textContent = "中间轮";
+      const anchor = c._anchor;
+      if (anchor && processBody.contains(anchor)) anchor.after(c); else processBody.appendChild(c);
+    }
+    roundCards = [];
+  }
   streamSid = sid ?? null;
   streamBuf.reasoning = ""; streamBuf.text = "";
   processThink = null; // 每轮流新开一段思考区（多轮按序混排在过程框内）
   streamCard = streamBody = streamStats = null; // 答案卡延迟到首个 text delta（保证过程框在前）
 }
 
+// W9.2 思考段：带「💭 思考」标签——裸淡文本夹在工具卡之间易被当成"没有思考"；
+// 标签+正文打包插入，processThink 始终指向正文元素（textContent 更新点不变）。
+// label 可选（W9.4 重放多轮思考时标注轮次）。
+function newThinkBlock(parent, label) {
+  const wrap = el(`<div class="think"><div class="think-label">${label || "💭 思考"}</div><div class="think-body" style="white-space:pre-wrap"></div></div>`);
+  (parent || processBody).appendChild(wrap);
+  return wrap.querySelector(".think-body");
+}
+
 function pushStream(ev) {
   if (ev.kind === "reasoning") {
     ensureProcessBox();
-    if (!processThink) {
-      processThink = el(`<div class="think-body" style="white-space:pre-wrap"></div>`);
-      processBody.appendChild(processThink);
-    }
+    if (!processThink) processThink = newThinkBlock();
     streamBuf.reasoning += ev.text || "";
     processThink.textContent = streamBuf.reasoning;
     processBox.open = true; // 过程进行中保持展开
@@ -620,6 +743,7 @@ function pushStream(ev) {
     ensureAnswerCard();
     streamBuf.text += ev.text || "";
     streamBody.textContent = streamBuf.text; // 流式期间纯文本追加，结束再渲染 markdown
+    scrollFeed(); // 正文增长页面跟随（scrollFeed 贴底判断，用户上滚不抢滚动条）
   }
 }
 
@@ -631,9 +755,75 @@ function endStream(ev) {
   // streamCard 不清：多轮流共享同一张答案卡（最终 assistant 事件覆盖内容后才随 renderAssistant 清）
 }
 
+// ── R11 子代理过程渲染：镜像 trace 事件（实时 + 重放同源）与子流式帧（仅实时）双源 ──
+// 镜像事件类型 user 不透传（父 trace user 序是回滚定位真相源）；assistant 兜底定稿正文
+// （无流式帧的重放场景在此直接呈现每轮答案）。
+function renderSubEvent(ev) {
+  const s = ensureSubBox(ev.sub);
+  switch (ev.type) {
+    case "tool_call": {
+      const card = el(`<details class="tool" open><summary><span class="statedot"></span><span class="name">⚙ ${esc(ev.name)}</span><span class="round">round ${esc(ev.round)}</span><span class="ms"></span><span class="chev">›</span></summary><div class="body"><div class="sec"><div class="lbl">参数</div><pre class="result-pre">${esc(JSON.stringify(ev.args ?? {}, null, 2))}</pre></div><div class="sec result-sec" style="display:none"><div class="lbl">结果</div><div class="result-pre result-body"></div></div></div></details>`);
+      s.body.appendChild(card);
+      pending.set(`sub:${ev.sub}|${ev.round}|${ev.name}`, card); // key 带 sub 前缀，与主框 pending 不串位
+      break;
+    }
+    case "tool_result": {
+      const key = `sub:${ev.sub}|${ev.round}|${ev.name}`;
+      let card = pending.get(key);
+      if (!card) {
+        card = el(`<details class="tool"><summary><span class="statedot"></span><span class="name">⚙ ${esc(ev.name)}</span><span class="round">round ${ev.round}</span><span class="ms"></span><span class="chev">›</span></summary><div class="body"><div class="sec result-sec"><div class="lbl">结果</div><div class="result-pre result-body"></div></div></div></details>`);
+        s.body.appendChild(card);
+      }
+      card.classList.add("done", ev.ok ? "ok" : "fail");
+      card.open = false;
+      const ms = card.querySelector(".ms"); if (ms) ms.textContent = `${ev.ms ?? "?"}ms`;
+      const rs = card.querySelector(".result-sec"); if (rs) rs.style.display = "";
+      const rb = card.querySelector(".result-body"); if (rb) rb.textContent = ev.result_truncated ?? "";
+      pending.delete(key);
+      break;
+    }
+    case "assistant": {
+      if (ev.sid) doneSids.add(ev.sid); // 该子轮回执已定稿：重连重放的 stream_* 帧忽略
+      if (!ev.answer && !ev.reasoning) break;
+      if (!s.text) { s.text = el(`<div class="sub-text"></div>`); s.body.appendChild(s.text); }
+      s.text.innerHTML = md(ev.answer || "");
+      break;
+    }
+    case "error":
+      s.body.appendChild(el(`<div class="sub-text err">⚠ ${esc(ev.message ?? "子代理出错")}</div>`));
+      break;
+  }
+}
+
+// 子流式帧：子代理每轮 LLM 调用的思考/正文增量（sink 每轮以 "w" 覆写旁路文件，帧序同主链）。
+function subStreamStart(ev) {
+  if (ev.sid && doneSids.has(ev.sid)) return;
+  const s = ensureSubBox(ev.sub);
+  s.think = s.text = null; s.rbuf = ""; s.tbuf = ""; // 新一轮流式区重开
+}
+function subStreamDelta(ev) {
+  if (ev.sid && doneSids.has(ev.sid)) return;
+  const s = ensureSubBox(ev.sub);
+  if (ev.kind === "reasoning") {
+    if (!s.think) s.think = newThinkBlock(s.body); // 子框思考段同样带标签
+    s.rbuf += ev.text || "";
+    s.think.textContent = s.rbuf;
+  } else {
+    if (!s.text) { s.text = el(`<div class="sub-text"></div>`); s.body.appendChild(s.text); }
+    s.tbuf += ev.text || "";
+    s.text.textContent = s.tbuf;
+  }
+}
+function subStreamEnd(ev) {
+  if (ev.sid) doneSids.add(ev.sid); // 正文定稿交由镜像 assistant 事件
+}
+
 function renderAssistant(ev, ts) {
   if (!ev.answer && !ev.reasoning) return; // 工具轮内容为空，仅 tool_call 渲染
-  if (ev.sid && ev.sid === streamSid) {
+  // 流式态判定（streamCard 或 streamSid 任一在）：本回合出现过流式帧 → 无论 sid 是否
+  // 对位都按回合收敛处理。末轮可能零流帧（LLM 秒回/网关攒帧），sid 仍属上一轮——旧逻辑
+  // 严格比对 sid 会掉进重放分支：中间卡残留「生成中…」、过程框不收起、答案重复成卡。
+  if (streamCard || streamSid) {
     // 同回合：答案卡填最终内容；过程框收起（回合完成，用户仍可点开回看）
     ensureAnswerCard();
     streamCard.classList.remove("streaming");
@@ -641,7 +831,10 @@ function renderAssistant(ev, ts) {
     if (tsSpan) tsSpan.textContent = ts || "完成";
     streamBody.innerHTML = md(ev.answer || "");
     applyStats(streamStats, ev.usage ?? null, ev.elapsed_ms ?? null);
-    if (ev.reasoning && processThink) processThink.textContent = ev.reasoning; // 兜底：流式思考帧缺失（网关攒帧）时补全
+    if (ev.reasoning) {
+      if (!processThink) processThink = newThinkBlock(); // 该轮零思考帧（网关攒帧/非流式）也要落块，否则思考被丢弃
+      processThink.textContent = ev.reasoning; // 兜底：流式思考帧缺失时补全
+    }
     if (ev.sid) doneSids.add(ev.sid); // 标记已完成：后续同 sid 的重连 stream_* 帧忽略
     // 多轮中间卡收进过程框（中间轮文本不是最终答案）：去掉重答按钮、标注「中间轮」，
     // 按各自锚点（本轮思考段）插回框内保持时序，只留最后一张（最终答案）在框外。
@@ -658,14 +851,21 @@ function renderAssistant(ev, ts) {
     roundCards = [];
     if (processBox) processBox.open = false;
     streamSid = streamCard = streamBody = streamStats = null;
+    filterArtifactsByAnswer(ev.answer); // 只留答案点名的产物（提及过滤）
+    settleTurnEnd(); // 产物/来源卡移到答案之后（回合末位置）
     return;
   }
-  // 重放 / 无流式：过程框（思考，折叠）+ 完整答案卡
-  if (ev.reasoning) {
+  // 重放 / 无流式：过程框（思考，折叠）+ 完整答案卡。思考按轮渲染（W9.4：agent-loop
+  // 最终事件携带 reasonings[{round,text}] 全量轮次；旧 trace 无此字段则退回单块）。
+  if (ev.reasonings?.length || ev.reasoning) {
     ensureProcessBox();
-    processThink = el(`<div class="think-body" style="white-space:pre-wrap"></div>`);
-    processBody.appendChild(processThink);
-    processThink.textContent = ev.reasoning;
+    const rounds = ev.reasonings?.length ? ev.reasonings : [{ text: ev.reasoning }];
+    for (const r of rounds) {
+      if (!r?.text) continue;
+      const tb = newThinkBlock(null, r.round ? `💭 思考 · round ${r.round}` : null);
+      tb.textContent = r.text;
+      processThink = tb;
+    }
     processBox.open = false; // 重放默认折叠
   }
   const card = el(`<div class="ev assistant"><div class="card"><div class="meta"><span class="who">assistant</span><span>${ts}</span><button class="rg-btn" title="回滚到本问题并重新生成">↻ 重新生成</button></div><div class="md"></div><div class="stats" hidden></div></div></div>`);
@@ -674,6 +874,11 @@ function renderAssistant(ev, ts) {
   if (ev.sid) doneSids.add(ev.sid); // 标记已完成：后续同 sid 的重连 stream_* 帧忽略
   feed.appendChild(card);
   bindRegen(card);
+  // 回合收敛：过程框兜底折叠 + 产物过滤/置底（重放时按 trace 序即达此序，此为
+  // 流式无帧路径的兜底；创建时本就折叠，重复设置无害）
+  if (processBox) processBox.open = false;
+  filterArtifactsByAnswer(ev.answer);
+  settleTurnEnd();
 }
 
 // ── 事件渲染 ──
@@ -681,13 +886,35 @@ const pending = new Map();
 // R2：本回合内已渲染的 user 轮次（idx = trace 内第几条 user 事件，0 基）。
 // 回滚按「第 N 条 user 消息」定位；重新生成复用最后一轮的原文+附件（trace user 事件带全量 b64）。
 let userTurns = [];
+// 回合级卡片追踪：产物卡/来源卡流式期间按到达序即时渲染（反馈优先），回合收敛时
+// 统一移到最终答案之后置底（appendChild 对既有节点即移动）。来源卡回合内累计去重。
+let turnArtifacts = [];
+let turnSourceBox = null;
+let turnTail = null; // 框外收纳区：流式期间的产物/来源卡随到达序排过程框下方（W9.1），答案出现后移出置底
+const turnSourceUrls = new Set();
+const turnArtifactPaths = new Set(); // 同回合同路径只出一张卡（write_file 结构化 + 答案兜底双登记）
 function render(ev) {
   const ts = ev.ts ? new Date(ev.ts).toLocaleTimeString() : "";
+  // R11 子代理事件路由：带 sub 标签的事件（镜像 trace + 子流式帧）进子框，不与主链
+  // 渲染（气泡/答案卡/主 pending 表）串线；artifact/sources 除外——子代理生成的成品
+  // 文件与引用来源同样汇入主回合的卡片收纳区。
+  if (ev.sub && ev.type !== "artifact" && ev.type !== "sources") {
+    const t = String(ev.type);
+    if (t === "stream_start") subStreamStart(ev);
+    else if (t === "stream_delta") subStreamDelta(ev);
+    else if (t === "stream_end") subStreamEnd(ev);
+    else if (t === "stream_error") { /* 子轮异常：镜像 error 事件会跟进 */ }
+    else renderSubEvent(ev);
+    scrollFeed();
+    return;
+  }
   switch (ev.type) {
     case "user": {
       doneSids.clear(); // 新回合开始：作废上一回合标记，防止同 round sid 碰撞误伤新回合流式
       processBox = processBody = processThink = null; // 过程链框按用户回合划分
+      subBoxes.clear(); // 子代理框按用户回合划分（引用随 DOM 重建，旧引用弃用）
       roundCards = []; // 答案卡按用户回合累积，新回合清空
+      turnArtifacts = []; turnSourceBox = null; turnSourceUrls.clear(); turnArtifactPaths.clear(); turnTail = null; // 回合级卡片追踪归位（卡已在 DOM，仅弃引用）
       const idx = userTurns.length;
       userTurns.push({ idx, text: ev.text ?? "", atts: ev.attachments ?? [] });
       // R3 附件重放：图片缩略图 / 文件条（trace user 事件带全量 b64）
@@ -703,6 +930,12 @@ function render(ev) {
     }
     case "assistant":
       renderAssistant(ev, ts);
+      break;
+    case "artifact":
+      renderArtifactCard(ev);
+      break;
+    case "sources":
+      renderSourcesCard(ev); // 信息溯源：web 检索/阅读引用链接
       break;
     case "stream_start":
       if (!(ev.sid && doneSids.has(ev.sid))) startStream(ev.sid);
@@ -739,9 +972,13 @@ function render(ev) {
       pending.delete(key);
       break;
     }
-    case "subagent":
-      feed.appendChild(el(`<div class="ev subagent"><div class="card">🔁 <b>${esc(ev.name ?? "subagent")}</b> ${esc(ev.note ?? "")}</div></div>`));
+    case "subagent": {
+      // R11：委派标记 → 在过程框内创建「子代理」实时子框（task 作标题；后续镜像
+      // 事件与子流式帧按 sub 标签汇入同框）。不再是一条静态卡片。
+      const sub = String(ev.sub_session ?? "").split("#").pop() || "sub";
+      ensureSubBox(sub, ev.task ?? "");
       break;
+    }
     case "compaction":
       feed.appendChild(el(`<div class="ev compaction"><span class="line">── 上下文已压缩（摘要 ${esc(ev.summarized)} 条，保留 ${esc(ev.kept)} 条）──</span></div>`));
       break;
@@ -795,7 +1032,7 @@ function render(ev) {
     default:
       return; // 未知事件类型：忽略（前向兼容）
   }
-  scroll();
+  scrollFeed();
 }
 
 // ── SSE：增量续传。after=0=全量重放（首屏/切换会话，清空 feed）；after>0=断线续传（保留历史，只补新增）。
@@ -805,7 +1042,7 @@ let es = null, lastAfter = 0;
 function connect(after) {
   after = after || 0;
   if (es) es.close();
-  if (after === 0) { feed.innerHTML = ""; pending.clear(); lastAfter = 0; doneSids.clear(); processBox = processBody = processThink = null; userTurns = []; } // 首屏/切换/回滚后：清空后全量重放
+  if (after === 0) { feed.innerHTML = ""; pending.clear(); lastAfter = 0; doneSids.clear(); processBox = processBody = processThink = null; subBoxes.clear(); userTurns = []; turnArtifacts = []; turnSourceBox = null; turnSourceUrls.clear(); turnArtifactPaths.clear(); turnTail = null; } // 首屏/切换/回滚后：清空后全量重放
   // 清 DOM 后流式句柄一并失效，避免继续写入已移除的气泡
   streamSid = streamCard = streamBody = streamStats = null;
   es = new EventSource(`/api/events?session=${encodeURIComponent(session)}&after=${after}`);
@@ -814,7 +1051,7 @@ function connect(after) {
   es.onmessage = (m) => {
     let ev; try { ev = JSON.parse(m.data); } catch { return; }
     if (ev && ev.type && !String(ev.type).startsWith("stream_")) lastAfter++; // 持久事件数 ≈ trace 游标
-    render(ev);
+    try { render(ev); } catch (e) { console.warn("render failed:", ev?.type, e); } // 单事件渲染异常不拖垮游标与后续事件
   };
 }
 connect();
@@ -859,6 +1096,10 @@ function renderAtts() {
   });
 }
 
+// chatAbort：当次 /api/chat 的中断器。停止 = 先 POST cancel（置位服务端取消信号），
+// 再 abort 阻塞中的请求——UI 即时解锁；服务端到最近检查点（波次间/轮次边界）自然收敛 K499，
+// memory/trace 照常落盘，重连 SSE 即见真实状态。
+let chatAbort = null;
 async function send(presetText, presetAtts) {
   const text = (presetText ?? input.value).trim();
   if (!text) return;
@@ -869,15 +1110,18 @@ async function send(presetText, presetAtts) {
   touchSession(session);
   autoName(session, text); // 标题为空时按首条消息自动命名
   try {
+    chatAbort = new AbortController();
     const r = await fetch("/api/chat", {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST", headers: { "content-type": "application/json" }, signal: chatAbort.signal,
       body: JSON.stringify({ session_id: session, message: text, ...(atts.length ? { attachments: atts } : {}) }),
     });
     const v = await r.json();
     if (!v.ok) setStatus("失败: " + (v.error?.message ?? r.status));
     else setStatus("");
-  } catch (e) { setStatus("请求失败: " + e); }
-  finally { sendBtn.disabled = false; stopBtn.hidden = true; input.focus(); }
+  } catch (e) {
+    if (e?.name === "AbortError") setStatus("已停止（后台正在收敛）"); else setStatus("请求失败: " + e);
+  }
+  finally { chatAbort = null; sendBtn.disabled = false; stopBtn.hidden = true; input.focus(); }
 }
 sendBtn.onclick = () => send();
 
@@ -893,14 +1137,18 @@ async function rollbackTo(idx, resend, ut) {
   if (resend && ut) send(ut.text, ut.atts || []);
 }
 
-// P2/T1 停止：发送期间可见。置位取消信号（agent-loop 在轮次边界收敛为 K499），
+// P2/T1 停止：发送期间可见。置位取消信号（agent-loop 在波次间/轮次边界收敛为 K499），
+// 随即 abort 阻塞中的 /api/chat（UI 即时解锁，不再等服务端收敛）。
 // 与发送互斥——stopBtn 仅在 sendBtn.disabled 时出现。
 stopBtn.onclick = async () => {
   stopBtn.disabled = true;
   try {
     const r = await fetch(`/api/chat/cancel?session=${encodeURIComponent(session)}`, { method: "POST" });
     const v = await r.json();
-    setStatus(v.ok ? "正在停止…" : "停止失败: " + (v.error?.message ?? r.status));
+    if (v.ok) {
+      setStatus("正在停止…");
+      chatAbort?.abort();
+    } else setStatus("停止失败: " + (v.error?.message ?? r.status));
   } catch (e) { setStatus("停止失败: " + e); }
   finally { stopBtn.disabled = false; }
 };
@@ -961,7 +1209,7 @@ async function loadConfig() {
     syncLlmFields();
     const a = c.agent ?? {};
     for (const [id, v] of [
-      ["agent-max-rounds", a.max_rounds], ["agent-budget-secs", a.budget_secs], ["agent-token-budget", a.token_budget],
+      ["agent-max-rounds", a.max_rounds], ["agent-output-dir", a.output_dir ?? "outputs"], ["agent-budget-secs", a.budget_secs], ["agent-token-budget", a.token_budget],
       ["agent-history-limit", a.history_limit], ["agent-compact-trigger", a.compact_trigger], ["agent-compact-keep", a.compact_keep],
       ["agent-tool-result-limit", a.tool_result_limit], ["agent-retry-attempts", a.retry_attempts], ["agent-retry-base-ms", a.retry_base_ms],
       ["agent-llm-context-tokens", a.llm_context_tokens],
@@ -1162,7 +1410,7 @@ $("tools-save").onclick = async () => {
 $("agent-save").onclick = async () => {
   const agent = {};
   for (const [k, id] of [
-    ["max_rounds", "agent-max-rounds"], ["budget_secs", "agent-budget-secs"], ["token_budget", "agent-token-budget"],
+    ["max_rounds", "agent-max-rounds"], ["output_dir", "agent-output-dir"], ["budget_secs", "agent-budget-secs"], ["token_budget", "agent-token-budget"],
     ["history_limit", "agent-history-limit"], ["compact_trigger", "agent-compact-trigger"], ["compact_keep", "agent-compact-keep"],
     ["tool_result_limit", "agent-tool-result-limit"], ["retry_attempts", "agent-retry-attempts"], ["retry_base_ms", "agent-retry-base-ms"],
     ["llm_context_tokens", "agent-llm-context-tokens"],
@@ -1189,8 +1437,9 @@ function renderSkills() {
   const box = $("skills-list"); box.innerHTML = "";
   if (!skillsCache.length) box.innerHTML = '<div class="empty">（暂无技能）</div>';
   for (const s of skillsCache) {
-    const item = el(`<div class="skillitem"><span class="name">${esc(s.name)}</span><span class="desc">${esc(s.description ?? "")}</span></div>`);
+    const item = el(`<div class="skillitem"><span class="name">${esc(s.name)}</span><span class="desc">${esc(s.description ?? "")}</span><span class="rev" title="在文件管理器中打开技能目录">📂</span></div>`);
     item.onclick = () => openSkill(s.name);
+    item.querySelector(".rev").onclick = (e) => { e.stopPropagation(); reveal("skill", s.name, "skill-flash"); };
     box.appendChild(item);
     // R9/W6：配套工具区（tools_detail 由 host 从 tools.skill_tools 合入，含未启用项 + enabled 标记）。
     // 启停就地完成：永远走配置闸（现有启用集 ± 该工具 → PUT /api/config）；失败回滚 UI。
@@ -1218,6 +1467,111 @@ function renderSkills() {
     box.appendChild(zone);
   }
 }
+// ── 产物文件卡片：agent 产出的成品文件（artifact trace 事件）→ 可点击查看/下载 ──
+// 点击分流：文本类内嵌预览（md 走富渲染）；html/图片/pdf 浏览器原生渲染新标签打开；
+// office/zip 等二进制走 /files?download=1 下载。来源（相对路径+工具）展示在卡片上。
+const PREVIEW_TEXT_EXTS = ["md", "markdown", "txt", "log", "json", "csv", "js", "ts", "py", "rs", "css", "xml", "yml", "yaml"];
+const PREVIEW_NATIVE_EXTS = ["html", "htm", "svg", "png", "jpg", "jpeg", "gif", "webp", "pdf"];
+function filesUrl(p, download) {
+  const encoded = p.split(/[\\/]/).map(encodeURIComponent).join("/");
+  return "/files/" + encoded + (download ? "?download=1" : "");
+}
+function renderArtifactCard(ev) {
+  if (!ev.path) return;
+  const key = ev.path.replace(/\\/g, "/").toLowerCase();
+  if (turnArtifactPaths.has(key)) return; // 同回合同路径去重
+  turnArtifactPaths.add(key);
+  const name = ev.path.split(/[\\/]/).pop();
+  const ext = (name.includes(".") ? name.split(".").pop() : "").toLowerCase();
+  const card = el(`<div class="artcard"><span class="ico">📄</span><span class="nm">${esc(name)}</span><span class="src" title="${esc(ev.path)}">${esc(ev.path)}${ev.tool ? " · " + esc(ev.tool) : ""}</span><span class="open">${PREVIEW_TEXT_EXTS.includes(ext) || PREVIEW_NATIVE_EXTS.includes(ext) ? "查看" : "下载"}</span></div>`);
+  card._artpath = key; // R12：最终答案「提及过滤」按此键匹配（文件名命中或全路径命中）
+  card.querySelector(".open").onclick = () => {
+    if (PREVIEW_TEXT_EXTS.includes(ext)) previewTextFile(ev.path, ext);
+    else if (PREVIEW_NATIVE_EXTS.includes(ext)) window.open(filesUrl(ev.path), "_blank");
+    else window.open(filesUrl(ev.path, true), "_blank");
+  };
+  ensureTurnTail().appendChild(card);
+  turnArtifacts.push(card); // 回合收敛时移到最终答案之后置底
+  scrollFeed();
+}
+// ── 来源 chip + 侧边抽屉（信息溯源）：web_search/web_read 的引用链接折叠为一张
+// 「🔗 来源 (N)」小卡；点击从右侧滑出抽屉逐条查看。回合内一张 chip 累计去重，
+// 引用清单挂在 chip 元素上（置底移动后仍可随时点开回看）。
+function renderSourcesCard(ev) {
+  const items = (ev.items ?? []).filter((it) => it && it.url && !turnSourceUrls.has(it.url));
+  if (!items.length) return;
+  const chip = turnSourceBox ?? el(`<div class="srcchip" title="点击查看引用来源">🔗 来源 <span class="cnt">0</span></div>`);
+  chip._items = chip._items ?? [];
+  for (const it of items) {
+    turnSourceUrls.add(it.url);
+    chip._items.push(it);
+  }
+  chip.querySelector(".cnt").textContent = chip._items.length;
+  chip.onclick = () => openSourceDrawer(chip._items);
+  if (!turnSourceBox) {
+    ensureTurnTail().appendChild(chip);
+    turnSourceBox = chip;
+    scrollFeed();
+  }
+}
+function openSourceDrawer(items) {
+  let d = $("src-drawer");
+  if (!d) {
+    d = el(`<div id="src-drawer" class="sd-overlay"><div class="sd-panel"><div class="sd-head"><span>🔗 引用来源</span><button class="btn ghost sd-close">关闭</button></div><div class="sd-body"></div></div></div>`);
+    document.body.appendChild(d);
+    d.onclick = (e) => { if (e.target === d) d.classList.remove("open"); };
+    d.querySelector(".sd-close").onclick = () => d.classList.remove("open");
+  }
+  const body = d.querySelector(".sd-body");
+  body.innerHTML = "";
+  (items ?? []).forEach((it, i) => {
+    body.appendChild(el(`<div class="sd-item"><span class="sd-idx">${i + 1}</span><a href="${esc(it.url)}" target="_blank" rel="noopener noreferrer">${esc(it.title || it.url)}</a><span class="u">${esc(it.url)}</span></div>`));
+  });
+  d.classList.add("open");
+}
+// 回合收敛：产物卡与来源卡移到最终答案之后（appendChild 对既有节点即移动）。
+// 回合异常终止（无 assistant 收敛事件）时卡片留在过程框内，仍可见。
+function settleTurnEnd() {
+  for (const c of turnArtifacts) feed.appendChild(c);
+  turnArtifacts = [];
+  if (turnSourceBox) feed.appendChild(turnSourceBox);
+  turnSourceBox = null;
+  turnTail?.remove();
+  turnTail = null;
+}
+// R12 产物「提及过滤」：只保留最终答案点名的文件——write_file 的中间草稿等与
+// 交付无关的成品不再铺开。文件名或完整路径出现在答案文本中即算提及；答案一条
+// 都没点名 → 不启用过滤（避免误杀「生成了但没逐个点名」的场景）。
+function filterArtifactsByAnswer(answer) {
+  if (!turnArtifacts.length || !answer) return;
+  const hay = String(answer).replace(/\\/g, "/").toLowerCase();
+  const kept = turnArtifacts.filter((c) => {
+    const p = c._artpath ?? "";
+    return p && (hay.includes(p) || hay.includes(p.split("/").pop() ?? "\u0000"));
+  });
+  if (!kept.length || kept.length === turnArtifacts.length) return;
+  for (const c of turnArtifacts) if (!kept.includes(c)) c.remove();
+  turnArtifacts = kept;
+}
+async function previewTextFile(path, ext) {
+  try {
+    const r = await fetch(filesUrl(path));
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const text = await r.text();
+    let overlay = $("file-preview");
+    if (!overlay) {
+      overlay = el(`<div id="file-preview" class="fp-overlay"><div class="fp-box"><div class="fp-head"><span class="fp-name"></span><button class="btn ghost fp-close">关闭</button></div><div class="fp-body"></div></div></div>`);
+      document.body.appendChild(overlay);
+      overlay.onclick = (e) => { if (e.target === overlay) overlay.style.display = "none"; };
+      overlay.querySelector(".fp-close").onclick = () => overlay.style.display = "none";
+    }
+    overlay.querySelector(".fp-name").textContent = path;
+    const body = overlay.querySelector(".fp-body");
+    body.innerHTML = ext === "md" || ext === "markdown" ? md(text) : `<pre>${esc(text)}</pre>`;
+    overlay.style.display = "flex";
+  } catch (e) { setStatus("文件预览失败: " + e.message); }
+}
+
 async function openSkill(name) {
   try {
     const v = await api("GET", "/api/skills/" + encodeURIComponent(name));
@@ -1229,6 +1583,16 @@ async function openSkill(name) {
     flash("skill-flash", true, "已加载 " + name);
   } catch (e) { flash("skill-flash", false, e.message); }
 }
+// ── 设置面板「📂 源文件」：host 代为在文件管理器中打开配置源文件位置（浏览器禁 file:// 跳转）──
+async function reveal(target, name, flashId) {
+  try {
+    await api("POST", "/api/reveal?target=" + target + (name ? "&name=" + encodeURIComponent(name) : ""));
+    flash(flashId, true, "已在文件管理器中打开");
+  } catch (e) { flash(flashId, false, e.message); }
+}
+$("llm-reveal").onclick = () => reveal("config", null, "llm-flash");
+$("tools-reveal").onclick = () => reveal("tools", null, "tools-flash");
+$("skills-reveal").onclick = () => reveal("skills", null, "skill-flash");
 $("skill-new").onclick = () => {
   curSkill = null;
   $("skill-editor").hidden = false;

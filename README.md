@@ -17,10 +17,10 @@
 - ReAct 循环：感知(读记忆)→规划(LLM+工具清单)→行动(执行工具/保留名路由)→观察(写回记忆)→收敛；全程发射事件（trace）+ 逐轮进度回显
 - 三家 LLM 全覆盖：OpenAI 兼容（可换 base_url 适配 DeepSeek 等）、Anthropic、Ollama；另带 **mock** provider 供离线测试
 - 生产级工具 8 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read（全部免费默认无 key）
-- 双前端：REPL（默认）/ Web 网关（HTTP+SSE，DeepSeek 风格单页会话：左侧会话栏+持久化、工具调用状态点卡片、富 markdown 代码块复制，刷新恢复=日志重放）
+- 双前端：REPL（默认）/ Web 网关（HTTP+SSE，DeepSeek 风格单页会话：左侧会话栏+持久化、工具调用状态点卡片、产物文件卡片（点击预览/下载）、富 markdown 代码块复制，刷新恢复=日志重放）
 - **Web 配置中心**（08）：设置面板在线配 LLM（provider/model/base_url/api_key，热生效+落盘 config.json）、勾选工具白名单、技能 CRUD（SKILL.md 在线编辑）
 - **自扩展**（08）：L1 技能自扩展——skills 根在 WORKSPACE_ROOT 内时系统提示词授权模型用 write_file 自建技能（文件即注册表，下轮对话自动可见）；L2 工具自扩展——`tools.reload` 动态装载新工具模块（装载≠启用，白名单两步分离）；R9 技能自造闭环——`skill_install` 编排 + 语言无关配套工具（tools.json 声明 + 任意语言执行体），前端内联卡一键启用（装载≠启用≠可见，见「配置中心与自扩展」）
-- subagent：保留工具 `task` 委派子任务（新 session 复用全链路，深度防嵌套）
+- subagent：保留工具 `task` 委派子任务（新 session 复用全链路，深度防嵌套）；前端「思考与工具」过程框内嵌套「子代理」实时框——子代理的思考流与工具卡实时透传呈现（trace 事件镜像 + 子旁路流式），委派不再"图标一闪就卡住"
 
 ## 目录
 
@@ -102,6 +102,9 @@ Web 前端是单文件 `crates/host/web-dist/index.html`（内联 CSS/JS，无�
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic 端点 |
 | `MOCK_SCRIPT` | — | mock provider 脚本（JSON 数组，逐次弹出） |
 | `MAX_ROUNDS` | `8` | ReAct 最大轮数 |
+| `AGENT_OUTPUT_DIR` | `outputs` | 产物输出目录（工作区内相对路径）：系统提示词注入产物统一写入约定，前端文件卡片经 `GET /files/{path}` 预览/下载 |
+| `LLM_EXTRA_BODY` | — | openai 兼容族请求体逃生舱（JSON 整体合并，如 `{"enable_thinking":true}`）；非法 JSON 打警告忽略 |
+| `LLM_DEBUG` | — | 置 `1` 时把 openai 兼容族最终请求体落盘 `.stream/last-request.json`（诊断请求差异） |
 | `SESSION_ID` | `default` | REPL/单轮会话 id |
 | `AGENT_KERNEL_REPO` | `../agent-kernel` | 内核 checkout（PYTHONPATH/TS shim 解析） |
 | `PLUGINS_DIR` | `<workspace>/plugins` | guest 脚本目录 |
@@ -130,7 +133,7 @@ cargo test -p react-agent-agent-loop   # 纯 Rust mock 测试（无需 python/no
 cargo test --workspace                 # 全量（含跨语言 e2e，缺解释器自动 skip）
 ```
 
-e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚本)、**全链路 ReAct**、上下文压缩、web 网关（chat+SSE 重放 + **配置中心与技能 CRUD**）、subagent（委派+嵌套拒绝）。
+e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚本)、**全链路 ReAct**、上下文压缩、web 网关（chat+SSE 重放 + **配置中心与技能 CRUD**）、subagent（委派+嵌套拒绝+**事件镜像透传**）。
 
 > 注意：若测试失败提前退出，guest 子进程可能残留（占用内存无害）；可用 `Get-Process python,node` 检查清理。测试内已将 guest stderr 指向 null，cargo 不会再被泄漏进程扣住。
 
@@ -142,6 +145,8 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 - req `{"op":"chat","session_id":str,"user_text":str,"attachments"?:[Attachment]}`（attachments：host 已校验，图片走多模态映射、文本文件内嵌 content，见「用户附件」）
 - resp `{"ok":true,"answer":str,"rounds":int,"steps":[{"round":int,"tool":str,"ms":int}],"session_id":str}` | `{"ok":false,"error":{...}}`
 - 保留工具名（不进 tools.list，由 agent-loop 路由）：`load_skill`→assets `skills.load`（成功发 `skill_loaded` trace 事件，会话技能集重放推导依据）；`skill_install`→R9 技能安装编排（assets skills.load 取声明 → tools.install fail-closed 装载 → trace `skill_installed`）；`task`→子代理（新 session 复用 agent.chat，深度防嵌套）
+- **产物登记**：write_file/edit_file 成功 → trace `{"type":"artifact","path","tool","bytes"?}` 事件；bash/最终答案文本经扩展名启发式扫描兜底（双闸：二进制成品任意位置放行；md/html/txt 等文本类仅产物目录 `AGENT_OUTPUT_DIR` 内放行——避免 rg/ls 输出把整仓文档刷成卡）；前端渲染可点击文件卡片（流式期间在过程框内，回合收敛后置底展示在最终答案下方），`GET /files/{path}` 服务内容（realpath ⊆ WORKSPACE_ROOT，`?download=1` 下载）。**提及过滤（W9.3）**：最终答案收敛时只保留答案文本点名的文件（路径或文件名匹配，大小写/路径分隔符归一；一条都没点名则不过滤防误杀）——中间草稿等未提及产物自动移除
+- **来源登记（信息溯源）**：web_search 成功 → trace `{"type":"sources","tool","items":[{"title","url"}]}`（web_read 单 URL 同款）；URL http/https 白名单 + 去重 + 上限 10 条；前端回合内累计去重折叠为一张「🔗 来源 (N)」chip 卡，点击右侧滑出抽屉逐条查看标题与链接（W9.3），与产物卡一并置底，方便回答依据溯源
 
 **llm-adapter**（`llm.chat`）
 - req `{"op":"chat","provider"?:"openai"|"anthropic"|"ollama"|"mock","messages":[Msg],"tools"?:[ToolSpec],"stream_path"?,"sid"?,"num_ctx"?:int}`（`num_ctx` 源自 `LLM_CONTEXT_TOKENS`，0/缺省不下发；仅 ollama native 映射 `options.num_ctx`）
@@ -183,8 +188,8 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 - `GET /` → 单页（Cursor 暖色系事件流式会话：米色纸感底 + 半透明炭黑 CTA，主题 token 见 crates/host/PLAN.md W1；左侧会话栏持久化、工具调用状态点卡片、富 markdown 代码块复制 + ⚙ 设置面板：LLM / 工具 / 技能 / Agent）
 - `GET /api/events?session=&after=` → SSE（从 0 全量重放 + 实时增量）
 - `POST /api/chat` body `{"session_id":str,"message":str,"attachments"?:[{"name","mime","data_b64"}]}` → 阻塞至收敛，回 agent.chat 响应（attachments 可选：图片走多模态映射、文本文件内嵌 content；上限 4 个、单个 ≤2MB，host 校验形状与体量，非法即 K400）
-- `POST /api/chat/cancel?session=` → 取消运行中的 chat：agent-loop `cancel`（轮次边界收敛 K499）+ llm-adapter `abort`（流式逐帧检查命中即关流，单轮长生成无需等轮次边界），立即返回
-- `POST /api/chat/rollback` body `{"session_id":str,"upto_user_index":int}` → R2 回滚：memory 消息与 trace 事件**同源物理截断**到第 N 条 user 消息之前（0 基）；前端 user 气泡 hover「⤺ 回滚」、答案 hover「↻ 重新生成」（= 回滚该问题 + 自动重发原文与附件）
+- `POST /api/chat/cancel?session=` → 取消运行中的 chat：agent-loop `cancel`（工具波次间 + 轮次边界收敛 K499）+ llm-adapter `abort`（流式逐帧检查命中即关流，单轮长生成无需等轮次边界），立即返回
+- `POST /api/chat/rollback` body `{"session_id":str,"upto_user_index":int}` → R2 回滚：memory 消息与 trace 事件**同源物理截断**到第 N 条 user 消息之前（0 基）。**计数口径以 trace user 事件为准（UI 真相源）**；memory 经压缩只剩「标记 + 最近 K 条」，两侧按**尾部对齐**（压缩只裁头部）定消息切点：回滚点在保留区 → 保压缩标记、截到该轮前；落在摘要区 → 标记与消息全清（摘要与回滚区间重叠，保留即上下文残留）；无 trace 文件的纯 memory 会话按 memory 侧计数，标记随截断一并丢弃。越界整体失败不落盘；只清对话层——工具产物文件与技能目录不回滚；前端 user 气泡 hover「⤺ 回滚」、答案 hover「↻ 重新生成」（= 回滚该问题 + 自动重发原文与附件）
 - `GET /api/config` → 配置视图（llm：config.json > env 缺省，key 只回 key_set+尾 4 位；tools 全集+enabled；skills_count）
 - `GET /api/models` → 转发 llm-adapter `models.list`，返回当前 provider 可用模型 id（前端「拉取模型」按钮；配好 base_url/key 后自动填充
  model 下拉；ollama 额外透传 `models_meta` 原生窗口元数据——前端下拉展示 `模型名 · 256k`，Agent 页 `llm_context_tokens` 提示原生窗口并可一键填入）
@@ -201,6 +206,7 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 - **L1 技能自扩展**：assets `skills.list` 回传 root，agent-loop 判定 root ⊆ WORKSPACE_ROOT 后在系统提示词注入授权段——模型用 `write_file` 写 `<skills-root>/<name>/SKILL.md` 即完成注册（list 每次重扫，下轮对话可见，无需 reload）。授权≠边界：真正的硬边界仍是文件工具 realpath 越界拦截
 - **L2 工具自扩展**：把符合 ToolSpec 三元组（name/description/parameters/run）的 `TOOLS` dict 放进 `plugins/tools/` 下的新 .py 文件，对话中说「重载工具」→ `tools.reload` 装载进池；再经配置中心勾选启用（装载≠启用，写与启用两步分离）
 - **R9 技能自造闭环**：模型调 `skill_install(name)` 完成技能包安装编排——assets `skills.load` 取 SKILL.md + frontmatter `tools:` 声明 → `tools.install` fail-closed 装载配套工具（语言无关：tools.json 声明 + 任意语言执行体，子进程 stdin/stdout JSON 协议）→ trace `skill_installed` 事件 → 前端过程框内联卡「技能已就绪 · N 件待启用」。**三层作用域**：装载（进池不可调用）≠ 启用（一键启用过配置闸，全局持久）≠ 可见（仅 `load_skill` 后该技能已启用工具进入本会话工具清单，会话技能集由 trace 重放推导）。工具归属技能界面（技能 tab 内启停），内置 8 件冻结不扩展
+- **过程框交互（W7-W9）**：「思考与工具」过程框固定宽度（820px）恒定高度（65vh）内滚，内容实时贴底滑动显示最新（用户上滚即暂停跟随，回底自动恢复），模型思考链带「💭 思考」标签按轮混排在工具卡之间；正式答案出现时自动收起，产物/来源卡挂在框外页面流（随到达序即时呈现），收敛后置底展示在答案下方。`task` 委派在框内嵌套「子代理」实时框：子代理思考流与工具卡实时透传（trace 事件镜像 + 子旁路流式，`user` 事件不镜像以保回滚定位真相源；刷新重放显示工具卡与各轮答案，思考流仅实时可见）
 
 ## 架构要点（内核约束的落点）
 
@@ -214,8 +220,10 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 ## 已知限制（摘要）
 
 - **运行中断（停止）**：已支持（P2/T1 + R1 补强）。`POST /api/chat/cancel?session=` 双通道置位：
-  agent-loop `cancel`（轮次边界以 K499 收敛）+ llm-adapter `abort`（流式逐帧检查命中即关流返回 K499，
-  **单轮长生成可即时中断**，无需等轮次边界）。前端发送期间显示「停止」按钮。机制详见
+  agent-loop `cancel`（**工具波次间 + 轮次边界**以 K499 收敛，单轮多波工具不等全轮跑完）+ llm-adapter
+  `abort`（流式逐帧检查命中即关流返回 K499，**单轮长生成可即时中断**，无需等轮次边界）。前端停止 =
+  cancel 置位后随即 abort 阻塞中的 /api/chat（UI 即时解锁，服务端到最近检查点自然收敛，memory/trace 照常落盘）。
+  正在执行中的单个工具调用不可中断（bash 子进程等到命令结束/超时）。机制详见
   `crates/agent-loop/README.md`「运行中断（停止）」与 `plugins/llm_adapter/README.md`「abort」。
 - **sid 跨对话不保证唯一**：同 round 的不同对话回合生成相同 sid，极端情况下后一回合的流式动画被去重逻辑误忽略
   （直接显示最终答案，无打字效果）。细节与修复建议见 `crates/agent-loop/README.md`「流式编排」。

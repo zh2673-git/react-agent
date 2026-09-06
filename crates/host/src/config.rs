@@ -231,6 +231,7 @@ pub const AGENT_ENV_MAP: &[(&str, &str)] = &[
     ("retry_attempts", "LLM_RETRY_ATTEMPTS"),
     ("retry_base_ms", "LLM_RETRY_BASE_MS"),
     ("llm_context_tokens", "LLM_CONTEXT_TOKENS"),
+    ("output_dir", "AGENT_OUTPUT_DIR"),
 ];
 
 /// 启动时把 config.json 应用为 env（spawn 下发走既有机制）。返回应用的键数。

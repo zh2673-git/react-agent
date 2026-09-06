@@ -70,6 +70,14 @@ def _build_body(endpoint: dict, payload: dict) -> dict:
             {"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
             for t in tools
         ]
+    # 逃生舱：LLM_EXTRA_BODY（JSON）整体合并进请求体——网关要求私有字段
+    # （如 enable_thinking / chat_template_kwargs）时无需改代码。非法 JSON 打警告忽略。
+    extra = os.environ.get("LLM_EXTRA_BODY", "").strip()
+    if extra:
+        try:
+            body.update(json.loads(extra))
+        except ValueError:
+            print(f"[llm_adapter] LLM_EXTRA_BODY 不是合法 JSON，已忽略: {extra[:100]}", flush=True)
     return body
 
 
@@ -80,6 +88,15 @@ def _chat_with(endpoint: dict, payload: dict, provider_label: str) -> dict:
     """
     require_httpx()
     body = _build_body(endpoint, payload)
+    # 诊断开关：LLM_DEBUG=1 时把最终请求体落盘到旁路目录（.stream/last-request.json），
+    # 用于核对「直连有思考、过 host 无思考」一类请求差异问题。
+    if os.environ.get("LLM_DEBUG") == "1" and payload.get("stream_path"):
+        try:
+            dbg = os.path.join(os.path.dirname(payload["stream_path"]), "last-request.json")
+            with open(dbg, "w", encoding="utf-8") as f:
+                json.dump(body, f, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            print(f"[llm_adapter] LLM_DEBUG 请求转储失败: {exc}", flush=True)
     stream_path = payload.get("stream_path")
     if stream_path:
         return _chat_stream(endpoint, body, stream_path, payload.get("sid"), provider_label)

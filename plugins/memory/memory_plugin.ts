@@ -12,8 +12,12 @@
 //   {"op":"rollback","session_id":str,"upto_user_index":int}   → {"ok":true,"removed_messages","removed_events"}
 //       R2 回滚（物理截断语义）：按「第 upto_user_index 条 user 消息」（0 基）把该条及
 //       之后的一切截掉——会话消息（LLM 上下文）与 trace 事件日志（UI 重放）原子同滚，
-//       先算两侧切点、任一越界即整体失败不落盘。user 计数口径 = 真实用户轮次；
-//       压缩标记（[Context compaction] 前缀的 user 消息）与 trace 的 compaction 事件不计。
+//       先算两侧切点、任一越界即整体失败不落盘。user 计数口径以 trace user 事件为准
+//       （UI 真相源，前端气泡序号即此）；memory 经压缩只留「标记 + 最近 K 条」，两侧
+//       user 数天然不对齐 → 尾部对齐（压缩只裁头部）：回滚点在保留区 → 保标记截到
+//       该轮前；落在摘要区 → 标记与消息全清（摘要与回滚区间重叠，保留即上下文残留，
+//       agent 会误以为已回滚的材料还在）。无 trace 文件的纯 memory 会话按 memory 侧
+//       真实 user 计数定位，压缩标记随截断一并丢弃。
 // Event = 任意 JSON 对象（建议 {type, ts, ...}）——事件日志（Phase 3-1）：只追加、不可变，
 // 服务于审计/恢复/UI 重放（与 memory「模型上下文」是不同关注点，dsh：Model-visible means logged）。
 // Msg = {role, content?, tool_calls?, tool_call_id?} —— 与 agent-loop 的 contract.rs 镜像。
@@ -164,23 +168,10 @@ export const memoryPlugin: Plugin = {
         // （与 agent-loop compaction_marker / 本插件 summarize 的固定前缀对齐）。
         const isRealUser = (m: Msg) =>
           m.role === "user" && !(m.content ?? "").startsWith("[Context compaction]");
-        const msgs = loadIfAbsent(sessionId);
-        let msgCut = -1;
-        let userCount = 0;
-        for (let i = 0; i < msgs.length; i++) {
-          if (isRealUser(msgs[i])) {
-            if (userCount === upto) {
-              msgCut = i;
-              break;
-            }
-            userCount++;
-          }
-        }
-        if (msgCut < 0) {
-          return err(`回滚位置超出会话历史（共 ${userCount} 条 user 消息）`);
-        }
-        // trace 切点：第 upto 条 type==="user" 事件行的字节偏移（JSONL 逐行解析，
-        // 与消息侧同一计数口径——chat_run 每轮先 append user 消息、再 trace user 事件）
+        // trace 切点先行（UI 真相源）：气泡由 trace 重放渲染，前端下发的 upto 就是
+        // trace user 事件序号。memory 侧经压缩只留「标记 + 最近 K 条」，两侧 user 数
+        // 天然不对齐、不能互为校验 → 尾部对齐（压缩只裁头部）：memory 的 N 条真实
+        // user 恰对应 trace 末尾 N 条 user 事件，local = upto - (trace侧user总数 - N)。
         const file = traceFile(sessionId);
         let text = "";
         try {
@@ -188,43 +179,62 @@ export const memoryPlugin: Plugin = {
         } catch {
           /* 尚无 trace 文件：仅回滚消息 */
         }
-        let traceCut = -1;
-        let evCount = 0;
+        // 全量扫描：user 事件行偏移 + 其事件序号（截断长度与 removed_events 都要用）
+        const userMarks: Array<{ off: number; evIdx: number }> = [];
         let totalEvents = 0;
-        let beforeCut = 0;
         let offset = 0;
         for (const line of text.split("\n")) {
           const lineBytes = Buffer.byteLength(line + "\n", "utf8");
           const t = line.trim();
           if (t) {
-            totalEvents++;
             try {
               if ((JSON.parse(t) as { type?: string }).type === "user") {
-                if (evCount === upto) {
-                  traceCut = offset;
-                  break;
-                }
-                evCount++;
+                userMarks.push({ off: offset, evIdx: totalEvents });
               }
             } catch {
               /* 半行写入容忍：跳过损坏行 */
             }
-            beforeCut = totalEvents;
+            totalEvents++;
           }
           offset += lineBytes;
         }
-        if (text && traceCut < 0) {
-          return err(`trace 与消息不同源：trace 中只有 ${evCount} 条 user 事件`);
+        if (text && upto >= userMarks.length) {
+          return err(`回滚位置超出会话历史（共 ${userMarks.length} 条 user 消息）`);
         }
-        const removedEvents = text && traceCut >= 0 ? totalEvents - beforeCut : 0;
-        // 落盘：消息 + trace 一起截
-        const kept = msgs.slice(0, msgCut);
+        const msgs = loadIfAbsent(sessionId);
+        const realIdx: number[] = [];
+        for (let i = 0; i < msgs.length; i++) {
+          if (isRealUser(msgs[i])) realIdx.push(i);
+        }
+        let kept: Msg[];
+        if (text) {
+          // 尾部对齐定消息切点。local >= 0：该轮还在（未压缩保留区）→ 截到它之前，
+          // 标记摘要描述的是切点之前的已压缩历史，与本次回滚不重叠，保留。
+          // local < 0：该轮已被压缩进标记（回滚点落在摘要区内）→ 摘要描述的历史与
+          // 回滚区间重叠，标记与全部消息一起清空——保留即上下文残留。
+          const local = upto - (userMarks.length - realIdx.length);
+          kept = local >= 0 ? msgs.slice(0, realIdx[local]) : [];
+        } else {
+          // 无 trace 文件的纯 memory 会话：按 memory 侧轮次定位，越界即失败；
+          // 该轮是否落在摘要区无法判定，压缩标记随截断一并丢弃（防上下文残留）。
+          if (upto >= realIdx.length) {
+            return err(`回滚位置超出会话历史（共 ${realIdx.length} 条 user 消息）`);
+          }
+          kept = msgs.slice(0, realIdx[upto]);
+          while (kept.length > 0 && (kept[0].content ?? "").startsWith("[Context compaction]")) {
+            kept = kept.slice(1);
+          }
+        }
         sessions.set(sessionId, kept);
         persist(sessionId, kept);
-        if (text && traceCut >= 0) {
-          fs.truncateSync(file, traceCut);
+        if (text) {
+          fs.truncateSync(file, userMarks[upto].off);
         }
-        return { ok: true, removed_messages: msgs.length - msgCut, removed_events: removedEvents };
+        return {
+          ok: true,
+          removed_messages: msgs.length - kept.length,
+          removed_events: text ? totalEvents - userMarks[upto].evIdx : 0,
+        };
       }
       default: {
         // 事件日志（Phase 3-1）：trace.* 不需要会话消息状态，仅要求 session_id（上方已校验）

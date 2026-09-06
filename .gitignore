@@ -3,6 +3,8 @@ node_modules/
 __pycache__/
 *.pyc
 plugins/memory/data/
+outputs/
+plugins/assets/skills/gongwen-format/scripts/*.json*
 *.log
 .stream/
 config.json

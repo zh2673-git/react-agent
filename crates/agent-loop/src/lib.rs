@@ -5,7 +5,7 @@
 //! 本体 `&self` 无跨调用可变态（A1）。委派深度随调用链传播（`ChatReq.depth`），
 //! 非插件级共享状态——并发下各链互不挤占委派额度。
 //! 取消（P2/T1）：`cancel` op 置位会话标志，循环在轮次边界（每轮开头/工具波次后）
-//! 轮询命中即收敛为 K499；语义为 Concurrent——否则 cancel 会在 per-plugin 锁后排队、
+//! 与工具波次间（R1 补强：单轮多波工具时不等全轮跑完）轮询命中即收敛为 K499；语义为 Concurrent——否则 cancel 会在 per-plugin 锁后排队、
 //! 迟到到 chat 结束之后。
 //!
 //! 空间契约：跨插件通信一律走 `HostApi::call_plugin`（按 `Envelope.target` 路由），
@@ -78,6 +78,14 @@ pub struct AgentLoopPlugin {
     /// 取消令牌（P2/T1）：被请求取消的 session id 集合。`cancel` op 置位，循环在
     /// 轮次边界 take（命中即清）；chat 结束时兜底清理，防残留标志误杀同 session 下轮对话。
     cancels: Mutex<HashSet<String>>,
+    /// 回合开始时间（per session）：兜底产物扫描的「新鲜度」基准——只有本轮生成
+    /// （mtime ≥ 回合开始）的文件才登记为 artifact，ls/git 输出里的历史文件不再刷卡。
+    turn_starts: Mutex<std::collections::HashMap<String, std::time::SystemTime>>,
+    /// 子代理事件镜像（R11）：sub_session → parent_session。run_subagent 委派期间
+    /// 注册，trace() 据此把子会话事件同步写一份到父 trace（打 `sub` 标签），前端
+    /// 过程框内的「子代理」框据此实时/重放渲染——否则子代理只有一个静态图标，
+    /// 过程不可见（用户感知为卡住）。
+    mirrors: Mutex<std::collections::HashMap<String, String>>,
 }
 
 /// 构造插件实例（`Arc<dyn Plugin>`）。
@@ -111,6 +119,8 @@ pub fn new(max_rounds: usize) -> PluginInstance {
         host: OnceLock::new(),
         sub_counter: AtomicU64::new(0),
         cancels: Mutex::new(HashSet::new()),
+        turn_starts: Mutex::new(std::collections::HashMap::new()),
+        mirrors: Mutex::new(std::collections::HashMap::new()),
     })
 }
 
@@ -151,12 +161,16 @@ fn stream_dir() -> Option<PathBuf> {
 }
 
 /// 旁路文件路径：session 名来自 URL 参数，必须过安全校验（防路径穿越）。
+/// `#` 仅为子代理会话分隔符（`{parent}#sub-{n}`，R11）：允许出现在文件名中，
+/// 宿主网关按 `{session}#sub-*.jsonl` 前缀 glob 子文件——`#` 不进 URL，无注入面。
 fn stream_file_for(session: &str) -> Option<String> {
     let dir = stream_dir()?;
     let safe = !session.is_empty()
         && session.len() <= 64
         && !session.contains("..")
-        && session.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        && session
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '#'));
     if !safe {
         return None;
     }
@@ -446,6 +460,12 @@ impl AgentLoopPlugin {
         if let Some(section) = Self::self_extension_section(root) {
             lines.push(section);
         }
+        // 产物输出约定（方案 A）：给用户的成品文件统一落产物目录——模型不再把产物
+        // 混写进技能目录/仓库根。提示词约束非硬边界，越界拦截仍在文件工具侧。
+        lines.push(format!(
+            "## Artifact output\n- Files produced for the user (word/excel/ppt/html/markdown/images/…) must be written into `{}` (workspace-relative path). Do not scatter them into skill directories or the repo root. Mention the relative path of each artifact in your answer.",
+            Self::output_dir()
+        ));
         lines.join("\n")
     }
 
@@ -629,6 +649,10 @@ impl AgentLoopPlugin {
 
     /// 事件日志（Phase 3-1，dsh：Model-visible means logged）：只追加 JSONL，
     /// 服务于审计/恢复/UI 重放。尽力而为——失败仅 debug，不阻断主流程。
+    /// R11 子代理镜像：session_id 命中 mirrors（子代理委派进行中）→ 同一事件补写
+    /// 一份到父 trace 并打 `sub` 标签（前端过程框内「子代理」框的渲染依据，实时与
+    /// 重放同源）。`user` 事件不镜像——父 trace 的 user 事件序是回滚定位真相源，
+    /// 混入子轮次会错位（任务文本已由 `subagent` 事件承载）。
     async fn trace(&self, src: &Envelope, session_id: &str, mut event: Value) {
         if let Some(obj) = event.as_object_mut() {
             obj.entry("ts".to_string()).or_insert_with(|| {
@@ -638,6 +662,7 @@ impl AgentLoopPlugin {
                     .unwrap_or(0))
             });
         }
+        let mirror = self.mirrors.lock().unwrap().get(session_id).cloned();
         if let Err(e) = self
             .call(
                 src,
@@ -648,6 +673,25 @@ impl AgentLoopPlugin {
             .await
         {
             tracing::debug!(target: ID, "trace.append failed: {e}");
+        }
+        if let Some(parent) = mirror {
+            if event.get("type").and_then(Value::as_str) != Some("user") {
+                let sub = session_id.rsplit('#').next().unwrap_or(session_id).to_string();
+                if let Some(obj) = event.as_object_mut() {
+                    obj.insert("sub".into(), json!(sub));
+                }
+                if let Err(e) = self
+                    .call(
+                        src,
+                        ID_MEMORY,
+                        json!({"op": "trace.append", "session_id": parent, "events": [event]}),
+                        MEM_DEADLINE,
+                    )
+                    .await
+                {
+                    tracing::debug!(target: ID, "subagent mirror append failed: {e}");
+                }
+            }
         }
     }
 
@@ -935,7 +979,199 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             }),
         )
         .await;
+        // 产物登记：给用户的成品文件在事件流里结构化落账，前端渲染可点击文件卡片
+        self.detect_artifacts(src, session_id, tc, result).await;
+        // 来源登记：web 检索/阅读的引用链接结构化落账，前端渲染溯源卡（信息溯源）
+        self.detect_sources(src, session_id, tc, result).await;
     }
+
+    /// 产物检测：write_file/edit_file 是结构化结果直接取 path/bytes；bash 从输出文本
+    /// 扩展名启发式扫描（python-docx 等子进程产物）。误报无害——前端点击由 /files
+    /// 服务兜底 404；漏报仅少一张卡片。
+    async fn detect_artifacts(&self, src: &Envelope, session_id: &str, tc: &ToolCall, result: &Value) {
+        if result.get("ok") != Some(&json!(true)) {
+            return;
+        }
+        let inner = result.get("result").cloned().unwrap_or(json!({}));
+        match tc.name.as_str() {
+            "write_file" | "edit_file" => {
+                if let Some(p) = inner.get("path").and_then(Value::as_str) {
+                    // 路径归一为正斜杠：Windows 下 _display 产出反斜杠，卡片展示/URL/跨平台一致性统一
+                    let p = p.replace('\\', "/");
+                    // 只登记「给用户的成品」：脚本/数据/自扩展文件是中间产物，不上卡片
+                    let name = p.rsplit('/').next().unwrap_or("");
+                    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+                    let is_product = Self::PRODUCT_EXTS.contains(&ext.as_str());
+                    let is_meta = name == "SKILL.md" || name == "tools.json";
+                    if is_product && !is_meta {
+                        self.trace(
+                            src,
+                            session_id,
+                            json!({
+                                "type": "artifact", "path": p, "tool": tc.name,
+                                "bytes": inner.get("bytes").and_then(Value::as_u64),
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            }
+            "bash" => {
+                let out = inner.get("output").and_then(Value::as_str).unwrap_or("");
+                for p in Self::scan_artifact_paths(out) {
+                    if !self.fresh_artifact(session_id, &p) {
+                        continue; // 历史文件：ls/git 输出误报，不上卡
+                    }
+                    self.trace(src, session_id, json!({"type": "artifact", "path": p, "tool": tc.name}))
+                        .await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 产物输出目录（方案 A）：AGENT_OUTPUT_DIR，缺省 `outputs`（工作区内相对路径）。
+    /// 安全边界不变——文件工具越界拦截照旧，本约定只是给模型一个统一去处。
+    fn output_dir() -> String {
+        std::env::var("AGENT_OUTPUT_DIR")
+            .ok()
+            .map(|s| s.trim().trim_matches(['/', '\\']).to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "outputs".into())
+    }
+
+    /// 兜底扫描路径的「新鲜度」闸：文件真实存在且 mtime ≥ 回合开始（容差 2s，吸收
+    /// 文件系统时间精度）才登记——ls/git 列出的历史文件不再刷成产物卡。
+    /// WORKSPACE_ROOT 未设置（e2e host 进程）或回合起点缺失 → 跳过校验保持旧行为。
+    fn fresh_artifact(&self, session_id: &str, path: &str) -> bool {
+        let Some(ws) = std::env::var_os("WORKSPACE_ROOT").map(std::path::PathBuf::from) else {
+            return true;
+        };
+        let started = self
+            .turn_starts
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .copied();
+        let Some(started) = started else { return true };
+        let p = std::path::Path::new(path);
+        let full = if p.is_absolute() { p.to_path_buf() } else { ws.join(p) };
+        match std::fs::metadata(&full).and_then(|m| m.modified()) {
+            Ok(mt) => mt + std::time::Duration::from_secs(2) >= started,
+            Err(_) => false,
+        }
+    }
+
+    /// 来源登记（信息溯源）：web_search/web_read 的引用链接以 `sources` 事件结构化
+    /// 落账，前端在最终答案之后渲染「来源」卡。与产物登记同款纪律：误报无害（仅多
+    /// 一条链接），漏报仅少一卡。
+    async fn detect_sources(&self, src: &Envelope, session_id: &str, tc: &ToolCall, result: &Value) {
+        if result.get("ok") != Some(&json!(true)) {
+            return;
+        }
+        let inner = result.get("result").cloned().unwrap_or(json!({}));
+        let items = Self::extract_sources(&tc.name, &inner);
+        if items.is_empty() {
+            return;
+        }
+        let items: Vec<Value> = items
+            .into_iter()
+            .map(|(title, url)| json!({"title": title, "url": url}))
+            .collect();
+        self.trace(src, session_id, json!({"type": "sources", "tool": tc.name, "items": items}))
+            .await;
+    }
+
+    /// 从 web 工具结果提取 (title, url) 列表：http/https 白名单、URL 去重、上限 10 条
+    /// （溯源卡是索引不是快照）。无 title 时用 URL 自身充作显示文本。
+    fn extract_sources(tool: &str, inner: &Value) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut push = |title: &str, url: &str| {
+            let url = url.trim();
+            if !url.starts_with("http") || out.iter().any(|(_, u)| u == url) || out.len() >= 10 {
+                return;
+            }
+            let title = title.trim();
+            out.push((
+                if title.is_empty() { url.to_string() } else { title.to_string() },
+                url.to_string(),
+            ));
+        };
+        match tool {
+            "web_search" => {
+                for r in inner.get("results").and_then(Value::as_array).into_iter().flatten() {
+                    push(
+                        r.get("title").and_then(Value::as_str).unwrap_or(""),
+                        r.get("url").and_then(Value::as_str).unwrap_or(""),
+                    );
+                }
+            }
+            "web_read" => push("", inner.get("url").and_then(Value::as_str).unwrap_or("")),
+            _ => {}
+        }
+        out
+    }
+
+    /// 自由文本（bash 输出 / 最终答案）扫描「疑似产物路径」：产物扩展名 + 路径字符，
+    /// 去重保序。启发式：误报无害（/files 404 兜底）；含空格的绝对路径会被空白截断——
+    /// 借 WORKSPACE_ROOT 的目录名把「…/工作区目录名/xxx」截成工作区相对路径。
+    /// 双闸收紧（2026-09-06 实测回归：一次 bash 列目录把整仓 .md 刷成 30+ 张卡）：
+    /// 二进制成品扩展名放行；文本类扩展（md/html/txt…）仅产物目录内放行——bash 输出
+    /// 里 rg/ls/git 列出的源码与文档路径高频出现，不设此闸必刷屏。文本类成品仍可经
+    /// write_file 结构化登记（PRODUCT_EXTS 全集，不受此限）。
+    fn scan_artifact_paths(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        // 工作区目录名（如 react-agent）：用于截掉绝对路径前缀（含空格路径被空白切断的场景）
+        let root_name = std::env::var("WORKSPACE_ROOT")
+            .ok()
+            .and_then(|ws| std::path::Path::new(&ws).file_name().map(|n| n.to_string_lossy().into_owned()));
+        let out_dir_prefix = format!("{}/", Self::output_dir());
+        for tok in text.split_whitespace() {
+            let t = tok.trim_matches(|c: char| "()[]{}<>\"'`，。；：！？）【】、".contains(c));
+            // 截前缀：token 中含「<sep>工作区目录名<sep>」→ 取其后的相对路径
+            let mut t = t.to_string();
+            if let Some(rn) = &root_name {
+                for sep in ['\\', '/'] {
+                    let marker = format!("{sep}{rn}{sep}");
+                    if let Some(idx) = t.find(&marker) {
+                        t = t[idx + marker.len()..].to_string();
+                        break;
+                    }
+                }
+            }
+            let Some(dot) = t.rfind('.') else { continue };
+            let (stem, ext) = t.split_at(dot);
+            let ext = &ext[1..];
+            if !Self::PRODUCT_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+                || stem.is_empty()
+                || !stem.chars().all(|c| c.is_alphanumeric() || "\\/_-.~".contains(c))
+            {
+                continue;
+            }
+            let ext_l = ext.to_ascii_lowercase();
+            let norm = t.replace('\\', "/");
+            if !Self::SCAN_DOC_EXTS.contains(&ext_l.as_str()) && !norm.starts_with(&out_dir_prefix) {
+                continue;
+            }
+            if !out.iter().any(|s| s.eq_ignore_ascii_case(&t)) {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    /// 成品扩展名白名单：卡片只收「给用户的交付物」，json/py 等中间脚本与数据不上卡。
+    const PRODUCT_EXTS: &[&str] = &[
+        "docx", "xlsx", "pptx", "pdf", "html", "htm", "md", "txt", "csv", "zip",
+        "png", "jpg", "jpeg", "gif", "webp", "svg",
+    ];
+
+    /// 文本兜底扫描（bash 输出 / 最终答案）的扩展名闸：只认「二进制成品」。文本类
+    /// 成品（md/html/txt…）仍可经 write_file 结构化登记、或写入产物目录（output_dir
+    /// 前缀放行），避免把 rg/ls/git 输出里的整仓文档刷成产物卡。
+    const SCAN_DOC_EXTS: &[&str] = &[
+        "docx", "xlsx", "pptx", "pdf", "zip", "png", "jpg", "jpeg", "gif", "webp",
+    ];
 
     /// 观察：写入记忆（尽力而为，失败不致命）。
     async fn observe(&self, src: &Envelope, session_id: &str, msgs: &[MemoryMsg]) {
@@ -977,8 +1213,12 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             }
         }
         let env = Envelope::new(PluginId::new(ID), payload);
+        // R11 事件镜像：委派期间子会话 trace 事件同步透传到父 trace（trace() 据 mirrors 表），
+        // 前端「子代理」框据此实时呈现过程（思考流式帧另经旁路文件由网关 tail 透传）。
+        self.mirrors.lock().unwrap().insert(sub_session.clone(), parent_session.to_string());
         // 递归委派：Box::pin 打断未来大小的无限递归（嵌套上限由随链 depth 硬性收敛）
         let resp = Box::pin(self.chat_body(&env)).await;
+        self.mirrors.lock().unwrap().remove(&sub_session);
         if resp.get("ok") == Some(&json!(true)) {
             json!({
                 "ok": true,
@@ -1046,6 +1286,11 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
     }
 
     async fn chat_run(&self, env: &Envelope, req: &ChatReq) -> Value {
+        // 回合开始时间：兜底产物扫描的新鲜度基准（见 turn_starts 字段注释）
+        self.turn_starts
+            .lock()
+            .unwrap()
+            .insert(req.session_id.clone(), std::time::SystemTime::now());
         // 用户消息先入记忆（持久化），随后拉取全量历史。
         // R3：文本附件拼入 content，图片附件走结构化字段（llm-adapter 按 provider 映射）。
         let user_msg = build_user_msg(&req.user_text, req.attachments.as_deref());
@@ -1098,6 +1343,9 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
 
         let mut steps: Vec<StepRecord> = Vec::new();
         let mut rounds: u32 = 0;
+        // W9.4：逐轮思考留痕——流式旁路每轮覆写只留末轮，刷新重放看不到中间轮思考。
+        // 各轮 reasoning 收集于此，随最终 assistant 事件持久化（轮次 + 文本）。
+        let mut round_reasonings: Vec<(u32, String)> = Vec::new();
         // 流式旁路：宿主以 AGENT_STREAM_DIR 下发目录；未配置即退化为一问一答（行为同改造前）。
         let stream_path = stream_file_for(&req.session_id);
         let mut usage = UsageAcc::default();
@@ -1150,7 +1398,13 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
                 return json!({"ok": false, "error": err_val});
             }
             if resp.tool_calls.is_empty() {
-                return self.finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms).await;
+                return self
+                    .finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms, std::mem::take(&mut round_reasonings))
+                    .await;
+            }
+            // 中间轮（带工具调用的轮次）思考留痕：最终轮由 finish 自行追加
+            if let Some(t) = resp.reasoning.clone().filter(|s| !s.trim().is_empty()) {
+                round_reasonings.push((rounds, t));
             }
 
             // 子代理预算快照（T4）：父链已用部分扣除后才传给子——随链衰减，多子代理共享同一剩余。
@@ -1182,6 +1436,13 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             let limit = tool_result_limit();
             let wave = self.manifest.max_inflight.unwrap_or(4).max(1);
             for group in resp.tool_calls.chunks(wave) {
+                // 停车检查点②'：波次间取消。工具执行可能很长（bash 等到命令超时 / 技能
+                // 工具 60s / web_search 引擎链），若只在轮末检查，「点了停止后台还在跑」
+                // 的卡顿即来源于此。此刻 round_msgs 尚未入 memory（append 在波次循环
+                // 之后），直接丢弃无孤儿消息。预算检查仍留在轮次边界，不在此重复。
+                if let Some(v) = self.check_cancel(env, &req.session_id).await {
+                    return v;
+                }
                 let execs = group
                     .iter()
                     .map(|tc| self.act_exec(env, &req.session_id, req.depth, tc, budget_snap));
@@ -1247,7 +1508,9 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
         usage.add(resp.usage.as_ref());
         llm_ms += resp.elapsed_ms.unwrap_or(0);
         if resp.ok && resp.tool_calls.is_empty() {
-            return self.finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms).await;
+            return self
+                .finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms, std::mem::take(&mut round_reasonings))
+                .await;
         }
         self.trace(env, &req.session_id, json!({"type": "error", "where": "max_rounds", "message": format!("agent loop exhausted max_rounds={max_rounds}")})).await;
         json!({"ok": false, "error": {"code": "K502", "message": format!("agent loop exhausted max_rounds={max_rounds}")}})
@@ -1258,6 +1521,8 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
     /// 事件带上 sid（与流式增量对位，供前端复用同一气泡）、reasoning、累计 usage 与
     /// LLM 总耗时。流式增量只经旁路文件实时外抛，不落日志；这条事件才是持久化与
     /// 刷新恢复的唯一依据，因此内容必须与流式所见一致（含思考）。
+    /// W9.4：reasonings 携带全部轮次的思考（round + 文本，最终轮在末尾追加），
+    /// 前端刷新重放按轮渲染——旁路每轮覆写只留末轮的局限由此补齐。
     #[allow(clippy::too_many_arguments)]
     async fn finish(
         &self,
@@ -1269,6 +1534,7 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
         sid: String,
         usage: UsageAcc,
         llm_ms: u64,
+        mut round_reasonings: Vec<(u32, String)>,
     ) -> Value {
         let answer = resp.content.clone().unwrap_or_default();
         if answer.trim().is_empty() {
@@ -1290,6 +1556,24 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
         )
         .await;
         let reasoning = resp.reasoning.clone();
+        // 最终轮思考追加到留痕末尾（中间轮已在 chat_body 循环中收集）
+        if let Some(t) = reasoning.clone().filter(|s| !s.trim().is_empty()) {
+            round_reasonings.push((rounds, t));
+        }
+        let reasonings_json: Vec<Value> = round_reasonings
+            .iter()
+            .map(|(r, t)| json!({"round": r, "text": t}))
+            .collect();
+        // 答案文本兜底扫描（R10 前的既有设计，过滤改造时调用点曾遗失致 e2e 回归）：
+        // 答案里提到的成品路径登记为 artifact（与 bash 输出同款启发式）；同一路径若
+        // 已由 write_file 结构化登记，前端按回合+路径去重，不重复出卡。
+        for p in Self::scan_artifact_paths(&answer) {
+            if !self.fresh_artifact(session_id, &p) {
+                continue; // 答案提及但非本轮生成（历史文件）：不上卡，点了也是 404
+            }
+            self.trace(env, session_id, json!({"type": "artifact", "path": p, "tool": "answer"}))
+                .await;
+        }
         self.trace(
             env,
             session_id,
@@ -1299,6 +1583,7 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
                 "rounds": rounds,
                 "sid": sid,
                 "reasoning": reasoning,
+                "reasonings": reasonings_json,
                 "usage": usage.to_value(),
                 "elapsed_ms": llm_ms,
             }),
@@ -1348,6 +1633,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn extract_sources_dedupes_and_validates() {
+        let inner = json!({
+            "query": "q", "engine": "bing",
+            "results": [
+                {"title": "A", "url": "https://a.example/1", "snippet": "s"},
+                {"title": "B", "url": "https://b.example/2", "snippet": "s"},
+                {"title": "A2", "url": "https://a.example/1", "snippet": "s"},  // 重复 URL 去重
+                {"title": "X", "url": "javascript:alert(1)", "snippet": "s"},   // 非 http 白名单外
+                {"title": "", "url": "  https://c.example/3  ", "snippet": "s"} // 空标题用 URL 充当
+            ]
+        });
+        let items = AgentLoopPlugin::extract_sources("web_search", &inner);
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert_eq!(items[0], ("A".into(), "https://a.example/1".into()));
+        assert_eq!(items[1], ("B".into(), "https://b.example/2".into()));
+        assert_eq!(items[2], ("https://c.example/3".into(), "https://c.example/3".into()));
+
+        // web_read：单 URL；其他工具：空
+        assert_eq!(
+            AgentLoopPlugin::extract_sources("web_read", &json!({"url": "https://r.example/x"})).len(),
+            1
+        );
+        assert!(AgentLoopPlugin::extract_sources("bash", &json!({"output": "https://x.example"})).is_empty());
+    }
+
+    #[test]
+    fn extract_sources_caps_at_ten() {
+        let results: Vec<Value> = (0..30)
+            .map(|i| json!({"title": format!("t{i}"), "url": format!("https://e.example/{i}")}))
+            .collect();
+        let items = AgentLoopPlugin::extract_sources("web_search", &json!({ "results": results }));
+        assert_eq!(items.len(), 10, "溯源卡上限 10 条");
+    }
+
+    #[test]
+    fn scan_artifact_paths_narrow_gate() {
+        // 文本兜底双闸：bash 输出里 rg/ls/git 列出的整仓 .md/源码不刷卡
+        let text = "README.md crates/agent-loop/PLAN.md docs/02-架构设计.md src/main.rs \
+                    outputs/report.md outputs/关于开学.docx 泥石流灾害预警防范的通知.docx report.xlsx";
+        let got = AgentLoopPlugin::scan_artifact_paths(text);
+        // 产物目录内放行（md 也收）+ 二进制成品放行（任意位置）
+        assert!(got.contains(&"outputs/report.md".to_string()), "{got:?}");
+        assert!(got.iter().any(|s| s.ends_with("关于开学.docx")), "{got:?}");
+        assert!(got.contains(&"泥石流灾害预警防范的通知.docx".to_string()), "{got:?}");
+        assert!(got.contains(&"report.xlsx".to_string()), "{got:?}");
+        // 整仓文档 / 源码不上卡
+        assert!(!got.iter().any(|s| s.contains("README")), "{got:?}");
+        assert!(!got.iter().any(|s| s.contains("PLAN.md")), "{got:?}");
+        assert!(!got.iter().any(|s| s.contains("docs/")), "{got:?}");
+        assert!(!got.iter().any(|s| s.ends_with(".rs")), "{got:?}");
+    }
+
+    #[test]
     fn path_within_prefix_and_case_insensitive() {
         // 直接子目录
         assert!(path_within(r"C:\ws\skills", r"C:\ws"));
@@ -1382,9 +1720,13 @@ mod tests {
         }
     }
 
+    /// TEXT_ATTACH_LIMIT 是进程级 env：并行测试同时改写会串扰，用互斥锁串行化。
+    static TEXT_ATTACH_LIMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn build_user_msg_routes_attachments() {
         // 隔离并行测试的 TEXT_ATTACH_LIMIT 串扰（截断行为由专项测试覆盖）
+        let _guard = TEXT_ATTACH_LIMIT_LOCK.lock().unwrap();
         let saved_limit = std::env::var("TEXT_ATTACH_LIMIT").ok();
         std::env::set_var("TEXT_ATTACH_LIMIT", "24000");
 
@@ -1421,6 +1763,7 @@ mod tests {
     #[test]
     fn build_user_msg_truncates_oversized_text_attachment() {
         // R3：文本附件超限 → 截断并显式标注（模型必须感知内容不完整）
+        let _guard = TEXT_ATTACH_LIMIT_LOCK.lock().unwrap();
         let saved = std::env::var("TEXT_ATTACH_LIMIT").ok();
         std::env::set_var("TEXT_ATTACH_LIMIT", "4");
         let atts = [Attachment {
@@ -1440,3 +1783,4 @@ mod tests {
         }
     }
 }
+
