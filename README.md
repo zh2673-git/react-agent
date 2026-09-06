@@ -19,8 +19,16 @@
 - 生产级工具 8 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read（全部免费默认无 key）
 - 双前端：REPL（默认）/ Web 网关（HTTP+SSE，DeepSeek 风格单页会话：左侧会话栏+持久化、工具调用状态点卡片、产物文件卡片（点击预览/下载）、富 markdown 代码块复制，刷新恢复=日志重放）
 - **Web 配置中心**（08）：设置面板在线配 LLM（provider/model/base_url/api_key，热生效+落盘 config.json）、勾选工具白名单、技能 CRUD（SKILL.md 在线编辑）
-- **自扩展**（08）：L1 技能自扩展——skills 根在 WORKSPACE_ROOT 内时系统提示词授权模型用 write_file 自建技能（文件即注册表，下轮对话自动可见）；L2 工具自扩展——`tools.reload` 动态装载新工具模块（装载≠启用，白名单两步分离）；R9 技能自造闭环——`skill_install` 编排 + 语言无关配套工具（tools.json 声明 + 任意语言执行体），前端内联卡一键启用（装载≠启用≠可见，见「配置中心与自扩展」）
+- **自扩展**（08）：L1 技能自扩展——skills 根在 WORKSPACE_ROOT 内时系统提示词授权模型用 write_file 自建技能（文件即注册表，下轮对话自动可见）；L2 工具自扩展——`tools.reload` 动态装载新工具模块（装载≠启用，白名单两步分离）；R9 技能自造闭环——`skill_install` 编排 + 语言无关配套工具（tools.json 声明 + 任意语言执行体），前端内联卡一键启用（装载≠启用≠可见，见「配置中心与自扩展」）。**已实证**：[`gongwen-format`](plugins/assets/skills/gongwen-format/SKILL.md)（公文格式写作）即 agent 在对话中自建的技能——SKILL.md 与配套工具（tools.json + Python 执行体）均由模型一次生成，内联卡启用后跨会话可用，非人工预置
 - subagent：保留工具 `task` 委派子任务（新 session 复用全链路，深度防嵌套）；前端「思考与工具」过程框内嵌套「子代理」实时框——子代理的思考流与工具卡实时透传呈现（trace 事件镜像 + 子旁路流式），委派不再"图标一闪就卡住"
+
+## 界面一览
+
+![Web 界面](docs/images/ui-overview.jpg)
+
+> 实机运行截图（`REACT_FRONTEND=web` 默认形态）：左侧会话栏（自动命名 + 持久化，刷新即恢复）、
+> 「思考与工具」过程框（工具卡状态点、可折叠回看）、🔗 来源 chip 与富 markdown 答案。
+> 图中会话即 agent 实际运行记录——工具清单查询 + 联网查天气 + 自动落盘会话命名。
 
 ## 目录
 
