@@ -5,7 +5,7 @@ members = ["crates/agent-loop", "crates/host"]
 [workspace.package]
 # 版本对齐内核：react-agent 的 <version> 表示「基于 agent-kernel 同版本构建」（见下方 dependency 的 tag）。
 # 例如 0.1.x 对应内核 v0.1.1；后续针对已知限制（运行中断 / sid 唯一性）迭代时再 bump 次版本号。
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 
 [workspace.dependencies]
