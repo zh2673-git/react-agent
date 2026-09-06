@@ -1284,3 +1284,295 @@ async fn num_ctx_passthrough_follows_context_window() {
         None => std::env::remove_var("LLM_PROVIDER"),
     }
 }
+
+// ---- R9（agent 自造技能闭环：skill_install / skill_loaded / 会话技能工具）------
+
+/// memory mock + trace 事件捕获/回放：断言 skill_installed/skill_loaded 事件，
+/// 或预置 skill_loaded 事件验证会话技能集重放推导。
+fn mock_memory_traced(state: Arc<Mutex<Vec<MemoryMsg>>>, events: Arc<Mutex<Vec<Value>>>) -> PluginInstance {
+    MockPlugin::simple("memory", &["memory.session"], move |env| {
+        let payload = &env.payload;
+        match payload.get("op").and_then(|v| v.as_str()) {
+            Some("get") => json!({"ok": true, "messages": state.lock().unwrap().clone()}),
+            Some("append") => {
+                let msgs: Vec<MemoryMsg> =
+                    serde_json::from_value(payload.get("messages").cloned().unwrap_or(Value::Null)).unwrap_or_default();
+                state.lock().unwrap().extend(msgs);
+                json!({"ok": true})
+            }
+            Some("summarize") => {
+                let keep = payload.get("keep_last").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mut st = state.lock().unwrap();
+                if keep > 0 && st.len() > keep {
+                    let split = st.len() - keep;
+                    *st = st.split_off(split);
+                }
+                json!({"ok": true})
+            }
+            Some("trace.append") => {
+                let evs: Vec<Value> =
+                    serde_json::from_value(payload.get("events").cloned().unwrap_or(Value::Null)).unwrap_or_default();
+                let n = evs.len();
+                events.lock().unwrap().extend(evs);
+                json!({"ok": true, "count": n})
+            }
+            Some("trace.read") => json!({"ok": true, "events": events.lock().unwrap().clone()}),
+            _ => json!({"ok": false, "error": {"code": "K400", "message": "bad op"}}),
+        }
+    })
+}
+
+/// tools mock：捕获 install payload（断言路由参数）+ 固定 skill_tools 应答 + 技能工具调用。
+fn mock_tools_r9(install_log: Arc<Mutex<Vec<Value>>>, skill_tool: Value) -> PluginInstance {
+    MockPlugin::simple("tools", &["tools.exec"], move |env| {
+        let payload = env.payload.clone();
+        match payload.get("op").and_then(|v| v.as_str()) {
+            Some("list") => json!({"ok": true, "tools": [{"name": "calculator", "description": "math", "parameters": {}}]}),
+            Some("install") => {
+                install_log.lock().unwrap().push(payload.clone());
+                json!({"ok": true, "skill": payload["skill"], "loaded": ["t1"], "skipped": [], "pending": ["t1"]})
+            }
+            Some("skill_tools") => json!({"ok": true, "tools": [skill_tool.clone()]}),
+            Some("call") => {
+                if payload["name"] == json!("skill_echo") {
+                    json!({"ok": true, "result": "SKILL-ECHO-RESULT"})
+                } else {
+                    json!({"ok": true, "result": 1})
+                }
+            }
+            _ => json!({"ok": false}),
+        }
+    })
+}
+
+#[tokio::test]
+async fn skill_install_full_chain_traces_and_reports() {
+    // Q：skill_install 全链路——assets.load 取声明 → tools.install（装载≠启用）→
+    // skill_installed 事件 → 观察回写含 loaded/pending。
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let mem_state = Arc::new(Mutex::new(Vec::<MemoryMsg>::new()));
+    let install_log = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let assets = MockPlugin::simple("assets", &["assets.registry"], move |env| {
+        match env.payload.get("op").and_then(|v| v.as_str()) {
+            Some("skills.load") => json!({
+                "ok": true, "content": "BODY",
+                "tools_manifest": {"path": "C:/ws/skills/demo/tools.json"}
+            }),
+            _ => json!({"ok": false}),
+        }
+    });
+    let llm_script = vec![
+        tool_call_resp(json!([{"id": "c1", "name": "skill_install", "arguments": {"name": "demo"}}])),
+        json!({"ok": true, "content": "installed demo", "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+    ];
+    let kernel = boot(vec![
+        mock_memory_traced(mem_state.clone(), events.clone()),
+        mock_llm(llm_script),
+        mock_tools_r9(install_log.clone(), json!({"name": "skill_echo", "description": "d", "parameters": {}})),
+        assets,
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "install my skill").await;
+    assert_eq!(r["ok"], json!(true), "{r}");
+    assert_eq!(r["answer"], json!("installed demo"));
+
+    // tools.install 被定点调用：path 来自声明、skill 显式传注册名
+    let installs = install_log.lock().unwrap();
+    assert_eq!(installs.len(), 1, "install 恰调用一次: {installs:?}");
+    assert_eq!(installs[0]["path"], json!("C:/ws/skills/demo/tools.json"));
+    assert_eq!(installs[0]["skill"], json!("demo"));
+    drop(installs);
+
+    // skill_installed 事件落 trace（前端内联卡与一键启用的依据）
+    let evs = events.lock().unwrap();
+    assert!(
+        evs.iter().any(|e| e["type"] == json!("skill_installed")
+            && e["skill"] == json!("demo")
+            && e["tools_loaded"] == json!(["t1"])
+            && e["tools_pending"] == json!(["t1"])),
+        "skill_installed 事件缺失或形状不对: {evs:?}"
+    );
+    drop(evs);
+
+    // 观察回写：loaded/pending 明细 + 「装载≠启用」提示（部分成功不算整体失败）
+    let mem = mem_state.lock().unwrap();
+    assert!(
+        mem.iter().any(|m| m.role == "tool"
+            && m.content.as_deref().map(|c| c.contains("t1") && c.contains("注册")).unwrap_or(false)),
+        "观察回写应含 loaded/pending 与注册提示: {mem:?}"
+    );
+}
+
+#[tokio::test]
+async fn skill_install_without_tools_declaration_still_registers() {
+    // 无 tools 声明的技能包：仅注册（tools.install 不调用），事件仍发（tools_* 为空）。
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let install_log = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let assets = MockPlugin::simple("assets", &["assets.registry"], move |env| {
+        match env.payload.get("op").and_then(|v| v.as_str()) {
+            Some("skills.load") => json!({"ok": true, "content": "BODY"}),
+            _ => json!({"ok": false}),
+        }
+    });
+    let llm_script = vec![
+        tool_call_resp(json!([{"id": "c1", "name": "skill_install", "arguments": {"name": "demo"}}])),
+        json!({"ok": true, "content": "registered", "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+    ];
+    let kernel = boot(vec![
+        mock_memory_traced(Arc::new(Mutex::new(vec![])), events.clone()),
+        mock_llm(llm_script),
+        mock_tools_r9(install_log.clone(), json!({"name": "x", "parameters": {}})),
+        assets,
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "register plain skill").await;
+    assert_eq!(r["ok"], json!(true), "{r}");
+
+    assert!(install_log.lock().unwrap().is_empty(), "无声明不得触发 tools.install");
+    let evs = events.lock().unwrap();
+    assert!(
+        evs.iter()
+            .any(|e| e["type"] == json!("skill_installed") && e["skill"] == json!("demo") && e["tools_loaded"] == json!([])),
+        "无声明技能也须发 skill_installed（tools_* 空）: {evs:?}"
+    );
+}
+
+#[tokio::test]
+async fn skill_install_unknown_skill_is_observed_not_fatal() {
+    // I：unknown skill 错误 payload 原样回喂观察（部分失败不算整体失败），循环不中断。
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let mem_state = Arc::new(Mutex::new(Vec::<MemoryMsg>::new()));
+    let install_log = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let assets = MockPlugin::simple("assets", &["assets.registry"], move |env| {
+        match env.payload.get("op").and_then(|v| v.as_str()) {
+            Some("skills.load") => json!({"ok": false, "error": {"code": "UNKNOWN_SKILL", "message": "unknown skill: nope"}}),
+            _ => json!({"ok": false}),
+        }
+    });
+    let llm_script = vec![
+        tool_call_resp(json!([{"id": "c1", "name": "skill_install", "arguments": {"name": "nope"}}])),
+        json!({"ok": true, "content": "I saw the error", "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+    ];
+    let kernel = boot(vec![
+        mock_memory_traced(mem_state.clone(), events.clone()),
+        mock_llm(llm_script),
+        mock_tools_r9(install_log.clone(), json!({"name": "x", "parameters": {}})),
+        assets,
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "install missing").await;
+    assert_eq!(r["ok"], json!(true), "安装失败不得中断循环: {r}");
+    assert_eq!(r["answer"], json!("I saw the error"));
+
+    assert!(install_log.lock().unwrap().is_empty(), "load 失败不得触发 tools.install");
+    assert!(
+        !events.lock().unwrap().iter().any(|e| e["type"] == json!("skill_installed")),
+        "load 失败不得发 skill_installed 事件"
+    );
+    let mem = mem_state.lock().unwrap();
+    assert!(
+        mem.iter().any(|m| m.role == "tool" && m.content.as_deref().map(|c| c.contains("UNKNOWN_SKILL")).unwrap_or(false)),
+        "错误明细应回喂观察: {mem:?}"
+    );
+}
+
+#[tokio::test]
+async fn load_skill_merges_enabled_skill_tools_into_next_rounds() {
+    // 清单组装规则：r1 load_skill 成功 → skill_loaded 事件 + 该技能已启用工具并入 r2 清单
+    //（r1 清单不含技能工具——会话可见性由 load_skill 驱动）。
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let payload_caps = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let llm_script = vec![
+        tool_call_resp(json!([{"id": "c1", "name": "load_skill", "arguments": {"name": "demo"}}])),
+        tool_call_resp(json!([{"id": "c2", "name": "skill_echo", "arguments": {"x": 1}}])),
+        json!({"ok": true, "content": "final", "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+    ];
+    let script = Arc::new(Mutex::new(llm_script));
+    let cap2 = payload_caps.clone();
+    let llm = MockPlugin::simple("llm-adapter", &["llm.chat"], move |env| {
+        cap2.lock().unwrap().push(env.payload.clone());
+        let mut s = script.lock().unwrap();
+        if s.len() > 1 {
+            s.remove(0)
+        } else {
+            s.first().cloned().unwrap()
+        }
+    });
+    let kernel = boot(vec![
+        mock_memory_traced(Arc::new(Mutex::new(vec![])), events.clone()),
+        llm,
+        mock_tools_r9(Arc::new(Mutex::new(vec![])), json!({"name": "skill_echo", "description": "d", "parameters": {}})),
+        mock_assets("BODY"),
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "load and use").await;
+    assert_eq!(r["ok"], json!(true), "{r}");
+    assert_eq!(r["answer"], json!("final"));
+
+    assert!(
+        events.lock().unwrap().iter().any(|e| e["type"] == json!("skill_loaded") && e["skill"] == json!("demo")),
+        "load_skill 成功须发 skill_loaded 事件"
+    );
+
+    let caps = payload_caps.lock().unwrap();
+    assert_eq!(caps.len(), 3, "llm 调用 = r1+r2+r3: {}", caps.len());
+    let has_echo = |i: usize| {
+        caps[i]["tools"]
+            .as_array()
+            .map(|ts| ts.iter().any(|t| t["name"] == json!("skill_echo")))
+            .unwrap_or(false)
+    };
+    assert!(!has_echo(0), "r1 清单不得含技能工具: {:?}", caps[0]["tools"]);
+    assert!(has_echo(1), "load_skill 成功后 r2 清单应并入技能工具: {:?}", caps[1]["tools"]);
+    // r3 上下文含技能工具执行结果（保留名外技能工具走 tools.call 正常分发）
+    assert!(
+        caps[2]["messages"].as_array().unwrap().iter().any(|m| m["role"] == json!("tool")
+            && m["content"].as_str().map(|c| c.contains("SKILL-ECHO-RESULT")).unwrap_or(false)),
+        "技能工具结果应回喂: {:?}",
+        caps[2]["messages"]
+    );
+}
+
+#[tokio::test]
+async fn session_skill_tools_replayed_from_trace_at_chat_start() {
+    // 会话技能集从 trace 重放推导：预置 skill_loaded 事件 → 新对话开局清单即含已启用技能工具
+    //（同会话技能作用域经重放恢复；子代理新会话不继承）。
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let events = Arc::new(Mutex::new(vec![json!({"type": "skill_loaded", "skill": "demo", "ts": 1})]));
+    let payload_caps = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let ok = json!({"ok": true, "content": "hi", "tool_calls": [], "model": "mock", "finish_reason": "stop"});
+    let cap2 = payload_caps.clone();
+    let llm = MockPlugin::simple("llm-adapter", &["llm.chat"], move |env| {
+        cap2.lock().unwrap().push(env.payload.clone());
+        ok.clone()
+    });
+    let kernel = boot(vec![
+        mock_memory_traced(Arc::new(Mutex::new(vec![])), events),
+        llm,
+        mock_tools_r9(Arc::new(Mutex::new(vec![])), json!({"name": "skill_echo", "description": "d", "parameters": {}})),
+        mock_assets("BODY"),
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "fresh turn").await;
+    assert_eq!(r["ok"], json!(true), "{r}");
+
+    let caps = payload_caps.lock().unwrap();
+    let tools = caps[0]["tools"].as_array().expect("tools present");
+    assert!(
+        tools.iter().any(|t| t["name"] == json!("skill_echo")),
+        "开局清单应含 trace 重放出的技能工具: {tools:?}"
+    );
+    assert!(
+        tools.iter().any(|t| t["name"] == json!("calculator")),
+        "内置工具仍在: {tools:?}"
+    );
+}

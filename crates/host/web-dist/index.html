@@ -65,9 +65,13 @@
   .sess .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
   .sess.active .dot { background: var(--accent); }
   .sess .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
-  .sess .del { margin-left: auto; opacity: 0; color: var(--faint); cursor: pointer; font-size: 16px; line-height: 1; padding: 0 2px; }
-  .sess:hover .del { opacity: 1; color: #e5484d; }
-  .sess .del:hover { color: #ff6b6b; }
+  .sess .ops { margin-left: auto; opacity: 0; display: flex; align-items: center; gap: 2px; }
+  .sess:hover .ops { opacity: 1; }
+  .sess .ops span { color: var(--faint); cursor: pointer; line-height: 1; padding: 0 2px; }
+  .sess .ops .ren { font-size: 12px; }
+  .sess .ops .ren:hover { color: var(--accent); }
+  .sess .ops .del { font-size: 16px; }
+  .sess .ops .del:hover { color: #ff6b6b; }
 
   .main { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--panel); }
   header {
@@ -243,6 +247,22 @@
   .skillitem:hover { border-color: var(--accent); }
   .skillitem .name { font-weight: 600; white-space: nowrap; }
   .skillitem .desc { color: var(--muted); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* R9/W6：技能 tab 配套工具区 + skill_installed 内联卡 */
+  .skilltools { margin: -2px 0 8px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .skilltool { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border: 1px dashed var(--border-soft);
+    border-radius: 8px; font-size: 12px; cursor: pointer; }
+  .skilltool:hover { border-color: var(--accent); }
+  .skilltool input { width: auto; }
+  .skilltool .sname { font-weight: 600; white-space: nowrap; }
+  .skilltool .sdesc { color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .si-tools { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+  .si-tool { display: flex; align-items: center; gap: 6px; }
+  .si-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+  .si-dot.on { background: var(--ok); }
+  .si-dot.pending { background: var(--accent); }
+  .si-tag { color: var(--accent); font-size: 11px; }
+  .si-note { font-size: 12px; color: var(--muted); }
+  .si-enable { padding: 5px 14px; font-size: 12px; }
   .empty { color: var(--faint); font-size: 13px; padding: 8px 2px; }
 </style>
 </head>
@@ -352,16 +372,30 @@
 const $ = (id) => document.getElementById(id);
 const feed = $("feed"), input = $("input"), sendBtn = $("send"), stopBtn = $("stop"), statusEl = $("status"), connEl = $("conn");
 
-// ── session 管理（localStorage）──
+// ── session 管理（localStorage；条目 {id,title}，旧格式 string[] 自动迁移）──
+// title 为空时侧栏显示 id；发送首条消息后按消息内容自动命名；手动重命名后不再覆盖（清空标题可恢复自动命名）。
 const SKEY = "ra.sessions", CKEY = "ra.session";
 let session = localStorage.getItem(CKEY) || "web";
-function loadSessions() { try { return JSON.parse(localStorage.getItem(SKEY) || "[]"); } catch { return []; } }
+function loadSessions() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(SKEY) || "[]");
+    return arr.map((s) => (typeof s === "string" ? { id: s, title: "" } : s)).filter((s) => s && s.id);
+  } catch { return []; }
+}
 function saveSessions(arr) { localStorage.setItem(SKEY, JSON.stringify(arr)); }
+function sessTitle(s) { return s.title || s.id; }
 function touchSession(id) {
-  let arr = loadSessions().filter((s) => s !== id);
-  arr.unshift(id);
-  if (arr.length > 30) arr = arr.slice(0, 30);
-  saveSessions(arr);
+  const arr = loadSessions();
+  const i = arr.findIndex((s) => s.id === id);
+  if (i >= 0) { const [it] = arr.splice(i, 1); arr.unshift(it); }
+  else arr.unshift({ id, title: "" });
+  saveSessions(arr.slice(0, 30));
+}
+function refreshSessionTag() {
+  const cur = loadSessions().find((s) => s.id === session);
+  const tag = $("session-tag");
+  tag.textContent = "session: " + (cur && cur.title ? cur.title : session);
+  tag.title = "会话 ID: " + session;
 }
 function renderSessions() {
   const box = $("sessions"); box.innerHTML = "";
@@ -369,41 +403,65 @@ function renderSessions() {
   if (!arr.length) { box.innerHTML = '<div class="empty">暂无历史会话</div>'; return; }
   for (const s of arr) {
     const el = document.createElement("div");
-    el.className = "sess" + (s === session ? " active" : "");
-    el.innerHTML = `<span class="dot"></span><span class="name">${esc(s)}</span>`;
-    el.onclick = () => switchSession(s);
+    el.className = "sess" + (s.id === session ? " active" : "");
+    el.title = "会话 ID: " + s.id;
+    el.innerHTML = `<span class="dot"></span><span class="name">${esc(sessTitle(s))}</span>`;
+    el.onclick = () => switchSession(s.id);
+    const ops = document.createElement("span");
+    ops.className = "ops";
+    const ren = document.createElement("span");
+    ren.className = "ren"; ren.textContent = "✎"; ren.title = "重命名";
+    ren.onclick = (e) => { e.stopPropagation(); renameSession(s.id); };
     const del = document.createElement("span");
-    del.className = "del";
-    del.textContent = "×";
-    del.title = "删除会话";
-    del.onclick = (e) => { e.stopPropagation(); delSession(s); };
-    el.appendChild(del);
+    del.className = "del"; del.textContent = "×"; del.title = "删除会话";
+    del.onclick = (e) => { e.stopPropagation(); delSession(s.id); };
+    ops.append(ren, del);
+    el.appendChild(ops);
     box.appendChild(el);
   }
 }
+function renameSession(id) {
+  const cur = loadSessions().find((s) => s.id === id);
+  const v = prompt("重命名会话（清空并确定则恢复自动命名）", cur ? cur.title || "" : "");
+  if (v === null) return;
+  const arr = loadSessions();
+  const it = arr.find((s) => s.id === id);
+  if (!it) return;
+  it.title = v.trim();
+  saveSessions(arr); renderSessions(); refreshSessionTag();
+}
+function autoName(id, text) {
+  const arr = loadSessions();
+  const it = arr.find((s) => s.id === id);
+  if (!it || it.title) return; // 已手动命名（或已命名过）则不覆盖
+  const t = (text || "").replace(/\s+/g, " ").trim().slice(0, 24);
+  if (!t) return;
+  it.title = t;
+  saveSessions(arr); renderSessions(); refreshSessionTag();
+}
 function delSession(id) {
   if (!confirm("删除会话 " + id + "？（仅清本地记录，服务端消息日志保留）")) return;
-  let arr = loadSessions().filter((x) => x !== id);
+  let arr = loadSessions().filter((x) => x.id !== id);
   saveSessions(arr);
   if (session === id) {
-    session = arr[0] || "web";
+    session = arr.length ? arr[0].id : "web";
     localStorage.setItem(CKEY, session);
   }
-  $("session-tag").textContent = "session: " + session;
+  refreshSessionTag();
   renderSessions(); connect();
 }
 function switchSession(id) {
   if (id === session) return;
   session = id; localStorage.setItem(CKEY, id); touchSession(id);
-  $("session-tag").textContent = "session: " + id;
+  refreshSessionTag();
   renderSessions(); connect();
 }
-$("session-tag").textContent = "session: " + session;
-touchSession(session); renderSessions();
+refreshSessionTag(); touchSession(session); renderSessions();
 $("toggle").onclick = () => $("sidebar").classList.toggle("collapsed");
 $("newchat").onclick = () => {
-  const v = prompt("新会话 ID", "s-" + Date.now().toString(36));
-  if (v && v.trim()) switchSession(v.trim());
+  const v = prompt("新会话 ID（可自定义易记名称；留空自动生成）", "s-" + Date.now().toString(36));
+  if (v === null) return;
+  switchSession(v.trim() || "s-" + Date.now().toString(36));
 };
 
 function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
@@ -687,6 +745,45 @@ function render(ev) {
     case "compaction":
       feed.appendChild(el(`<div class="ev compaction"><span class="line">── 上下文已压缩（摘要 ${esc(ev.summarized)} 条，保留 ${esc(ev.kept)} 条）──</span></div>`));
       break;
+    case "skill_installed": {
+      // R9/W6：技能就绪内联卡（过程框内，样式同工具卡族）。pending 空 → 仅「已注册」无按钮。
+      // 启用永远走配置闸：点击时拉取当前 config 求「现有 ∪ pending」并集（重放卡同样安全）。
+      ensureProcessBox();
+      const loaded = ev.tools_loaded ?? [];
+      const pend = ev.tools_pending ?? [];
+      const card = el(`<details class="tool skill-installed" open><summary><span class="statedot"></span><span class="name">🧩 技能 ${esc(ev.skill)} 已就绪</span><span class="round">${pend.length ? `工具 ${pend.length} 件待启用` : "已注册"}</span><span class="chev">›</span></summary><div class="body"><div class="sec"><div class="lbl">配套工具（装载 ≠ 启用）</div><div class="si-tools"></div><div class="si-actions"></div></div></div></details>`);
+      const toolsBox = card.querySelector(".si-tools");
+      if (!(loaded.length || pend.length)) {
+        toolsBox.innerHTML = '<span class="si-note">无配套工具（仅注册，技能正文下轮对话可见）</span>';
+      } else {
+        for (const t of loaded) {
+          const isPending = pend.includes(t);
+          toolsBox.appendChild(el(`<div class="si-tool"><span class="si-dot ${isPending ? "pending" : "on"}"></span>${esc(t)}${isPending ? ' <span class="si-tag">待启用</span>' : ""}</div>`));
+        }
+      }
+      const actions = card.querySelector(".si-actions");
+      if (pend.length) {
+        const btn = el(`<button class="btn ghost si-enable">一键启用（${pend.length}）</button>`);
+        btn.onclick = async () => {
+          btn.disabled = true;
+          try {
+            const c = (await api("GET", "/api/config")).config;
+            const cur = new Set((c.tools ?? []).filter((x) => x.enabled).map((x) => x.name));
+            for (const t of pend) cur.add(t);
+            await api("PUT", "/api/config", { tools: { enabled: [...cur] } });
+            actions.innerHTML = '<span class="si-note">已启用 · 在会话中 load_skill 后生效</span>';
+            card.querySelector(".statedot").style.background = "var(--ok)";
+            loadConfig(); // 刷新 cfgTools 缓存（若抽屉已开）
+          } catch (e) {
+            btn.disabled = false;
+            actions.innerHTML = `<span class="si-note">启用失败: ${esc(e.message)}</span>`;
+          }
+        };
+        actions.appendChild(btn);
+      }
+      processBody.appendChild(card);
+      break;
+    }
     case "error": {
       const em = ev.message;
       const emsg = typeof em === "string" ? em : (em && em.message) ? em.message : (em ? JSON.stringify(em) : "");
@@ -770,6 +867,7 @@ async function send(presetText, presetAtts) {
   if (presetText === undefined) { input.value = ""; input.style.height = "48px"; renderAtts(); }
   sendBtn.disabled = true; stopBtn.hidden = false; setStatus("思考中…");
   touchSession(session);
+  autoName(session, text); // 标题为空时按首条消息自动命名
   try {
     const r = await fetch("/api/chat", {
       method: "POST", headers: { "content-type": "application/json" },
@@ -1094,6 +1192,30 @@ function renderSkills() {
     const item = el(`<div class="skillitem"><span class="name">${esc(s.name)}</span><span class="desc">${esc(s.description ?? "")}</span></div>`);
     item.onclick = () => openSkill(s.name);
     box.appendChild(item);
+    // R9/W6：配套工具区（tools_detail 由 host 从 tools.skill_tools 合入，含未启用项 + enabled 标记）。
+    // 启停就地完成：永远走配置闸（现有启用集 ± 该工具 → PUT /api/config）；失败回滚 UI。
+    const td = s.tools_detail ?? [];
+    if (!td.length) continue;
+    const zone = el(`<div class="skilltools"></div>`);
+    for (const t of td) {
+      const row = el(`<label class="skilltool"><input type="checkbox" ${t.enabled ? "checked" : ""}><span class="sname">${esc(t.name)}</span><span class="sdesc">${esc(t.description ?? "")}</span></label>`);
+      row.querySelector("input").onchange = async (e) => {
+        const on = e.target.checked;
+        try {
+          const c = (await api("GET", "/api/config")).config;
+          const set = new Set((c.tools ?? []).filter((x) => x.enabled).map((x) => x.name));
+          if (on) set.add(t.name); else set.delete(t.name);
+          await api("PUT", "/api/config", { tools: { enabled: [...set] } });
+          flash("skill-flash", true, on ? `已启用 ${t.name}（会话中 load_skill 后生效）` : `已禁用 ${t.name}`);
+          loadConfig();
+        } catch (err) {
+          e.target.checked = !on; // 启用失败回滚勾选态
+          flash("skill-flash", false, err.message);
+        }
+      };
+      zone.appendChild(row);
+    }
+    box.appendChild(zone);
   }
 }
 async function openSkill(name) {

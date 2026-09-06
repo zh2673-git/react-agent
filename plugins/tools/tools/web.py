@@ -234,7 +234,32 @@ def _web_search(args: dict) -> dict:
     raise ToolError("搜索引擎链全部失败。已试: " + " | ".join(tried) + "。" + hint, code="SEARCH_ALL_ENGINES_FAILED")
 
 
-# ---- web_read：Jina 区域镜像优先，失败回退本地直抓 -------------------------------
+# ---- web_read：Jina 区域镜像优先，失败回退本地直抓（含 URL 缓存 + 字符分页，v3） ----
+
+_READ_TTL_S = 600
+_READ_CACHE: dict[str, tuple[float, str]] = {}
+_READ_CACHE_MAX = 32
+_CACHEABLE_CHARS = 256 * 1024
+
+
+def _cache_get(url: str) -> str | None:
+    hit = _READ_CACHE.get(url)
+    if hit is None:
+        return None
+    ts, text = hit
+    if time.monotonic() - ts > _READ_TTL_S:
+        _READ_CACHE.pop(url, None)
+        return None
+    return text
+
+
+def _cache_put(url: str, text: str) -> None:
+    _READ_CACHE.pop(url, None)
+    if len(text) <= _CACHEABLE_CHARS:
+        _READ_CACHE[url] = (time.monotonic(), text)
+    while len(_READ_CACHE) > _READ_CACHE_MAX:
+        _READ_CACHE.pop(next(iter(_READ_CACHE)))
+
 
 def _jina_read(url: str) -> str:
     host = "https://r.jinaai.cn/" if _region() == "cn" else "https://r.jina.ai/"
@@ -262,27 +287,39 @@ def _web_read(args: dict) -> dict:
     scheme = urllib.parse.urlsplit(url).scheme.lower()
     if scheme not in ("http", "https"):
         raise ToolError(f"scheme '{scheme}' 不允许（仅 http/https）", code="BAD_SCHEME", field="url")
-    via, text = None, None
-    errors = []
-    for name, fn in (("jina", _jina_read), ("direct", _direct_read)):
-        try:
-            text = fn(url)
-            via = name
-            break
-        except Exception as exc:  # noqa: BLE001 - 降级下一读取器
-            errors.append(f"{name}: {type(exc).__name__}: {exc}")
-    if text is None:
-        raise ToolError(
-            f"网页读取失败（两种方式均失败: {' | '.join(errors)}）。"
-            "可先用 web_search 换来源，或确认 URL 可达。",
-            code="READ_FAILED",
-            field="url",
-        )
-    limit = 32 * 1024
-    truncated = len(text.encode("utf-8")) > limit
-    if truncated:
-        text = text.encode("utf-8")[:limit].decode("utf-8", errors="ignore") + "\n[truncated: 正文超过 32KB]"
-    return {"url": url, "via": via, "truncated": truncated, "content": text}
+    cached = _cache_get(url)
+    if cached is not None:  # 10 分钟内同 URL 直接命中缓存，不再出网
+        text, via = cached, "cache"
+    else:
+        text, via, errors = None, None, []
+        for name, fn in (("jina", _jina_read), ("direct", _direct_read)):
+            try:
+                text = fn(url)
+                via = name
+                break
+            except Exception as exc:  # noqa: BLE001 - 降级下一读取器
+                errors.append(f"{name}: {type(exc).__name__}: {exc}")
+        if text is None:
+            raise ToolError(
+                f"网页读取失败（两种方式均失败: {' | '.join(errors)}）。"
+                "可先用 web_search 换来源，或确认 URL 可达。",
+                code="READ_FAILED",
+                field="url",
+            )
+        _cache_put(url, text)
+    total = len(text)
+    offset = optional_int(args, "offset", 0, 0, 10**7)
+    limit = optional_int(args, "limit", 32_000, 1, 64_000)
+    result = {
+        "url": url,
+        "via": via,
+        "total_chars": total,
+        "offset": offset,
+        "content": text[offset : offset + limit],
+    }
+    if offset + limit < total:
+        result["next_offset"] = offset + limit  # 还有后续页，用 offset=next_offset 续读
+    return result
 
 
 TOOLS = {
@@ -301,12 +338,18 @@ TOOLS = {
     },
     "web_read": {
         "description": (
-            "Read a web page as markdown-ish text (Jina Reader with CN mirror, fallback to direct fetch). "
-            "Args: url (required, http/https). Result includes the source URL."
+            "Read a web page as markdown-ish text (Jina Reader with CN mirror, fallback to direct "
+            "fetch; per-URL 10-min in-process cache). Char-paged: result has total_chars and "
+            "next_offset when more remains. Args: url (required, http/https), offset (chars, default 0), "
+            "limit (chars, default 32000, max 64000)."
         ),
         "parameters": {
             "type": "object",
-            "properties": {"url": {"type": "string"}},
+            "properties": {
+                "url": {"type": "string"},
+                "offset": {"type": "integer", "description": "char offset for paging"},
+                "limit": {"type": "integer", "description": "chars per page (1000-64000)"},
+            },
             "required": ["url"],
         },
         "run": _web_read,

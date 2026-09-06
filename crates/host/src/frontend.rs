@@ -856,11 +856,45 @@ async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[u8]) -> any
 }
 
 /// GET /api/skills：转发 assets skills.list（每次重扫，Web 端即见最新目录）。
+/// R9/W6：技能条目合入「配套工具」视图（tools.skill_tools all=true 按 skill 分组，含未启用
+/// 项 + enabled 标记）——技能 tab 就地启停的数据源；tools 不可用 → 静默省略（软依赖不阻塞）。
 async fn get_skills(stream: &mut TcpStream, kernel: &Kernel) -> anyhow::Result<()> {
-    let v = match dispatch_or_err(kernel, "assets", json!({"op": "skills.list"})).await {
+    let mut v = match dispatch_or_err(kernel, "assets", json!({"op": "skills.list"})).await {
         Ok(v) => v,
         Err(e) => return json_resp(stream, 503, e).await,
     };
+    if let Some(skills) = v.get_mut("skills").and_then(Value::as_array_mut) {
+        let by_skill: std::collections::HashMap<String, Vec<Value>> =
+            match dispatch_or_err(kernel, "tools", json!({"op": "skill_tools", "all": true})).await {
+                Ok(t) => t
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|mut tool| {
+                        let sk = tool.get("skill").and_then(Value::as_str)?.to_string();
+                        if let Some(o) = tool.as_object_mut() {
+                            o.remove("parameters"); // 清单视图不需要 schema
+                        }
+                        Some((sk, tool))
+                    })
+                    .fold(std::collections::HashMap::new(), |mut m, (sk, tool)| {
+                        m.entry(sk).or_insert_with(Vec::new).push(tool);
+                        m
+                    }),
+                Err(_) => std::collections::HashMap::new(),
+            };
+        for s in skills.iter_mut() {
+            if let Some(name) = s.get("name").and_then(Value::as_str).map(str::to_string) {
+                if let Some(tools) = by_skill.get(&name) {
+                    if let Some(obj) = s.as_object_mut() {
+                        obj.insert("tools_detail".into(), json!(tools));
+                    }
+                }
+            }
+        }
+    }
     json_resp(stream, 200, v).await
 }
 

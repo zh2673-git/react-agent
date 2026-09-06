@@ -6,16 +6,22 @@
   Execution: 复用基础工具（assets 从不执行 skill 代码，语言无关）
 
 线契约（03 §2.4）：
-  {"op":"skills.list"}             → {"ok":true,"skills":[{"name","description"}],"root":str}
+  {"op":"skills.list"}             → {"ok":true,"skills":[{"name","description","tools"?:true}],"root":str}
                                      每次调用重扫目录（08：Web 技能 CRUD / L1 自扩展实时可见）；
-                                     root=skills 根目录绝对路径（agent-loop 自扩展可达性探测用）
-  {"op":"skills.load","name":str}  → {"ok":true,"content":str} | {"ok":false,"error":{...}}（读取前重扫）
+                                     root=skills 根目录绝对路径（agent-loop 自扩展可达性探测用）；
+                                     `tools:true` = 该技能声明了配套工具（R9，供前端徽章与授权段提示）
+  {"op":"skills.load","name":str}  → {"ok":true,"content":str,"tools_manifest"?:
+                                       {"path":str,"missing"?:[str]}} | {"ok":false,"error":{...}}
+                                     （读取前重扫；tools_manifest.path = 声明文件绝对路径，
+                                      供 tools.install 定点装载；声明存在但文件缺失时回传 missing）
   {"op":"prompts.list"}            → {"ok":true,"prompts":[{"name","description"}]}
   {"op":"prompts.get","name":str}  → {"ok":true,"content":str}
 
 skill = 目录含 SKILL.md，frontmatter 仅必需 name/description（手写解析，不引 PyYAML）；
+frontmatter 可选 `tools: <文件名>` 声明配套工具（R9，语言无关：单一 JSON 清单，如 tools.json）；
 prompt = markdown 文件，首行 `# name`，次个非空行为描述。
-frontmatter 不合规的目录跳过（warn），不影响其他 skill。
+frontmatter 不合规的目录跳过（warn），不影响其他 skill；tools 声明非法时忽略该字段
+（注册表不因声明错误而 list/load 失败；tools.json 内容校验归 tools 插件，assets 只负责找文件）。
 """
 
 import os
@@ -48,6 +54,15 @@ def _parse_frontmatter(text: str) -> dict | None:
     return meta
 
 
+def _valid_tools_decl(value: str) -> bool:
+    """tools 声明合法性（R9）：非空单文件名（无分隔符、无 ..），≤128 字符。
+    非法声明由调用方忽略该字段——注册表不因声明错误而失败。"""
+    v = value.strip()
+    if not v or len(v) > 128:
+        return False
+    return Path(v).name == v and v not in (".", "..")
+
+
 def _scan_skills(root: Path) -> dict:
     catalog: dict = {}
     if not root.is_dir():
@@ -64,7 +79,12 @@ def _scan_skills(root: Path) -> dict:
         if meta is None:
             print(f"[assets] frontmatter 缺 name/description，跳过 {d.name}", file=sys.stderr)
             continue
-        catalog[meta["name"]] = {"description": meta["description"], "path": skill_md}
+        tools_decl = meta.get("tools", "").strip()
+        catalog[meta["name"]] = {
+            "description": meta["description"],
+            "path": skill_md,
+            "tools": tools_decl if _valid_tools_decl(tools_decl) else None,
+        }
     return catalog
 
 
@@ -109,7 +129,11 @@ class AssetsPlugin:
             self._skills = _scan_skills(self._skills_root)  # 每次重扫：Web CRUD / 自扩展写盘即时可见
             return {
                 "ok": True,
-                "skills": [{"name": n, "description": s["description"]} for n, s in self._skills.items()],
+                "skills": [
+                    # tools: true = 声明了配套工具（R9）；声明指向的文件是否存在不在此校验
+                    {"name": n, "description": s["description"], **({"tools": True} if s.get("tools") else {})}
+                    for n, s in self._skills.items()
+                ],
                 "root": str(self._skills_root),
             }
         if op == "skills.load":
@@ -123,7 +147,17 @@ class AssetsPlugin:
                 content = entry["path"].read_text(encoding="utf-8")[:_MAX_LOAD_BYTES]
             except OSError as exc:
                 return _err(f"skill 读取失败: {exc}")
-            return {"ok": True, "content": content}
+            resp = {"ok": True, "content": content}
+            # R9：配套工具声明 → 回传 tools.json 绝对路径（供 tools.install 定点装载）；
+            # 声明存在但文件缺失时附 missing（观察回写要让模型知道）。
+            tools_decl = entry.get("tools")
+            if tools_decl:
+                manifest_path = entry["path"].parent / tools_decl
+                manifest = {"path": str(manifest_path)}
+                if not manifest_path.is_file():
+                    manifest["missing"] = [tools_decl]
+                resp["tools_manifest"] = manifest
+            return resp
         if op == "prompts.list":
             self._prompts = _scan_prompts(self._prompts_root)
             return {

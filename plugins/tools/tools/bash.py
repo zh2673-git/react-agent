@@ -79,9 +79,14 @@ def _timeout_result(timeout_ms: int) -> dict:
 
 
 def _result(exit_code, timeout: bool, output: str) -> dict:
-    truncated = len(output.encode("utf-8")) > _MAX_OUTPUT
+    total = len(output.encode("utf-8"))
+    truncated = total > _MAX_OUTPUT
     if truncated:
-        output = output.encode("utf-8")[:_MAX_OUTPUT].decode("utf-8", errors="ignore") + "\n[truncated: 输出超过 64KB]"
+        # head+tail 双保留：报错信息多在尾部，只留头部会丢关键线索（v3）
+        eb = output.encode("utf-8")
+        head = eb[:40_000].decode("utf-8", errors="ignore")
+        tail = eb[-20_000:].decode("utf-8", errors="ignore")
+        output = head + f"\n…[中段略去约 {(total - 60_000) // 1024}KB，保留头部 40KB + 尾部 20KB]…\n" + tail
     return {"exit_code": exit_code, "timeout": timeout, "truncated": truncated, "output": output}
 
 
@@ -95,14 +100,15 @@ def _run_bash(args: dict) -> dict:
 
 _DESCRIPTION = (
     "Run a shell command in the workspace (cwd = WORKSPACE_ROOT) via a restricted-token sandbox helper "
-    "(reduced privileges, admin groups deny-only; fail-closed). "
-    "Args: command (required), timeout_ms (default 30000, max 60000)."
-    if _SANDBOXED
-    else (
-        "Run a shell command in the workspace (cwd = WORKSPACE_ROOT). "
-        "Runs with full user permissions - NOT sandboxed (BASH_SANDBOX=off). "
+        "(reduced privileges, admin groups deny-only; fail-closed). Large output keeps head 40KB + tail 20KB. "
         "Args: command (required), timeout_ms (default 30000, max 60000)."
-    )
+        if _SANDBOXED
+        else (
+            "Run a shell command in the workspace (cwd = WORKSPACE_ROOT). "
+            "Runs with full user permissions - NOT sandboxed (BASH_SANDBOX=off). "
+            "Large output keeps head 40KB + tail 20KB. "
+            "Args: command (required), timeout_ms (default 30000, max 60000)."
+        )
 )
 
 TOOLS = {

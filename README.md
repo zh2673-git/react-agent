@@ -8,7 +8,7 @@
         ┌──────────────────┬──────────┼──────────────────┐
         ▼                  ▼          ▼                  ▼
   llm-adapter(Python)   tools(Python) assets(Python)   memory(TypeScript)
-  provider pack 注册表   生产级 7 工具  skills/prompts   会话消息+事件日志
+  provider pack 注册表   生产级 8 工具  skills/prompts   会话消息+事件日志
   (openai/anthropic/    +越界拦截     注册表(渐进披露)  (JSON/JSONL)
    ollama/mock)         +免费搜索链
 ```
@@ -16,10 +16,10 @@
 - 内核只做：插件装载隔离、执行编排、契约/权限校验；一切能力皆为插件
 - ReAct 循环：感知(读记忆)→规划(LLM+工具清单)→行动(执行工具/保留名路由)→观察(写回记忆)→收敛；全程发射事件（trace）+ 逐轮进度回显
 - 三家 LLM 全覆盖：OpenAI 兼容（可换 base_url 适配 DeepSeek 等）、Anthropic、Ollama；另带 **mock** provider 供离线测试
-- 生产级工具 7 件：read_file / write_file / edit_file / list_dir / bash / web_search / web_read（全部免费默认无 key）
+- 生产级工具 8 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read（全部免费默认无 key）
 - 双前端：REPL（默认）/ Web 网关（HTTP+SSE，DeepSeek 风格单页会话：左侧会话栏+持久化、工具调用状态点卡片、富 markdown 代码块复制，刷新恢复=日志重放）
 - **Web 配置中心**（08）：设置面板在线配 LLM（provider/model/base_url/api_key，热生效+落盘 config.json）、勾选工具白名单、技能 CRUD（SKILL.md 在线编辑）
-- **自扩展**（08）：L1 技能自扩展——skills 根在 WORKSPACE_ROOT 内时系统提示词授权模型用 write_file 自建技能（文件即注册表，下轮对话自动可见）；L2 工具自扩展——`tools.reload` 动态装载新工具模块（装载≠启用，白名单两步分离）
+- **自扩展**（08）：L1 技能自扩展——skills 根在 WORKSPACE_ROOT 内时系统提示词授权模型用 write_file 自建技能（文件即注册表，下轮对话自动可见）；L2 工具自扩展——`tools.reload` 动态装载新工具模块（装载≠启用，白名单两步分离）；R9 技能自造闭环——`skill_install` 编排 + 语言无关配套工具（tools.json 声明 + 任意语言执行体），前端内联卡一键启用（装载≠启用≠可见，见「配置中心与自扩展」）
 - subagent：保留工具 `task` 委派子任务（新 session 复用全链路，深度防嵌套）
 
 ## 目录
@@ -28,7 +28,7 @@
 crates/agent-loop        ReAct 编排插件（InProcess，仅依赖 agent-kernel-sdk）
 crates/host              宿主二进制：装配、spawn、探测、双前端、sandbox-run 助手；web-dist/ 为 web 前端单页（运行时 serve，非内嵌）
 plugins/llm_adapter      LLM 适配器（Python guest，providers/ 按 vendor 分 pack）
-plugins/tools            工具注册与执行（Python guest，纯 stdlib，files/bash/web 分文件）
+plugins/tools            工具注册与执行（Python guest，纯 stdlib，files/bash/web/grep 分文件）
 plugins/assets           skills/prompts 注册表（Python guest，开放标准 SKILL.md）
 plugins/memory           会话记忆 + 事件日志（TS guest，strip-types）
 docs/                    方案与设计文档（01 总纲 / 02 架构 / 03 模块契约 / 04-07 分模块四层设计）
@@ -107,7 +107,8 @@ Web 前端是单文件 `crates/host/web-dist/index.html`（内联 CSS/JS，无�
 | `PLUGINS_DIR` | `<workspace>/plugins` | guest 脚本目录 |
 | `MEMORY_DATA_DIR` | `plugins/memory/data` | memory 会话与事件日志持久化目录 |
 | `WORKSPACE_ROOT` | 进程 cwd | 文件工具越界拦截根（realpath 前缀校验） |
-| `TOOLS_ENABLED` | 全开 | 逗号分隔白名单，如 `read_file,write_file,bash` |
+| `TOOLS_ENABLED` | 全开 | 逗号分隔白名单，如 `read_file,write_file,bash`（R9：技能工具名持久化后重启 → 延迟启用，install 时自动生效，不再启动失败） |
+| `SKILL_TOOL_TIMEOUT_SECS` | `60` | R9 技能工具子进程执行超时（超时杀进程，字段级错误） |
 | `SEARCH_REGION` | `cn` | cn（Bing→搜狗→百度零 key 直连）/ global（ddgs→DDG→Bing） |
 | `SEARCH_BACKEND` | 自动 | 强制指定引擎：bing / sogou / baidu / ddgs / duckduckgo / bocha / baidu_ai / tavily |
 | `BOCHA_API_KEY` / `BAIDU_API_KEY` / `TAVILY_API_KEY` | — | 可选升级搜索后端 |
@@ -140,7 +141,7 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 **agent-loop**（`agent.chat`）
 - req `{"op":"chat","session_id":str,"user_text":str,"attachments"?:[Attachment]}`（attachments：host 已校验，图片走多模态映射、文本文件内嵌 content，见「用户附件」）
 - resp `{"ok":true,"answer":str,"rounds":int,"steps":[{"round":int,"tool":str,"ms":int}],"session_id":str}` | `{"ok":false,"error":{...}}`
-- 保留工具名（不进 tools.list，由 agent-loop 路由）：`load_skill`→assets `skills.load`；`task`→子代理（新 session 复用 agent.chat，深度防嵌套）
+- 保留工具名（不进 tools.list，由 agent-loop 路由）：`load_skill`→assets `skills.load`（成功发 `skill_loaded` trace 事件，会话技能集重放推导依据）；`skill_install`→R9 技能安装编排（assets skills.load 取声明 → tools.install fail-closed 装载 → trace `skill_installed`）；`task`→子代理（新 session 复用 agent.chat，深度防嵌套）
 
 **llm-adapter**（`llm.chat`）
 - req `{"op":"chat","provider"?:"openai"|"anthropic"|"ollama"|"mock","messages":[Msg],"tools"?:[ToolSpec],"stream_path"?,"sid"?,"num_ctx"?:int}`（`num_ctx` 源自 `LLM_CONTEXT_TOKENS`，0/缺省不下发；仅 ollama native 映射 `options.num_ctx`）
@@ -152,15 +153,18 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 - 扩展 `{"op":"models.list","provider"?}` → `{"ok":true,"models":[str],"models_meta"?}`（openai/deepseek 走 `/v1/models`；ollama 走 `/api/tags` + 逐模型 `/api/show` 探测原生窗口；anthropic/mock 走静态清单；`models_meta` 为可选扩展 `[{"name","ctx_limit"?}]`——模型原生上下文窗口，取不到省略键，其他 provider 不带；失败 `{"ok":false,"error":{...}}`）
 
 **tools**（`tools.exec`）
-- `{"op":"list"}` → `{"ok":true,"tools":[ToolSpec]}`（生产级 7 件：read_file / write_file / edit_file / list_dir / bash / web_search / web_read，受 `TOOLS_ENABLED` 裁剪）
+- `{"op":"list"}` → `{"ok":true,"tools":[ToolSpec]}`（生产级 8 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read，受 `TOOLS_ENABLED` 裁剪）
 - `{"op":"list","all":true}` → 额外含未启用工具，各项附 `"enabled":bool`（配置中心视图）
 - `{"op":"call","name":str,"args":object}` → `{"ok":true,"result":any}` | `{"ok":false,"error":{"code","message","field"?}}`（字段级错误：哪个参数错、合法值是什么）
 - 扩展 `{"op":"configure","enabled":[str,...]}` → 运行时整体替换白名单（未知名 → 字段级 400）
 - 扩展 `{"op":"reload"}` → 扫描 tools/ 目录动态装载新模块 → `{"ok":true,"loaded":[...],"added":[...],"skipped":[...]}`（**装载≠启用**：新工具进可用池不进白名单，需 configure 启用；内置不可覆盖，单模块失败跳过 fail-closed）
+- 扩展 `{"op":"install","path":str,"skill"?}` → `{"ok":true,"skill","loaded","skipped","pending"}`（R9：定点装载技能包内 tools.json——数组，每项 ToolSpec + `exec:{cmd:[...],"cwd"?}`；装载进技能工具池，不可调用、不进 list、不启用。校验 fail-closed：realpath ⊆ WORKSPACE_ROOT 且 ⊆ skills 根，name 不与内置/已装载冲突，单项失败跳过；`skill` 缺省回退目录名）
+- 扩展 `{"op":"skill_tools","skills":[str]?,"all"?}` → `{"ok":true,"tools":[ToolSpec + "skill" + "enabled"?]}`（R9：缺省只出**已启用**技能工具——agent-loop 会话清单装配视图；`all:true` 附未启用项——host 配置视图。不在 list 契约内，技能工具对内置工具 tab 不可见）
+- **技能工具执行协议（语言无关）**：被 call 时起**子进程**执行 `exec.cmd`——stdin 收 `{"args":{...}}`，stdout 回 `{"ok":true,"result":...}` | `{"ok":false,"error":{...}}`（与 Wire 契约同形，任意语言 JSON 序列化即可实现工具）；cwd 缺省技能目录，受 `SKILL_TOOL_TIMEOUT_SECS`（缺省 60s）约束，输出不合契约 → `TOOL_EXEC_ERROR`，未启用调用 → `TOOL_DISABLED`。`configure` 合法值 = 内置/动态池 ∪ 技能工具池；`TOOLS_ENABLED` 中的技能工具名先于装载到达（重启场景）→ 延迟启用，install 同名工具时自动转入启用集
 
 **assets**（`assets.registry`）
-- `{"op":"skills.list"}` → `{"ok":true,"skills":[{"name","description"}],"root":str}`（每次调用重扫目录；root 供 agent-loop 自扩展可达性探测）
-- `{"op":"skills.load","name":str}` → `{"ok":true,"content":str}` | `{"ok":false,"error":{...}}`（读取前重扫）
+- `{"op":"skills.list"}` → `{"ok":true,"skills":[{"name","description","tools"?:true}],"root":str}`（每次调用重扫目录；root 供 agent-loop 自扩展可达性探测；`tools:true` = frontmatter 声明了配套工具——R9，声明指向的文件是否存在不在此校验）
+- `{"op":"skills.load","name":str}` → `{"ok":true,"content":str,"tools_manifest"?:{"path":str,"missing"?:[str]}}` | `{"ok":false,"error":{...}}`（读取前重扫；`tools_manifest.path` = 声明文件绝对路径，供 tools.install 定点装载；声明存在但文件缺失时回传 missing）
 - `{"op":"prompts.list"}` → `{"ok":true,"prompts":[{"name","description"}]}`
 - `{"op":"prompts.get","name":str}` → `{"ok":true,"content":str}`
 
@@ -186,7 +190,7 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
  model 下拉；ollama 额外透传 `models_meta` 原生窗口元数据——前端下拉展示 `模型名 · 256k`，Agent 页 `llm_context_tokens` 提示原生窗口并可一键填入）
 - `GET /api/presets` → 转发 llm-adapter `presets.list`，OpenAI 兼容站点预设清单（ModelScope / 硅基流动 / OpenRouter 等，数据源 plugins/llm_adapter/presets.py——前端「站点」下拉一键切换：选站自动填 base_url、per-site key 由 localStorage 记忆带出，保存走 configure 热应用零重启）
 - `PUT /api/config` body `{"llm"?:{...},"tools"?":{"enabled":[...]}}` → 逐项转发 configure op（任一失败 400 不落盘，重启即回滚）；全成落 config.json
-- `GET /api/skills` → assets skills.list（实时目录）
+- `GET /api/skills` → assets skills.list（实时目录；R9：合入 `tools_detail`——tools.skill_tools all=true 按 skill 分组的配套工具视图，含未启用项 + enabled 标记，前端技能 tab 就地启停数据源；tools 不可用 → 静默省略）
 - `GET /api/skills/{name}` → `{"ok":true,"name","content"}`（SKILL.md 原文，编辑用）
 - `PUT /api/skills/{name}` body `{"content":SKILL.md全文}` → 写入（frontmatter name 须与目录名一致；名字仅字母数字/_/-）
 - `DELETE /api/skills/{name}` → 删除技能目录
@@ -196,6 +200,7 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 - **配置中心**：Web 设置面板保存 → llm-adapter/tools configure op 热生效（env）→ merge 落 `config.json`；重启时 `apply_config_file_to_env` 还原。env 仍是一切配置之源（spawn 复用既有机制）
 - **L1 技能自扩展**：assets `skills.list` 回传 root，agent-loop 判定 root ⊆ WORKSPACE_ROOT 后在系统提示词注入授权段——模型用 `write_file` 写 `<skills-root>/<name>/SKILL.md` 即完成注册（list 每次重扫，下轮对话可见，无需 reload）。授权≠边界：真正的硬边界仍是文件工具 realpath 越界拦截
 - **L2 工具自扩展**：把符合 ToolSpec 三元组（name/description/parameters/run）的 `TOOLS` dict 放进 `plugins/tools/` 下的新 .py 文件，对话中说「重载工具」→ `tools.reload` 装载进池；再经配置中心勾选启用（装载≠启用，写与启用两步分离）
+- **R9 技能自造闭环**：模型调 `skill_install(name)` 完成技能包安装编排——assets `skills.load` 取 SKILL.md + frontmatter `tools:` 声明 → `tools.install` fail-closed 装载配套工具（语言无关：tools.json 声明 + 任意语言执行体，子进程 stdin/stdout JSON 协议）→ trace `skill_installed` 事件 → 前端过程框内联卡「技能已就绪 · N 件待启用」。**三层作用域**：装载（进池不可调用）≠ 启用（一键启用过配置闸，全局持久）≠ 可见（仅 `load_skill` 后该技能已启用工具进入本会话工具清单，会话技能集由 trace 重放推导）。工具归属技能界面（技能 tab 内启停），内置 8 件冻结不扩展
 
 ## 架构要点（内核约束的落点）
 
@@ -218,10 +223,8 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 
 ## Roadmap（后续方向）
 
-- **agent 自造技能并自然呈现在 UI（探讨中）**：当前自扩展是「半自动」——L1 技能自扩展（模型用
-  `write_file` 写 SKILL.md，文件即注册表，下轮对话可见）与 L2 工具自扩展（`tools.reload` 装载 +
-  配置中心手动勾选启用）是两条分离的链路，且工具启用需要人工介入。后续要探讨的闭环是：
-  agent 在实际任务中**自己产出完整技能包**（SKILL.md + 配套工具定义 + 可执行脚本），产出后
-  **自动完成装载与启用**（或按安全策略显式授权），并**同步呈现在前端 UI**（技能列表出现新条目、
-  新能力即时可对话验证）——从「模型写文件、人工后台配置」进化为「agent 自造、UI 自然生长」。
-  涉及的安全边界（自动启用的白名单策略、脚本执行沙箱、技能来源审计）将在实施时一并设计。
+- **agent 自造技能并自然呈现在 UI——已落地（R9，方案 B 档位）**：`skill_install` 保留名编排 +
+  语言无关命令工具（tools.json + 任意语言执行体）+ 前端内联卡与一键启用已实现并通过全链路
+  验证（详见 `crates/agent-loop/PLAN.md` R9）。自动化档位取方案 B：装载全自动、启用保留人工
+  一键确认（配置闸）、会话可见由 `load_skill` 驱动。后续增强方向：会话级临时启用的授权策略、
+  命令工具执行沙箱化（复用 BASH_SANDBOX 受限令牌思路）、技能来源审计。
