@@ -43,6 +43,11 @@ plugins/memory           会话记忆 + 事件日志（TS guest，strip-types）
 docs/                    方案与设计文档（01 总纲 / 02 架构 / 03 模块契约 / 04-07 分模块四层设计）
 ```
 
+> **关于 web-dist/vendor（≈11MB）**：Monaco Editor 本地静态资源随源码库分发（不入 npm/CDN 链路），
+> 目的是产物卡预览的「本地 vendor → CDN → 纯文本」三级降级在离线/CDN 不可达环境下仍有完整编辑器体验。
+> 代价是 clone 体积 +11MB；资源为第三方构建产物，不随业务改动演进。Monaco Editor 采用 MIT 许可
+> （版权声明见 `web-dist/vendor/LICENSE-Monaco.txt`），随库分发合规。
+
 ## 环境准备（一次）
 
 > Windows 下用 [start.cmd](start.cmd) 一键启动可跳过本节——脚本会自动检测并安装缺失依赖。
