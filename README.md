@@ -8,7 +8,7 @@
         ┌──────────────────┬──────────┼──────────────────┐
         ▼                  ▼          ▼                  ▼
   llm-adapter(Python)   tools(Python) assets(Python)   memory(TypeScript)
-  provider pack 注册表   生产级 8 工具  skills/prompts   会话消息+事件日志
+  provider pack 注册表   生产级 9 工具  skills/prompts   会话消息+事件日志
   (openai/anthropic/    +越界拦截     注册表(渐进披露)  (JSON/JSONL)
    ollama/mock)         +免费搜索链
 ```
@@ -16,10 +16,10 @@
 - 内核只做：插件装载隔离、执行编排、契约/权限校验；一切能力皆为插件
 - ReAct 循环：感知(读记忆)→规划(LLM+工具清单)→行动(执行工具/保留名路由)→观察(写回记忆)→收敛；全程发射事件（trace）+ 逐轮进度回显
 - 三家 LLM 全覆盖：OpenAI 兼容（可换 base_url 适配 DeepSeek 等）、Anthropic、Ollama；另带 **mock** provider 供离线测试
-- 生产级工具 8 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read（全部免费默认无 key）
+- 生产级工具 9 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read / symbols_search（全部免费默认无 key）；另有 **MCP 外接池**（stdio 服务器，`mcp__{server}__{tool}` 命名空间，见 env 表 `MCP_SERVERS` 与 §八）与技能配套工具两池，统一白名单启用
 - 双前端：REPL（默认）/ Web 网关（HTTP+SSE，Cursor 暖色系事件流式会话：左侧会话栏 + 自动命名 + 持久化、「思考与工具」过程框（思考链 + 工具卡状态点，可折叠回看）、🔗 来源 chip 溯源抽屉、产物文件卡片（预览/下载）、📎 附件上传、消息回滚/重新生成、subagent 实时框、富 markdown（表格/代码块复制），刷新恢复 = 日志重放）
-- **Web 配置中心**（08）：右上角 ⚙ 侧边抽屉四标签——LLM（provider/model/站点预设/base_url/api_key，ollama 另显模型原生窗口，热生效 + 落盘 config.json）、工具（白名单勾选）、技能（SKILL.md 在线编辑 + R9 配套工具就地启停）、Agent（max_rounds/系统提示词/上下文窗口等热通道）；配置源文件一键「在编辑器中打开」
-- **自扩展**（08）：L1 技能自扩展——skills 根在 WORKSPACE_ROOT 内时系统提示词授权模型用 write_file 自建技能（文件即注册表，下轮对话自动可见）；L2 工具自扩展——`tools.reload` 动态装载新工具模块（装载≠启用，白名单两步分离）；R9 技能自造闭环——`skill_install` 编排 + 语言无关配套工具（tools.json 声明 + 任意语言执行体），前端内联卡一键启用（装载≠启用≠可见，见「配置中心与自扩展」）。**已实证**：[`gongwen-format`](plugins/assets/skills/gongwen-format/SKILL.md)（公文格式写作）即 agent 在对话中自建的技能——SKILL.md 与配套工具（tools.json + Python 执行体）均由模型一次生成，内联卡启用后跨会话可用，非人工预置
+- **Web 配置中心**（08）：右上角 ⚙ 侧边抽屉四标签——LLM（provider/model/站点预设/base_url/api_key，ollama 另显模型原生窗口，热生效 + 落盘 config.json）、工具（内置/技能/MCP 三池分组折叠，条目展开看参数 schema；MCP 组内 server 总开关 + API Key 配置）、技能（SKILL.md 在线编辑 + R9 配套工具就地启停；来源徽章区分出厂/用户，出厂件删除保护）、Agent（max_rounds/系统提示词/上下文窗口等热通道）；配置源文件一键「在编辑器中打开」
+- **自扩展**（08）：L1 技能自扩展——skills 根在 WORKSPACE_ROOT 内时系统提示词授权模型用 write_file 自建技能（文件即注册表，下轮对话自动可见）；L2 工具自扩展——`tools.reload` 动态装载新工具模块（装载≠启用，白名单两步分离）；R9 技能自造闭环——`skill_install` 编排 + 语言无关配套工具（tools.json 声明 + 任意语言执行体），前端内联卡一键启用（装载≠启用≠可见，见「配置中心与自扩展」）。**已实证**：`gongwen-format`（公文格式写作，用户自建件，随 gitignore 用户件规则**不入库**）即 agent 在对话中自建的技能——SKILL.md 与配套工具（tools.json + Python 执行体）均由模型一次生成，内联卡启用后跨会话可用，非人工预置
 - subagent：保留工具 `task` 委派子任务（新 session 复用全链路，深度防嵌套）；前端「思考与工具」过程框内嵌套「子代理」实时框——子代理的思考流与工具卡实时透传呈现（trace 事件镜像 + 子旁路流式），委派不再"图标一闪就卡住"
 
 ## 界面一览
@@ -148,7 +148,7 @@ cargo test -p react-agent-agent-loop   # 纯 Rust mock 测试（无需 python/no
 cargo test --workspace                 # 全量（含跨语言 e2e，缺解释器自动 skip）
 ```
 
-e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚本)、**全链路 ReAct**、上下文压缩、web 网关（chat+SSE 重放 + **配置中心与技能 CRUD**）、subagent（委派+嵌套拒绝+**事件镜像透传**）。
+e2e：tools(9 工具往返 + MCP echo 三模式)、memory(append/get/clear/summarize)、llm(mock 脚本)、**全链路 ReAct**、上下文压缩、web 网关（chat+SSE 重放 + **配置中心与技能 CRUD**）、subagent（委派+嵌套拒绝+**事件镜像透传**）、SYSTEM.md 覆盖链与预置技能注册。
 
 > 注意：若测试失败提前退出，guest 子进程可能残留（占用内存无害）；可用 `Get-Process python,node` 检查清理。测试内已将 guest stderr 指向 null，cargo 不会再被泄漏进程扣住。
 
