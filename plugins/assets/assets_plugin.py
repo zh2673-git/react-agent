@@ -6,10 +6,13 @@
   Execution: 复用基础工具（assets 从不执行 skill 代码，语言无关）
 
 线契约（03 §2.4）：
-  {"op":"skills.list"}             → {"ok":true,"skills":[{"name","description","tools"?:true}],"root":str}
+  {"op":"skills.list"}             → {"ok":true,"skills":[{"name","description","tools"?:true,
+                                       "origin":"preset"|"user"}],"root":str}
                                      每次调用重扫目录（08：Web 技能 CRUD / L1 自扩展实时可见）；
                                      root=skills 根目录绝对路径（agent-loop 自扩展可达性探测用）；
-                                     `tools:true` = 该技能声明了配套工具（R9，供前端徽章与授权段提示）
+                                     `tools:true` = 该技能声明了配套工具（R9，供前端徽章与授权段提示）；
+                                     `origin` = 来源标记（Phase A）：frontmatter 显式 `origin: user`
+                                     → "user"，缺省/其他值 → "preset"（出厂件，host 删除 API 拒删）
   {"op":"skills.load","name":str}  → {"ok":true,"content":str,"tools_manifest"?:
                                        {"path":str,"missing"?:[str]}} | {"ok":false,"error":{...}}
                                      （读取前重扫；tools_manifest.path = 声明文件绝对路径，
@@ -80,10 +83,14 @@ def _scan_skills(root: Path) -> dict:
             print(f"[assets] frontmatter 缺 name/description，跳过 {d.name}", file=sys.stderr)
             continue
         tools_decl = meta.get("tools", "").strip()
+        # 来源判定：显式 `origin: preset` → 出厂件；缺省/其他 → 用户件（出厂件必须显式
+        # 声明——预置技能归 git 管理并打标，存量用户技能缺字段即正确归类，可删可改）
+        origin = "preset" if meta.get("origin", "").strip() == "preset" else "user"
         catalog[meta["name"]] = {
             "description": meta["description"],
             "path": skill_md,
             "tools": tools_decl if _valid_tools_decl(tools_decl) else None,
+            "origin": origin,
         }
     return catalog
 
@@ -130,8 +137,10 @@ class AssetsPlugin:
             return {
                 "ok": True,
                 "skills": [
-                    # tools: true = 声明了配套工具（R9）；声明指向的文件是否存在不在此校验
-                    {"name": n, "description": s["description"], **({"tools": True} if s.get("tools") else {})}
+                    # tools: true = 声明了配套工具（R9）；声明指向的文件是否存在不在此校验；
+                    # origin 显式回传 preset|user（Phase A，老消费方忽略即兼容）
+                    {"name": n, "description": s["description"], "origin": s["origin"],
+                     **({"tools": True} if s.get("tools") else {})}
                     for n, s in self._skills.items()
                 ],
                 "root": str(self._skills_root),

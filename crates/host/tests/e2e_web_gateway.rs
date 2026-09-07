@@ -1,4 +1,4 @@
-﻿//! e2e：web 网关全链路（Phase 3-2 / Phase 4）——真实 memory/llm(mock)/tools guest + 真 agent-loop。
+//! e2e：web 网关全链路（Phase 3-2 / Phase 4）——真实 memory/llm(mock)/tools guest + 真 agent-loop。
 //! POST /api/chat → agent.chat 收敛；GET /api/events → SSE 从 0 重放全量事件；
 //! 非法请求 → 400 字段级错误。HTTP 客户端用裸 TcpStream（不引测试依赖）。
 //! Phase 4（08）：/api/config 读写（llm 热应用 + 落盘 + tools 白名单）、/api/skills CRUD。
@@ -247,7 +247,11 @@ async fn web_config_center_and_skills_crud() {
     let (status, body) = http(addr, "GET", "/api/skills/e2e-skill", None).await;
     assert_eq!(status, 200, "get skill: {body}");
     let v: Value = serde_json::from_str(&body).expect("skill JSON");
-    assert_eq!(v["content"], json!(skill_md), "回读应与写入一致: {v}");
+    // Phase A：PUT 写入的用户技能自动打标 origin: user（回读比写入多一行）
+    let mut expected = skill_md.to_string();
+    let close = expected.find("\n---\n\n").expect("frontmatter close");
+    expected.insert_str(close, "\norigin: user");
+    assert_eq!(v["content"], json!(expected), "回读应含 origin 打标: {v}");
 
     // 6. 技能写入校验：frontmatter 缺失 → 400；name 不一致 → 400；非法名（路径注入）→ 400
     let (status, body) = http(addr, "PUT", "/api/skills/bad", Some(&json!({"content": "no frontmatter"}).to_string())).await;

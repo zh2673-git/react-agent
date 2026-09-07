@@ -35,7 +35,7 @@
 
 ```
 crates/agent-loop        ReAct 编排插件（InProcess，仅依赖 agent-kernel-sdk）
-crates/host              宿主二进制：装配、spawn、探测、双前端（frontend repl + web/ 网关）、sandbox-run 助手；web-dist/ 为 web 前端三文件 index.html+style.css+app.js（运行时 serve，非内嵌）
+crates/host              宿主二进制：装配、spawn、探测、双前端（frontend repl + web/ 网关）、sandbox-run 助手；web-dist/ 为 web 前端三文件 index.html+style.css+app.js + vendor/（monaco 本地资源，运行时 serve，非内嵌）
 plugins/llm_adapter      LLM 适配器（Python guest，providers/ 按 vendor 分 pack）
 plugins/tools            工具注册与执行（Python guest，纯 stdlib，files/bash/web/grep 分文件）
 plugins/assets           skills/prompts 注册表（Python guest，开放标准 SKILL.md）
@@ -121,6 +121,7 @@ Web 前端是单文件 `crates/host/web-dist/index.html`（内联 CSS/JS，无�
 | `WORKSPACE_ROOT` | 进程 cwd | 文件工具越界拦截根（realpath 前缀校验） |
 | `TOOLS_ENABLED` | 全开 | 逗号分隔白名单，如 `read_file,write_file,bash`（R9：技能工具名持久化后重启 → 延迟启用，install 时自动生效，不再启动失败） |
 | `SKILL_TOOL_TIMEOUT_SECS` | `60` | R9 技能工具子进程执行超时（超时杀进程，字段级错误） |
+| `MCP_SERVERS` | — | §八 MCP server 声明（整体 JSON：`{"名称":{"command":[...],"args"?,"env"?}}`），host 自 config.json `mcp_servers` 透传；改后需重启 host |
 | `SEARCH_REGION` | `cn` | cn（Bing→搜狗→百度零 key 直连）/ global（ddgs→DDG→Bing） |
 | `SEARCH_BACKEND` | 自动 | 强制指定引擎：bing / sogou / baidu / ddgs / duckduckgo / bocha / baidu_ai / tavily |
 | `BOCHA_API_KEY` / `BAIDU_API_KEY` / `TAVILY_API_KEY` | — | 可选升级搜索后端 |
@@ -175,9 +176,10 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 - 扩展 `{"op":"install","path":str,"skill"?}` → `{"ok":true,"skill","loaded","skipped","pending"}`（R9：定点装载技能包内 tools.json——数组，每项 ToolSpec + `exec:{cmd:[...],"cwd"?}`；装载进技能工具池，不可调用、不进 list、不启用。校验 fail-closed：realpath ⊆ WORKSPACE_ROOT 且 ⊆ skills 根，name 不与内置/已装载冲突，单项失败跳过；`skill` 缺省回退目录名）
 - 扩展 `{"op":"skill_tools","skills":[str]?,"all"?}` → `{"ok":true,"tools":[ToolSpec + "skill" + "enabled"?]}`（R9：缺省只出**已启用**技能工具——agent-loop 会话清单装配视图；`all:true` 附未启用项——host 配置视图。不在 list 契约内，技能工具对内置工具 tab 不可见）
 - **技能工具执行协议（语言无关）**：被 call 时起**子进程**执行 `exec.cmd`——stdin 收 `{"args":{...}}`，stdout 回 `{"ok":true,"result":...}` | `{"ok":false,"error":{...}}`（与 Wire 契约同形，任意语言 JSON 序列化即可实现工具）；cwd 缺省技能目录，受 `SKILL_TOOL_TIMEOUT_SECS`（缺省 60s）约束，输出不合契约 → `TOOL_EXEC_ERROR`，未启用调用 → `TOOL_DISABLED`。`configure` 合法值 = 内置/动态池 ∪ 技能工具池；`TOOLS_ENABLED` 中的技能工具名先于装载到达（重启场景）→ 延迟启用，install 同名工具时自动转入启用集
+- **§八 MCP 第三池**：`MCP_SERVERS` 声明的 stdio server 于 init 时握手入池——命名空间 `mcp__{server}__{tool}`，description / inputSchema 透传（list 中 `mcp_server` 字段标来源）；call → JSON-RPC `tools/call`，content text 拼接回契约形，`isError:true` → `MCP_TOOL_ERROR`；server 崩溃 fail-closed 跳过（其工具不入池，调用即 `UNKNOWN_TOOL`），重启带退避不拖垮其余工具；启用闸与内置/技能工具同走 `TOOLS_ENABLED`（装载≠启用）。`{"op":"mcp_tools"}` → `{"ok":true,"servers":[{"name","status","tools","error"?}],"tools":[{...,"enabled"}]}`（host 配置视图）。destroy 逆序回收无孤儿进程
 
 **assets**（`assets.registry`）
-- `{"op":"skills.list"}` → `{"ok":true,"skills":[{"name","description","tools"?:true}],"root":str}`（每次调用重扫目录；root 供 agent-loop 自扩展可达性探测；`tools:true` = frontmatter 声明了配套工具——R9，声明指向的文件是否存在不在此校验）
+- `{"op":"skills.list"}` → `{"ok":true,"skills":[{"name","description","origin","tools"?:true}],"root":str}`（每次调用重扫目录；root 供 agent-loop 自扩展可达性探测；`origin` = 来源标记：frontmatter 显式 `origin: preset` → 出厂件（删除保护），缺省/其他 → 用户件——出厂件必须显式声明，存量用户技能缺字段即正确归类；`tools:true` = frontmatter 声明了配套工具——R9，声明指向的文件是否存在不在此校验）
 - `{"op":"skills.load","name":str}` → `{"ok":true,"content":str,"tools_manifest"?:{"path":str,"missing"?:[str]}}` | `{"ok":false,"error":{...}}`（读取前重扫；`tools_manifest.path` = 声明文件绝对路径，供 tools.install 定点装载；声明存在但文件缺失时回传 missing）
 - `{"op":"prompts.list"}` → `{"ok":true,"prompts":[{"name","description"}]}`
 - `{"op":"prompts.get","name":str}` → `{"ok":true,"content":str}`
@@ -195,19 +197,20 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 
 **web 网关**（host 级，非插件）
 - `GET /` → 单页（Cursor 暖色系事件流式会话：米色纸感底 + 半透明炭黑 CTA，主题 token 见 crates/host/PLAN.md W1；左侧会话栏持久化、工具调用状态点卡片、富 markdown 代码块复制 + ⚙ 设置面板：LLM / 工具 / 技能 / Agent）
+- `GET /vendor/{path}` → W11 静态资源树（monaco 编辑器本地化于 `web-dist/vendor/`）：路径段校验（无 `..`/反斜杠/空段）+ 扩展名白名单（js/css/json/ttf/woff/woff2）防穿越；产物文件卡预览走「本地 vendor → CDN → 纯文本」三级降级链
 - `GET /api/events?session=&after=` → SSE（从 0 全量重放 + 实时增量）
 - `POST /api/chat` body `{"session_id":str,"message":str,"attachments"?:[{"name","mime","data_b64"}]}` → 阻塞至收敛，回 agent.chat 响应（attachments 可选：图片走多模态映射、文本文件内嵌 content；上限 4 个、单个 ≤2MB，host 校验形状与体量，非法即 K400）
 - `POST /api/chat/cancel?session=` → 取消运行中的 chat：agent-loop `cancel`（工具波次间 + 轮次边界收敛 K499）+ llm-adapter `abort`（流式逐帧检查命中即关流，单轮长生成无需等轮次边界），立即返回
 - `POST /api/chat/rollback` body `{"session_id":str,"upto_user_index":int}` → R2 回滚：memory 消息与 trace 事件**同源物理截断**到第 N 条 user 消息之前（0 基）。**计数口径以 trace user 事件为准（UI 真相源）**；memory 经压缩只剩「标记 + 最近 K 条」，两侧按**尾部对齐**（压缩只裁头部）定消息切点：回滚点在保留区 → 保压缩标记、截到该轮前；落在摘要区 → 标记与消息全清（摘要与回滚区间重叠，保留即上下文残留）；无 trace 文件的纯 memory 会话按 memory 侧计数，标记随截断一并丢弃。越界整体失败不落盘；只清对话层——工具产物文件与技能目录不回滚；前端 user 气泡 hover「⤺ 回滚」、答案 hover「↻ 重新生成」（= 回滚该问题 + 自动重发原文与附件）
-- `GET /api/config` → 配置视图（llm：config.json > env 缺省，key 只回 key_set+尾 4 位；tools 全集+enabled；skills_count）
+- `GET /api/config` → 配置视图（llm：config.json > env 缺省，key 只回 key_set+尾 4 位；tools 三池聚合数组——每项 `{name,enabled,pool:"builtin"|"skill"|"mcp",description,parameters}` 附 `skill`/`mcp_server` 来源字段，前端按 pool 分组渲染：内置平铺，技能/MCP 池按来源折叠分组 + 组头总开关（三态），MCP 组 ready 在前 failed 垫底；`mcp:{servers, declared}`——servers 为运行状态，declared 为 config.json 声明视图（command/cwd + env 各键脱敏为 `key_set`/`key_tail`），key 配置内嵌于前端「MCP 外接」各服务折叠组内（填 Key → 保存仅落盘 → 重启 host 生效）；skills_count；agent 参数视图）
+- `PUT /api/config` → 分段合并落盘 + 热应用：`llm` 逐字段（null 不覆盖，key 热应用 env）；`tools.enabled` 白名单整体替换（configure 热生效）；`agent` 逐字段（null 不覆盖）；`mcp_servers` 按 server 名合并——command/cwd 未传保留原值，env 逐键合并（空串=不动），**仅落盘**（server 子进程生命周期归插件 init/destroy，改后需重启 host）
 - `GET /api/models` → 转发 llm-adapter `models.list`，返回当前 provider 可用模型 id（前端「拉取模型」按钮；配好 base_url/key 后自动填充
  model 下拉；ollama 额外透传 `models_meta` 原生窗口元数据——前端下拉展示 `模型名 · 256k`，Agent 页 `llm_context_tokens` 提示原生窗口并可一键填入）
 - `GET /api/presets` → 转发 llm-adapter `presets.list`，OpenAI 兼容站点预设清单（ModelScope / 硅基流动 / OpenRouter 等，数据源 plugins/llm_adapter/presets.py——前端「站点」下拉一键切换：选站自动填 base_url、per-site key 由 localStorage 记忆带出，保存走 configure 热应用零重启）
-- `PUT /api/config` body `{"llm"?:{...},"tools"?":{"enabled":[...]}}` → 逐项转发 configure op（任一失败 400 不落盘，重启即回滚）；全成落 config.json
 - `GET /api/skills` → assets skills.list（实时目录；R9：合入 `tools_detail`——tools.skill_tools all=true 按 skill 分组的配套工具视图，含未启用项 + enabled 标记，前端技能 tab 就地启停数据源；tools 不可用 → 静默省略）
 - `GET /api/skills/{name}` → `{"ok":true,"name","content"}`（SKILL.md 原文，编辑用）
-- `PUT /api/skills/{name}` body `{"content":SKILL.md全文}` → 写入（frontmatter name 须与目录名一致；名字仅字母数字/_/-）
-- `DELETE /api/skills/{name}` → 删除技能目录
+- `PUT /api/skills/{name}` body `{"content":SKILL.md全文}` → 写入（frontmatter name 须与目录名一致；名字仅字母数字/_/-）；写入自动打标 `origin: user`
+- `DELETE /api/skills/{name}` → 删除技能目录；出厂件（frontmatter 显式 `origin: preset`，预置技能归 git 管理）拒删 K403，缺省视为用户件可删
 
 ## 配置中心与自扩展（08）
 
@@ -220,7 +223,7 @@ e2e：tools(7 工具往返)、memory(append/get/clear/summarize)、llm(mock 脚�
 ## 架构要点（内核约束的落点）
 
 - **agent-loop 必须在 InProcess 域**：Process guest 无 guest→host 回调，跨插件调用只有进程内 `HostApi::call_plugin` 可用（可跨域调 Process 插件）
-- **注册顺序**：memory → llm-adapter → tools → assets → agent-loop。内核 `register` 对「硬依赖无 provider」静默失败（K302），故 host 对每个 provider 先探测再注册编排插件
+- **注册顺序**：memory → llm-adapter → tools → assets → agent-loop（编排依赖序）。装配**并行化**：四 guest 插件 spawn 与探测并发执行（互不依赖），总启动时长 = 最慢单项（如 llm 云端 ping 慢不再拖累其余探测）；probe 带超时护栏（30s，llm 120s）防挂死。内核 `register` 对「硬依赖无 provider」静默失败（K302），故 host 对每个 provider 先探测再注册编排插件。探测失败策略分层：memory/tools 硬依赖失败即退出；llm-adapter **进程存活即依赖就位**，云端 ping 不通仅 warn 降级（chat 时自然报错，web 设置可重配）；assets 本为软依赖
 - **guest api_version 必须 (0,1)**：gRPC 握手要求 guest major==host major 且 guest minor ≥ host minor
 - **配置走环境变量**：内核 Init 不传业务配置，子进程继承宿主 env
 - **循环无跨调用可变态**：ReAct 状态在局部变量 + memory 插件，插件本体 `&self`（A1）；每步转发带 deadline（A2）

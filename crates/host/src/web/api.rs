@@ -219,23 +219,104 @@ pub(super) async fn get_config(stream: &mut TcpStream, kernel: &Kernel) -> anyho
         json!({"key_set": true, "key_tail": tail})
     };
 
-    let tools = match dispatch_or_err(kernel, "tools", json!({"op": "list", "all": true})).await {
-        Ok(v) => v
-            .get("tools")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .map(|t| {
-                        json!({
-                            "name": t.get("name").and_then(Value::as_str).unwrap_or("?"),
-                            "enabled": t.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+    // 工具三池聚合视图（前端按 pool 分组渲染）：内置（list all，mcp__ 前缀除外）+
+    // 技能工具（skill_tools all）+ MCP（mcp_tools）；各项统一 {name,enabled,pool,...}。
+    let mut tools: Vec<Value> = Vec::new();
+    if let Ok(v) = dispatch_or_err(kernel, "tools", json!({"op": "list", "all": true})).await {
+        if let Some(arr) = v.get("tools").and_then(Value::as_array) {
+            for t in arr {
+                let name = t.get("name").and_then(Value::as_str).unwrap_or("?");
+                if name.starts_with("mcp__") {
+                    continue; // MCP 工具走下方 mcp_tools 视图（pool/mcp_server 标注更完整）
+                }
+                tools.push(json!({
+                    "name": name,
+                    "enabled": t.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+                    "pool": "builtin",
+                    "description": t.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": t.get("parameters").cloned().unwrap_or(Value::Null),
+                }));
+            }
+        }
+    }
+    if let Ok(v) = dispatch_or_err(kernel, "tools", json!({"op": "skill_tools", "all": true})).await {
+        if let Some(arr) = v.get("tools").and_then(Value::as_array) {
+            for t in arr {
+                tools.push(json!({
+                    "name": t.get("name").and_then(Value::as_str).unwrap_or("?"),
+                    "enabled": t.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+                    "pool": "skill",
+                    "skill": t.get("skill").cloned().unwrap_or(Value::Null),
+                    "description": t.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": t.get("parameters").cloned().unwrap_or(Value::Null),
+                }));
+            }
+        }
+    }
+    // §八 MCP 区块：servers 状态（状态徽章数据源）；工具项并入上方聚合数组
+    let mut mcp_servers: Value = json!([]);
+    let mcp_decl = cfg.get("mcp_servers").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
+    if let Ok(v) = dispatch_or_err(kernel, "tools", json!({"op": "mcp_tools"})).await {
+        mcp_servers = v.get("servers").cloned().unwrap_or_else(|| json!([]));
+        if let Some(arr) = v.get("tools").and_then(Value::as_array) {
+            for t in arr {
+                tools.push(json!({
+                    "name": t.get("name").and_then(Value::as_str).unwrap_or("?"),
+                    "enabled": t.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+                    "pool": "mcp",
+                    "mcp_server": t.get("server").cloned().unwrap_or(Value::Null),
+                    "description": t.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": t.get("parameters").cloned().unwrap_or(Value::Null),
+                }));
+            }
+        }
+    }
+    // config.json 声明的 mcp_servers（持久配置视图）：回显 command/cwd + env 各键的 key 状态
+    // （key 只回 key_set + 尾 4 位，绝不回明文）。前端按此渲染 API key 输入框。
+    let mcp_decl_view: Vec<Value> = mcp_decl
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .map(|(name, spec)| {
+                    let env = spec.get("env").and_then(Value::as_object).cloned().unwrap_or_default();
+                    let env_view: Vec<Value> = env
+                        .iter()
+                        .map(|(k, v)| {
+                            let s = v.as_str().unwrap_or("");
+                            if s.is_empty() {
+                                json!({"key": k, "key_set": false})
+                            } else {
+                                let tail: String = s.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+                                json!({"key": k, "key_set": true, "key_tail": tail})
+                            }
                         })
+                        .collect();
+                    json!({
+                        "name": name,
+                        "command": spec.get("command").cloned().unwrap_or(Value::Null),
+                        "cwd": spec.get("cwd").cloned().unwrap_or(Value::Null),
+                        "env": env_view,
                     })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
-        Err(_) => vec![],
-    };
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // 状态合并：tools 回显的 servers 状态（ready/failed/...）与声明兜底（未启动前声明即所见）
+    let mut mcp_decl_merge: Vec<Value> = mcp_decl_view;
+    if let Ok(v) = dispatch_or_err(kernel, "tools", json!({"op": "mcp_tools"})).await {
+        if let Some(arr) = v.get("servers").and_then(Value::as_array) {
+            for (_i, decl) in mcp_decl_merge.iter_mut().enumerate() {
+                let name = decl.get("name").and_then(Value::as_str).unwrap_or("");
+                if let Some(st) = arr.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(name)) {
+                    decl["status"] = st.get("status").cloned().unwrap_or(Value::Null);
+                    decl["tools"] = st.get("tools").cloned().unwrap_or(Value::Null);
+                    if let Some(err) = st.get("error") {
+                        decl["error"] = err.clone();
+                    }
+                }
+            }
+        }
+    }
     let skills_count = match dispatch_or_err(kernel, "assets", json!({"op": "skills.list"})).await {
         Ok(v) => v.get("skills").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
         Err(_) => 0,
@@ -248,6 +329,7 @@ pub(super) async fn get_config(stream: &mut TcpStream, kernel: &Kernel) -> anyho
             "config": {
                 "llm": {"provider": provider, "model": model, "base_url": base_url, "ollama_host": ollama_host, "key": key_view},
                 "tools": tools,
+                "mcp": {"servers": mcp_servers, "declared": mcp_decl_merge},
                 "skills_count": skills_count,
                 "agent": agent_config_view(),
             },
@@ -266,8 +348,16 @@ pub(super) async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[
     let llm = req.get("llm").filter(|v| v.is_object());
     let tools = req.get("tools").filter(|v| v.is_object());
     let agent = req.get("agent").filter(|v| v.is_object());
-    if llm.is_none() && tools.is_none() && agent.is_none() {
-        return json_resp(stream, 400, bad_request("body 需含 llm / tools / agent 对象", None)).await;
+    // §八 MCP：仅持久通道（server 子进程生命周期归 tools 插件 init/destroy，无热通道）。
+    // PUT 落盘 config.json mcp_servers，改后需重启 host 生效。
+    let mcp_servers = req.get("mcp_servers").filter(|v| v.is_object());
+    if llm.is_none() && tools.is_none() && agent.is_none() && mcp_servers.is_none() {
+        return json_resp(
+            stream,
+            400,
+            bad_request("body 需含 llm / tools / agent / mcp_servers 对象", None),
+        )
+        .await;
     }
     if let Some(llm) = llm {
         let mut payload = json!({"op": "configure"});
@@ -327,6 +417,44 @@ pub(super) async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[
             }
         }
         cfg["agent"] = cur;
+    }
+    // §八 MCP merge：按 server 名合并声明（command/cwd 未传则保留原值；env 逐键合并，
+    // 前端提交空串环境变量值 = 保持已有 key 不动）。只落盘，重启由持久通道生效。
+    if let Some(mcp) = mcp_servers.and_then(|m| m.as_object().cloned()) {
+        let mut cur = cfg.get("mcp_servers").cloned().unwrap_or_else(|| json!({}));
+        if let Some(obj) = cur.as_object_mut() {
+            for (name, spec) in mcp {
+                let old = obj.get(&name).cloned().unwrap_or_else(|| json!({}));
+                let mut merged = old;
+                if let Some(o) = merged.as_object_mut() {
+                    if let Some(cmd) = spec.get("command") {
+                        if !cmd.is_null() {
+                            o.insert("command".into(), cmd.clone());
+                        }
+                    }
+                    if let Some(cwd) = spec.get("cwd") {
+                        o.insert("cwd".into(), cwd.clone());
+                    }
+                    // env 逐键合并：空串/空对象 = 不修改；有值则覆盖
+                    if let Some(env_add) = spec.get("env").and_then(Value::as_object) {
+                        let env_cur = o.get("env").cloned().unwrap_or_else(|| json!({}));
+                        let mut env = env_cur.as_object().cloned().unwrap_or_default();
+                        for (k, v) in env_add {
+                            if let Some(s) = v.as_str() {
+                                if !s.is_empty() {
+                                    env.insert(k.clone(), json!(s));
+                                }
+                            } else if !v.is_null() {
+                                env.insert(k.clone(), v.clone());
+                            }
+                        }
+                        o.insert("env".into(), json!(env));
+                    }
+                }
+                obj.insert(name, merged);
+            }
+        }
+        cfg["mcp_servers"] = cur;
     }
     match config::persist_config(&cfg) {
         Ok(()) => json_resp(
@@ -415,6 +543,59 @@ fn valid_skill_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// 来源判定：SKILL.md frontmatter 显式 `origin: preset` → 出厂件；缺省/其他 → 用户件
+/// （出厂件必须显式声明——预置技能归 git 管理并打标，存量用户技能缺字段即正确放开）。
+/// 行式解析，与 assets guest 同语义（不引 YAML）。
+fn skill_origin(content: &str) -> &'static str {
+    let Some(rest) = content.strip_prefix("---") else {
+        return "user";
+    };
+    for line in rest.lines() {
+        let t = line.trim();
+        if t == "---" {
+            break;
+        }
+        if let Some(v) = t.strip_prefix("origin:") {
+            return if v.trim() == "preset" { "preset" } else { "user" };
+        }
+    }
+    "user"
+}
+
+/// Phase A：frontmatter 注入 `origin: user`（Web CRUD 写入自动打标，缺省视为出厂件）。
+/// 在闭合 `---` 前插入一行；已有 origin 行则替换其值（幂等）。frontmatter 无闭合围栏时
+/// 原样返回（写入前另有校验拦截）。
+fn tag_origin_user(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.first().map(|l| l.trim()) != Some("---") {
+        return content.to_string();
+    }
+    // 闭合围栏 = 首行之后第一个 `---` 行；其后全部视为正文
+    let Some(close) = lines.iter().skip(1).position(|l| l.trim() == "---").map(|i| i + 1) else {
+        return content.to_string();
+    };
+    let mut head: Vec<String> = lines[1..close].iter().map(|l| l.to_string()).collect();
+    match head.iter().position(|l| l.trim_start().starts_with("origin:")) {
+        Some(i) => head[i] = "origin: user".into(), // 替换旧 origin 行
+        None => head.push("origin: user".into()),
+    }
+    let mut out = String::from("---");
+    for l in &head {
+        out.push('\n');
+        out.push_str(l);
+    }
+    out.push_str("\n---");
+    let tail = lines[close + 1..].join("\n");
+    if !tail.is_empty() {
+        out.push('\n');
+        out.push_str(&tail);
+    }
+    if content.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 /// frontmatter 最小校验：`---` 开头，闭合前含 `name: {name}`（与目录名一致）与非空 `description:`。
 fn skill_frontmatter_ok(content: &str, name: &str) -> Result<(), String> {
     let Some(rest) = content.strip_prefix("---") else {
@@ -466,6 +647,8 @@ pub(super) async fn put_skill(stream: &mut TcpStream, name: &str, body: &[u8]) -
     if let Err(e) = skill_frontmatter_ok(content, name) {
         return json_resp(stream, 400, bad_request(e, Some("content"))).await;
     }
+    // Phase A：Web CRUD 写入自动打标 origin: user（用户件可删；出厂件不经验此通道不改动）
+    let content = tag_origin_user(content);
     let dir = config::skills_dir().join(name);
     let skill_md = dir.join("SKILL.md");
     match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&skill_md, content)) {
@@ -485,6 +668,8 @@ pub(super) async fn put_skill(stream: &mut TcpStream, name: &str, body: &[u8]) -
 }
 
 /// DELETE /api/skills/{name}：删除技能目录（名字约束已杜绝路径注入）。
+/// 删除保护：出厂件（frontmatter 显式 `origin: preset`）拒删——出厂技能归 git
+/// 管理，Web / agent 代删同一 API 同一规则；用户件（含缺省）可删。
 pub(super) async fn delete_skill(stream: &mut TcpStream, name: &str) -> anyhow::Result<()> {
     if !valid_skill_name(name) {
         return json_resp(stream, 400, bad_request("非法技能名（仅字母数字/_/-，≤64 字符）", Some("name"))).await;
@@ -495,6 +680,19 @@ pub(super) async fn delete_skill(stream: &mut TcpStream, name: &str) -> anyhow::
             stream,
             404,
             json!({"ok": false, "error": {"code": "K404", "message": format!("技能不存在: {name}")}}),
+        )
+        .await;
+    }
+    let origin = match std::fs::read_to_string(dir.join("SKILL.md")) {
+        Ok(c) => skill_origin(&c),
+        Err(_) => "preset", // 读不到 SKILL.md 无法证明是用户件，按出厂件保护（fail-closed）
+    };
+    if origin != "user" {
+        return json_resp(
+            stream,
+            400,
+            json!({"ok": false, "error": {"code": "K400", "field": "origin",
+                "message": format!("技能 '{name}' 为出厂件（origin=preset），不可删除；如需定制请复制为用户技能")}}),
         )
         .await;
     }
@@ -618,6 +816,33 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    #[test]
+    fn skill_origin_and_tag_user() {
+        // 来源判定——显式 preset / 缺省 user / 非法值 user / 无 frontmatter user
+        let user_md = "---\nname: a\ndescription: d\norigin: user\n---\nbody";
+        let preset_md = "---\nname: a\ndescription: d\norigin: preset\n---\nbody";
+        assert_eq!(skill_origin(user_md), "user");
+        assert_eq!(skill_origin(preset_md), "preset");
+        assert_eq!(skill_origin("---\nname: a\ndescription: d\n---\n"), "user");
+        assert_eq!(skill_origin("no frontmatter"), "user");
+
+        // 打标：缺 origin → 闭合围栏前插入；已有 origin → 替换；无围栏 → 原样
+        let tagged = tag_origin_user(preset_md);
+        assert_eq!(skill_origin(&tagged), "user");
+        assert!(tagged.contains("description: d\norigin: user\n---"));
+        assert!(tagged.ends_with("body"));
+        let retagged = tag_origin_user(user_md);
+        assert_eq!(retagged.matches("origin").count(), 1, "重复打标幂等（旧行被替换）");
+        assert_eq!(tag_origin_user("no fence"), "no fence");
+
+        // 打标后正文不被复制/丢失
+        let md_with_body = "---\nname: a\ndescription: d\n---\n\n# H\n\ntext\n";
+        let t = tag_origin_user(md_with_body);
+        assert_eq!(t.matches("# H").count(), 1);
+        assert!(t.starts_with("---\nname: a\n"));
+        assert!(t.ends_with("text\n"));
     }
 
     #[test]

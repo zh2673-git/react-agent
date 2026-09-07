@@ -761,7 +761,7 @@ async function api(method, url, body) {
   return v;
 }
 
-let cfgTools = [];
+let cfgTools = [], cfgMcp = { servers: [], tools: [] };
 async function loadConfig() {
   try {
     await loadPresets(); // 站点清单就绪后再回显，base_url 反查预设
@@ -781,6 +781,9 @@ async function loadConfig() {
     $("llm-key").placeholder = c.llm.key?.key_set ? `已设置（尾号 ${c.llm.key.key_tail}，留空不修改）` : "未设置";
     if (sitePresets.length && c.llm.provider === "openai") { $("llm-site").value = curSiteId(); updateSiteLink(curSiteId()); }
     cfgTools = c.tools ?? [];
+    cfgMcp = c.mcp ?? { servers: [], tools: [] };
+    if (!$("tab-tools").hidden) renderTools(); // 工具 tab 可见时回填（覆盖 fetch 完成晚于 tab 切换的时序）
+    // （MCP key 配置已移入「MCP 外接」各服务组内，随 renderTools 渲染）
     syncLlmFields();
     const a = c.agent ?? {};
     for (const [id, v] of [
@@ -963,20 +966,156 @@ $("llm-save").onclick = async () => {
     fetchModels();
   } catch (e) { flash("llm-flash", false, e.message); }
 };
+// 工具三池分组元数据（pool → 组标题/说明）；条目点击折叠展开配置详情
+const POOL_META = {
+  builtin: { label: "内置工具", hint: "" },
+  skill: { label: "技能工具", hint: "随技能装载（tools.json 声明）——装载 ≠ 启用" },
+  mcp: { label: "MCP 外接", hint: "展开各服务组：勾选启用工具、填写 API Key（保存落盘，重启 host 生效）" },
+};
+function paramSummary(p) {
+  if (!p || typeof p !== "object") return "";
+  const props = p.properties;
+  if (!props || typeof props !== "object") return "";
+  const lines = Object.entries(props).map(([k, v]) => {
+    const t = v && v.type ? v.type : "?";
+    const d = v && v.description ? ` — ${v.description}` : "";
+    return `${k} (${t})${d}`;
+  });
+  return lines.length ? lines.join("\n") : "（无参数）";
+}
 function renderTools() {
   const box = $("tools-list"); box.innerHTML = "";
   if (!cfgTools.length) { box.innerHTML = '<div class="empty">（工具池为空或 tools 不可用）</div>'; return; }
-  for (const t of cfgTools) {
-    box.appendChild(el(`<label class="toolitem"><input type="checkbox" ${t.enabled ? "checked" : ""}><span class="name">${esc(t.name)}</span></label>`));
+  const groups = { builtin: [], skill: [], mcp: [] };
+  for (const t of cfgTools) (groups[t.pool] ?? groups.builtin).push(t);
+  for (const pool of ["builtin", "skill", "mcp"]) {
+    const items = groups[pool];
+    if (!items.length && !(pool === "mcp" && (cfgMcp.servers ?? []).length)) continue; // MCP 池：声明了 server（即使装载失败 0 工具）也要可见
+    const meta = POOL_META[pool];
+    // 池级折叠：poolhead 本身可点击收起/展开整池（默认展开）
+    const phead = el(`<div class="poolhead collapsible"><span class="chev">▾</span><span class="plabel">${meta.label}</span><span class="pcnt">${items.length}</span></div>`);
+    const pbody = el(`<div class="poolbody"></div>`);
+    phead.onclick = () => {
+      pbody.hidden = !pbody.hidden;
+      phead.querySelector(".chev").textContent = pbody.hidden ? "▸" : "▾";
+      phead.classList.toggle("closed", pbody.hidden);
+    };
+    box.appendChild(phead);
+    box.appendChild(pbody);
+    if (meta.hint) pbody.appendChild(el(`<div class="poolhint">${meta.hint}</div>`));
+    if (pool === "builtin") {
+      // 内置 9 件：少而稳定，平铺
+      for (const t of items) appendToolRow(pbody, t, "");
+      continue;
+    }
+    // 技能/MCP 池：按来源折叠分组（默认收起），组头 = 来源名 + 计数 +（MCP）状态灯 + 总开关
+    const key = pool === "skill" ? "skill" : "mcp_server";
+    const order = new Map();
+    if (pool === "mcp") {
+      // server 排序：ready 在前、其余按名稳定排；failed 垫底（故障一眼可见）
+      const rank = { ready: 0, starting: 1, stopped: 1, failed: 2 };
+      (cfgMcp.servers ?? []).forEach((s) => order.set(s.name, s));
+      items.sort((a, b) => ((rank[order.get(a[key])?.status] ?? 1) - (rank[order.get(b[key])?.status] ?? 1)) || a[key].localeCompare(b[key]));
+    } else {
+      items.sort((a, b) => (a[key] ?? "").localeCompare(b[key] ?? ""));
+    }
+    const bySrc = new Map();
+    for (const t of items) { const k = t[key] ?? "?"; (bySrc.get(k) ?? bySrc.set(k, []).get(k)).push(t); }
+    if (pool === "mcp") {
+      // 装载失败/0 工具的声明 server 也要可见（否则用户无从发现该去填 key）
+      for (const s of cfgMcp.servers ?? []) if (!bySrc.has(s.name)) bySrc.set(s.name, []);
+    }
+    for (const [src, list] of bySrc) {
+      const st = order.get(src);
+      const stHtml = pool === "mcp" && st
+        ? `<span class="mcp-status st-${esc(st.status)}" ${st.status === "failed" && st.error ? `title="${esc(st.error)}"` : ""}>${esc(st.status)}</span>`
+        : "";
+      const head = el(`<div class="tghead"><input type="checkbox" title="全启/全停该组工具"><span class="tname">${esc(src)}</span><span class="pcnt">${list.length}</span>${stHtml}<span class="chev">▸</span></div>`);
+      const body = el(`<div class="tgbody" hidden></div>`);
+      for (const t of list) appendToolRow(body, t, pool === "skill" ? "" : `<span class="badge b-skill" title="MCP server：${esc(src)}">mcp</span>`);
+      if (pool === "mcp" && !list.length) body.appendChild(el(`<div class="empty">0 工具装载——${esc(st?.error || st?.status || "未连接")}；下方填好 Key 保存后重启 host 重试</div>`));
+      // MCP 服务配置区（组内）：env key 输入 + 独立保存（仅落盘，重启 host 生效）
+      if (pool === "mcp") {
+        const decl = (cfgMcp.declared ?? []).find((d) => d.name === src);
+        if (decl && (decl.env ?? []).length) {
+          const cfgBox = el(`<div class="tgcfg"><div class="tgcfg-title">服务配置（Key 保存仅落盘，需重启 host 生效）</div></div>`);
+          for (const e of decl.env) {
+            cfgBox.appendChild(el(`<div class="field"><label>${esc(e.key)}</label><input type="password" autocomplete="off" data-k="${esc(e.key)}" placeholder="${e.key_set ? `已设置（尾号 ${esc(e.key_tail ?? "")}，留空不修改）` : "未设置"}"></div>`));
+          }
+          const srow = el(`<div class="row"><button class="btn">保存 Key</button><span class="flash"></span></div>`);
+          const sflash = srow.querySelector(".flash");
+          srow.querySelector("button").onclick = async (e) => {
+            e.stopPropagation();
+            const env = {};
+            for (const inp of cfgBox.querySelectorAll("input[data-k]")) {
+              const v = inp.value.trim();
+              if (v) { env[inp.dataset.k] = v; inp.value = ""; }
+            }
+            if (!Object.keys(env).length) { sflash.textContent = "无修改（留空 = 不覆盖）"; sflash.className = "flash err"; return; }
+            try {
+              await api("PUT", "/api/config", { mcp_servers: { [src]: { env } } });
+              sflash.textContent = "已保存，重启 host 生效"; sflash.className = "flash ok";
+            } catch (err) { sflash.textContent = err.message; sflash.className = "flash err"; }
+          };
+          cfgBox.appendChild(srow);
+          body.appendChild(cfgBox);
+        }
+      }
+      // 总开关三态：all / none / partial(indeterminate)；组内勾选变化实时回写
+      const syncHead = () => {
+        const boxes = [...body.querySelectorAll(".toolitem input")];
+        const on = boxes.filter((b) => b.checked).length;
+        head.querySelector("input").checked = on > 0 && on === boxes.length;
+        head.querySelector("input").indeterminate = on > 0 && on < boxes.length;
+      };
+      head.querySelector("input").onclick = (e) => {
+        e.stopPropagation();
+        const on = head.querySelector("input").checked;
+        body.querySelectorAll(".toolitem input").forEach((b) => { b.checked = on; });
+        syncHead();
+      };
+      body.addEventListener("change", syncHead);
+      head.onclick = (e) => {
+        e.stopPropagation(); // 组头点击不冒泡到池级折叠
+        if (e.target.tagName === "INPUT") return;
+        body.hidden = !body.hidden;
+        head.querySelector(".chev").textContent = body.hidden ? "▸" : "▾";
+        head.classList.toggle("open", !body.hidden);
+      };
+      syncHead();
+      pbody.appendChild(head);
+      pbody.appendChild(body);
+    }
   }
+}
+function appendToolRow(box, t, src) {
+  const params = paramSummary(t.parameters);
+  const row = el(`<div class="toolitem"><input type="checkbox" ${t.enabled ? "checked" : ""}><span class="name">${esc(t.name)}</span>${src}<span class="chev">▸</span></div>`);
+  const detail = (t.description || params)
+    ? el(`<div class="tooldetail" hidden><div class="tdesc">${esc(t.description ?? "")}</div>${params ? `<pre class="tparams">${esc(params)}</pre>` : ""}</div>`)
+    : null;
+  row.onclick = (e) => {
+    if (e.target.tagName === "INPUT") return; // 勾选不触发折叠
+    if (!detail) return;
+    const open = detail.hidden;
+    detail.hidden = !open;
+    row.querySelector(".chev").textContent = open ? "▾" : "▸";
+    row.classList.toggle("open", open);
+  };
+  box.appendChild(row);
+  if (detail) box.appendChild(detail);
 }
 const toolsTabObserver = new MutationObserver(() => { if (!$("tab-tools").hidden) renderTools(); });
 toolsTabObserver.observe($("tab-tools"), { attributes: true, attributeFilter: ["hidden"] });
 $("tools-save").onclick = async () => {
-  const enabled = [...document.querySelectorAll("#tools-list input:checked")].map((i) => i.closest(".toolitem").querySelector(".name").textContent);
+  // 整体替换白名单：三池条目已统一渲染于 #tools-list，勾选合并提交
+  // 注意选择器限定 .toolitem——折叠组头也有 checkbox（总开关），不能混入
+  // MCP key 保存已移入各服务组内独立按钮（tools-save 只管白名单）
+  const enabled = [...document.querySelectorAll("#tools-list .toolitem input:checked")].map((i) => i.closest(".toolitem").querySelector(".name").textContent);
+  const body = { tools: { enabled } };
   try {
-    await api("PUT", "/api/config", { tools: { enabled } });
-    flash("tools-flash", true, "白名单已更新");
+    await api("PUT", "/api/config", body);
+    flash("tools-flash", true, "已保存，白名单热生效");
     await loadConfig();
   } catch (e) { flash("tools-flash", false, e.message); }
 };
@@ -1012,7 +1151,10 @@ function renderSkills() {
   const box = $("skills-list"); box.innerHTML = "";
   if (!skillsCache.length) box.innerHTML = '<div class="empty">（暂无技能）</div>';
   for (const s of skillsCache) {
-    const item = el(`<div class="skillitem"><span class="name">${esc(s.name)}</span><span class="desc">${esc(s.description ?? "")}</span><span class="rev" title="在文件管理器中打开技能目录">📂</span></div>`);
+    // 来源徽章：origin=preset 出厂（删除保护）/ 缺省 user 用户；老数据缺 origin 按 user 显示
+    const isUser = s.origin !== "preset";
+    const badge = `<span class="badge ${isUser ? "b-user" : "b-preset"}" title="${isUser ? "用户技能（可删除）" : "出厂技能（删除保护）"}">${isUser ? "用户" : "内置"}</span>`;
+    const item = el(`<div class="skillitem"><span class="name">${esc(s.name)}</span>${badge}<span class="desc">${esc(s.description ?? "")}</span><span class="rev" title="在文件管理器中打开技能目录">📂</span></div>`);
     item.onclick = () => openSkill(s.name);
     item.querySelector(".rev").onclick = (e) => { e.stopPropagation(); reveal("skill", s.name, "skill-flash"); };
     box.appendChild(item);
@@ -1128,33 +1270,100 @@ function filterArtifactsByAnswer(answer) {
   for (const c of turnArtifacts) if (!kept.includes(c)) c.remove();
   turnArtifacts = kept;
 }
+// ── Monaco 代码预览（W11）：本地 vendor → CDN → 纯文本 三级链 ──
+// 先探测 loader.js 可达性（GET，仅 ~10KB）再注入，保证同页只加载一个 AMD loader，
+// 规避双 loader 注册表互踩；editor.main 装载失败则调用方退回纯文本兜底。
+const MONACO_LANGS = { js: "javascript", ts: "typescript", py: "python", rs: "rust", css: "css", xml: "xml", yml: "yaml", yaml: "yaml", json: "json", csv: "plaintext", txt: "plaintext", log: "plaintext" };
+let monacoReady = null, previewEditor = null;
+function disposePreviewEditor() { if (previewEditor) { try { previewEditor.dispose(); } catch {} previewEditor = null; } }
+function tryMonacoBase(base) {
+  // 探测 + 注入：fetch loader.js（CDN 需 CORS，jsdelivr 支持；本地同源无碍）
+  return fetch(base + "/loader.js", { cache: "no-store" })
+    .then((r) => (r.ok ? new Promise((resolve) => {
+      const s = document.createElement("script");
+      s.src = base + "/loader.js";
+      s.onload = () => { try { require.config({ paths: { vs: base } }); require(["vs/editor/editor.main"], () => resolve(true), () => resolve(false)); } catch { resolve(false); } };
+      s.onerror = () => resolve(false);
+      document.head.appendChild(s);
+    }) : false))
+    .catch(() => false);
+}
+function ensureMonaco() {
+  if (monacoReady) return monacoReady;
+  monacoReady = (async () => {
+    // 一级：本地 vendor（同源）；二级：CDN 回退。两种基座统一用「绝对 baseUrl + blob 代理
+    // worker」——tsWorker 等 labored worker 在 worker 作用域内解析相对 URL 会炸
+    // （Failed to parse URL），绝对地址是官方推荐写法。
+    const base = (await tryMonacoBase("vendor/monaco/vs")) ? "vendor/monaco/vs"
+      : ((await tryMonacoBase("https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs")) ? "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs" : null);
+    if (base) {
+      const abs = new URL(base, location.href).href.replace(/\/$/, "");
+      // MonacoEnvironment.baseUrl 指向 vs/ 的父目录（模块 id 自带 vs/ 前缀），别多带一层
+      const absRoot = abs.replace(/\/vs$/, "");
+      window.MonacoEnvironment = {
+        getWorkerUrl: () => URL.createObjectURL(new Blob(
+          [`self.MonacoEnvironment={baseUrl:'${absRoot}/'};importScripts('${abs}/base/worker/workerMain.js');`],
+          { type: "text/javascript" })),
+      };
+      return true;
+    }
+    return false; // 三级：调用方退回纯文本
+  })();
+  return monacoReady;
+}
+function ensurePreviewOverlay() {
+  let overlay = $("file-preview");
+  if (!overlay) {
+    overlay = el(`<div id="file-preview" class="fp-overlay"><div class="fp-box"><div class="fp-head"><span class="fp-name"></span><button class="btn ghost fp-close">关闭</button></div><div class="fp-body"></div></div></div>`);
+    document.body.appendChild(overlay);
+    overlay.onclick = (e) => { if (e.target === overlay) { disposePreviewEditor(); overlay.style.display = "none"; } };
+    overlay.querySelector(".fp-close").onclick = () => { disposePreviewEditor(); overlay.style.display = "none"; };
+  }
+  return overlay;
+}
 async function previewTextFile(path, ext) {
   try {
     const r = await fetch(filesUrl(path));
     if (!r.ok) throw new Error("HTTP " + r.status);
     const text = await r.text();
-    let overlay = $("file-preview");
-    if (!overlay) {
-      overlay = el(`<div id="file-preview" class="fp-overlay"><div class="fp-box"><div class="fp-head"><span class="fp-name"></span><button class="btn ghost fp-close">关闭</button></div><div class="fp-body"></div></div></div>`);
-      document.body.appendChild(overlay);
-      overlay.onclick = (e) => { if (e.target === overlay) overlay.style.display = "none"; };
-      overlay.querySelector(".fp-close").onclick = () => overlay.style.display = "none";
-    }
+    const overlay = ensurePreviewOverlay();
     overlay.querySelector(".fp-name").textContent = path;
     const body = overlay.querySelector(".fp-body");
-    body.innerHTML = ext === "md" || ext === "markdown" ? md(text) : `<pre>${esc(text)}</pre>`;
+    disposePreviewEditor();
+    if (ext === "md" || ext === "markdown") {
+      body.innerHTML = md(text);
+    } else if (await ensureMonaco()) {
+      body.innerHTML = `<div id="fp-monaco" style="height:100%"></div>`;
+      previewEditor = monaco.editor.create($("fp-monaco"), {
+        value: text, language: MONACO_LANGS[ext] || "plaintext", readOnly: true,
+        minimap: { enabled: false }, automaticLayout: true, fontSize: 13, scrollBeyondLastLine: false,
+      });
+    } else {
+      body.innerHTML = `<pre>${esc(text)}</pre>`;
+    }
     overlay.style.display = "flex";
   } catch (e) { setStatus("文件预览失败: " + e.message); }
 }
 
 async function openSkill(name) {
+  // toggle：再点当前已展开的技能条目 → 收起编辑器
+  if (curSkill === name && !$("skill-editor").hidden) {
+    $("skill-editor").hidden = true;
+    curSkill = null;
+    flash("skill-flash", true, "已收起 " + name);
+    return;
+  }
   try {
     const v = await api("GET", "/api/skills/" + encodeURIComponent(name));
     curSkill = name;
     $("skill-editor").hidden = false;
     $("skill-name").value = name; $("skill-name").readOnly = true;
     $("skill-content").value = v.content ?? "";
+    // 来源删除保护：出厂件（origin=preset）删除置灰（后端仍有一道保护，此处仅 UI 提示）
+    const isUser = (skillsCache.find((x) => x.name === name)?.origin ?? "user") === "user";
     $("skill-del").hidden = false;
+    $("skill-del").disabled = !isUser;
+    $("skill-del").title = isUser ? "删除该用户技能" : "出厂技能不可删除（origin=preset）";
     flash("skill-flash", true, "已加载 " + name);
   } catch (e) { flash("skill-flash", false, e.message); }
 }
@@ -1172,8 +1381,9 @@ $("skill-new").onclick = () => {
   curSkill = null;
   $("skill-editor").hidden = false;
   $("skill-name").value = ""; $("skill-name").readOnly = false;
-  $("skill-content").value = "---\nname: \ndescription: \n---\n\n# 何时使用\n…\n\n# 执行指引\n…";
+  $("skill-content").value = "---\nname: \ndescription: \norigin: user\n---\n\n# 何时使用\n…\n\n# 执行指引\n…";
   $("skill-del").hidden = true;
+  $("skill-del").disabled = false;
   $("skill-name").focus();
 };
 $("skill-save").onclick = async () => {

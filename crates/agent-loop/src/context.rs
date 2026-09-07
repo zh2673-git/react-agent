@@ -124,7 +124,7 @@ fn retrim_tool_results(msgs: &mut [MemoryMsg], limit: usize) {
         if m.role == "tool" {
             if let Some(c) = m.content.as_deref() {
                 if c.chars().count() > limit {
-                    m.content = Some(crate::truncate_chars(c, limit));
+                    m.content = Some(crate::tools_exec::truncate_chars(c, limit));
                 }
             }
         }

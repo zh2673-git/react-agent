@@ -1,6 +1,7 @@
 ---
 name: web-research
 description: Guide for researching topics on the web with web_search/web_read - multi-source cross-checking, CN/global engine selection, and citation discipline. No extra runtimes required.
+origin: preset
 ---
 
 # Web Research

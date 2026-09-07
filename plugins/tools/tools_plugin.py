@@ -29,9 +29,21 @@
 命令执行协议（语言无关）：技能工具被 call 时起**子进程**执行 exec.cmd——
   stdin 收 {"args":{...}}；stdout 回 {"ok":true,"result":...} | {"ok":false,"error":{...}}
   （与 Wire 契约同形，任何语言 JSON 序列化即可实现工具）；cwd 缺省技能目录；
-  受 SKILL_TOOL_TIMEOUT_SECS（缺省 60s）约束（超时杀进程）；执行体与插件进程隔离。
+  超时：exec.timeout_secs（可选正数）按工具覆盖全局 SKILL_TOOL_TIMEOUT_SECS（缺省 60s），
+  超时杀进程；执行体与插件进程隔离。
 
-工具实现位于 tools/ 包（files / bash / web / grep，按运行时关注点分文件）；
+MCP 工具（§八，stdio 传输第三池）：MCP_SERVERS env JSON {"name":{"command":[...],"cwd"?,"env"?}}
+  → 启动时逐台连接（fail-closed per server：握手/枚举失败跳过不阻断）。命名空间
+  `mcp__{server}__{tool}`（非法字符 sanitize，重名/超限跳过）；inputSchema 即 parameters 透传。
+  {"op":"mcp_tools"} → {"ok":true,"servers":[{name,status,tools,error?}],"tools":[{name,description,server,enabled}]}
+                                                 配置视图（host 工具 tab MCP 区块数据源）。
+  装载 ≠ 启用：MCP 工具进池不进白名单，经 configure/设置面板显式启用后常驻全会话可见
+  （不绑技能，无 load_skill 前置）——list 对外契约含**已启用** MCP 工具，清单注入
+  agent-loop 零改动。调用 = JSON-RPC tools/call，content[] 文本拼接回 {"ok":true,"result"}；
+  isError=true / 远端错误 / 超时 / 崩溃 → 字段级错误（崩溃按 5s 退避窗口重启）。
+  超时复用 SKILL_TOOL_TIMEOUT_SECS。server 随插件 destroy 逆序回收。
+
+工具实现位于 tools/ 包（files / bash / web / grep / symbols / mcp，按运行时关注点分文件）；
 本文件只做：init 装配 scope → list 过滤 → call 校验分发 → ToolError 转字段级错误。
 
 scope：TOOLS_ENABLED=read_file,bash（白名单；未列出的工具 Schema 与实现双不可见）。
@@ -52,12 +64,30 @@ from tools import ToolError
 from tools import bash as bash_mod
 from tools import files as files_mod
 from tools import grep as grep_mod
+from tools import mcp as mcp_mod
 from tools import web as web_mod
 
-ALL_TOOLS: dict = {**files_mod.TOOLS, **bash_mod.TOOLS, **web_mod.TOOLS, **grep_mod.TOOLS}
+# v4 第 9 件（symbols_search）：依赖 tree-sitter-language-pack（pin <1.0）。依赖缺失时
+# 跳过装载（fail-closed）——插件与其余 8 件正常，仅 symbols_search 不注册。
+try:
+    from tools import symbols as symbols_mod
+except ImportError as _exc:  # pragma: no cover - 缺依赖环境
+    symbols_mod = None
+    print(f"[tools] symbols_search 未装载（缺依赖）: {_exc}", file=sys.stderr)
+
+_ALL: dict = {**files_mod.TOOLS, **bash_mod.TOOLS, **web_mod.TOOLS, **grep_mod.TOOLS}
+if symbols_mod is not None:
+    _ALL = {**_ALL, **symbols_mod.TOOLS}
+ALL_TOOLS: dict = _ALL
 _ENABLED: set[str] = set()
 # L2 动态装载：按模块分表保留（某模块 reload 失败时其旧工具原样保留——fail-closed）
 _EXTRA_BY_MODULE: dict[str, dict] = {}
+
+# §八 MCP 第三池：name(全限定 mcp__server__tool) → {name,description,parameters,server,remote}。
+# 装载 ≠ 启用：进池不进白名单；启用后常驻全会话可见（不绑技能）。失败 server 记 _MCP_FAILED。
+_MCP_TOOLS: dict = {}
+_MCP_SERVERS: dict = {}
+_MCP_FAILED: dict = {}
 
 # R9 技能工具池（命令通道）：name → {"name","description","parameters","exec","skill","dir"}
 # 装载 ≠ 启用 ≠ 可见（三层作用域）：进池不可调用、不进 list；启用走 configure/config.json；
@@ -67,8 +97,9 @@ _SKILL_TOOLS: dict = {}
 # 内置启动校验不再对非内置名 SystemExit，改为挂起——install 同名工具时自动转入启用集。
 _DEFERRED_ENABLED: set[str] = set()
 
-# reload 时跳过的内置模块名（重入 sys.modules 清理无意义，且防止测试/误删内置实现）
-_BUILTIN_MODULES = frozenset({"files", "bash", "web", "grep"})
+# reload 时跳过的内置模块名（重入 sys.modules 清理无意义，且防止测试/误删内置实现；
+# mcp 是传输模块无 TOOLS dict，列入防 reload 误扫）
+_BUILTIN_MODULES = frozenset({"files", "bash", "web", "grep", "symbols", "mcp"})
 # 动态工具条目必须暴露的键（与内置 ToolSpec 三元组同规范：dict 键即 name，不要求冗余键）
 _REQUIRED_KEYS = ("description", "parameters", "run")
 
@@ -79,15 +110,16 @@ _SKILL_TOOL_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 def _parse_enabled() -> set[str]:
     raw = (os.environ.get("TOOLS_ENABLED") or "").strip()
     if not raw:
-        return set(ALL_TOOLS)
+        return set(ALL_TOOLS)  # 缺省白名单 = 内置全集；MCP/技能工具不自动启用（人工闸）
     names = {n.strip() for n in raw.split(",") if n.strip()}
-    unknown = names - set(ALL_TOOLS)
+    known = set(ALL_TOOLS) | set(_MCP_TOOLS)
+    unknown = names - known
     if unknown:
         # R9：非内置名不再启动失败——技能工具经 install 装载后才存在，持久化启用授权
         # （config.json tools.enabled）先于装载到达 → 延迟到 install 同名工具时生效。
         _DEFERRED_ENABLED.update(unknown)
         print(f"[tools] TOOLS_ENABLED 含未装载工具（延迟启用，待 install）: {sorted(unknown)}", file=sys.stderr)
-    return names & set(ALL_TOOLS)
+    return names & known
 
 
 def _pool() -> dict:
@@ -124,6 +156,72 @@ def _skill_tool_timeout() -> float:
     except ValueError:
         return 60.0
     return v if v > 0 else 60.0
+
+
+# ── §八：MCP 第三池装配（stdio 传输，协议见 tools/mcp.py） ──────────────────────
+
+def _mcp_sanitize(s: str) -> str:
+    """命名空间片段净化：非法字符 → '_'（全限定名再过 _SKILL_TOOL_NAME_RE 终检）。"""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", s)
+
+
+def _register_mcp_tools(server_name: str, items: list) -> None:
+    """server 枚举结果 → 全限定名入池。非法/重名/超限跳过（单工具失败不阻断）。"""
+    sname = _mcp_sanitize(server_name)
+    for t in items:
+        remote = t.get("name") if isinstance(t, dict) else None
+        if not isinstance(remote, str) or not remote.strip():
+            print(f"[tools] MCP server '{server_name}' 含无名工具条目，跳过", file=sys.stderr)
+            continue
+        fq = f"mcp__{sname}__{_mcp_sanitize(remote.strip())}"
+        if not _SKILL_TOOL_NAME_RE.fullmatch(fq):
+            print(f"[tools] MCP 工具全限定名超限/非法，跳过: {fq}", file=sys.stderr)
+            continue
+        if fq in _MCP_TOOLS or fq in ALL_TOOLS:
+            print(f"[tools] MCP 工具名冲突，跳过: {fq}", file=sys.stderr)
+            continue
+        params = t.get("inputSchema") if isinstance(t, dict) else None
+        desc = t.get("description") if isinstance(t, dict) else None
+        _MCP_TOOLS[fq] = {
+            "name": fq,
+            "description": str(desc) if desc else f"MCP tool '{remote}' (server {server_name})",
+            "parameters": params if isinstance(params, dict) else {"type": "object", "properties": {}},
+            "server": server_name,
+            "remote": remote.strip(),
+        }
+
+
+def _init_mcp() -> None:
+    """MCP_SERVERS env → 逐台连接 + 枚举工具入池。fail-closed per server：任一失败跳过，
+    不影响其余 server 与内置池（与 reload 纪律一致）。"""
+    raw = (os.environ.get("MCP_SERVERS") or "").strip()
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        print(f"[tools] MCP_SERVERS 非法 JSON，MCP 不装载: {exc}", file=sys.stderr)
+        return
+    if not isinstance(data, dict) or not data:
+        print("[tools] MCP_SERVERS 须为非空 JSON 对象，MCP 不装载", file=sys.stderr)
+        return
+    for raw_name, spec in data.items():
+        name = str(raw_name)
+        if not isinstance(spec, dict) or not isinstance(spec.get("command"), list) or not spec["command"]:
+            print(f"[tools] MCP server '{name}' 声明非法（需非空 command 数组），跳过", file=sys.stderr)
+            continue
+        server = mcp_mod.McpServer(name, spec)
+        try:
+            server.start()
+            items = server.list_tools(timeout=30.0)
+        except Exception as exc:  # noqa: BLE001 - 单 server 失败跳过（fail-closed）
+            server.stop()
+            _MCP_FAILED[name] = f"{type(exc).__name__}: {exc}"
+            print(f"[tools] MCP server '{name}' 连接失败，跳过: {exc}", file=sys.stderr)
+            continue
+        _MCP_SERVERS[name] = server
+        _register_mcp_tools(name, items)
+        print(f"[tools] MCP server '{name}' 就绪（{sum(1 for e in _MCP_TOOLS.values() if e['server'] == name)} 件工具）", file=sys.stderr)
 
 
 def _err(message: str, code: str = "TOOL_ERROR", field: str | None = None) -> dict:
@@ -167,10 +265,11 @@ def _reload_modules() -> tuple[list[str], list[str], list[dict]]:
 
 class ToolsPlugin:
     def manifest(self) -> dict:
-        return {"id": "tools", "version": "0.3.0", "api_version": "0.1"}
+        return {"id": "tools", "version": "0.5.0", "api_version": "0.1"}
 
     def init(self, config) -> None:
         global _ENABLED
+        _init_mcp()  # §八：MCP 第三池先于启用闸解析（TOOLS_ENABLED 内的 mcp__ 名即可识别）
         _ENABLED = _parse_enabled()
         os.environ.setdefault("WORKSPACE_ROOT", os.getcwd())
 
@@ -190,11 +289,26 @@ class ToolsPlugin:
                 for name, spec in pool.items()
                 if show_all or name in _ENABLED
             ]
+            # §八 MCP 第三池：已启用工具常驻 list（全会话可见，agent-loop 清单注入零改动）；
+            # all=true 视图附 enabled 与 mcp_server（host 配置视图按 mcp_tools op 取，勿混内置 tab）
+            for name, e in _MCP_TOOLS.items():
+                if show_all or name in _ENABLED:
+                    tools.append(
+                        {
+                            "name": name,
+                            "description": e["description"],
+                            "parameters": e["parameters"],
+                            "mcp_server": e["server"],
+                            **({"enabled": name in _ENABLED} if show_all else {}),
+                        }
+                    )
             return {"ok": True, "tools": tools}
         if op == "call":
             return self._call(payload)
         if op == "configure":
             return self._configure(payload)
+        if op == "mcp_tools":
+            return self._mcp_tools_view(payload)
         if op == "reload":
             loaded, added, skipped = _reload_modules()
             return {"ok": True, "loaded": loaded, "added": added, "skipped": skipped,
@@ -211,11 +325,11 @@ class ToolsPlugin:
         if not isinstance(names, list) or not names or not all(isinstance(n, str) and n.strip() for n in names):
             return _err("enabled 必须是非空字符串数组", code="K400", field="enabled")
         uniq = {n.strip() for n in names}
-        # R9：合法值 = 内置/动态池 ∪ 技能工具池（启用闸对两通道一致）
-        unknown = uniq - set(_pool()) - set(_SKILL_TOOLS)
+        # R9：合法值 = 内置/动态池 ∪ 技能工具池 ∪ MCP 池（启用闸对三通道一致）
+        unknown = uniq - set(_pool()) - set(_SKILL_TOOLS) - set(_MCP_TOOLS)
         if unknown:
             return _err(
-                f"未知工具: {sorted(unknown)}（合法值: {sorted(_pool()) + sorted(_SKILL_TOOLS)}）",
+                f"未知工具: {sorted(unknown)}（合法值: {sorted(_pool()) + sorted(_SKILL_TOOLS) + sorted(_MCP_TOOLS)}）",
                 code="K400",
                 field="enabled",
             )
@@ -298,6 +412,12 @@ class ToolsPlugin:
             cwd_raw = exec_.get("cwd")
             if cwd_raw is not None and (not isinstance(cwd_raw, str) or not cwd_raw.strip()):
                 raise ToolError("exec.cwd 必须是非空字符串（相对技能目录）")
+            # T0：可选 timeout_secs（正数）——按工具覆盖全局 SKILL_TOOL_TIMEOUT_SECS
+            timeout_secs = exec_.get("timeout_secs")
+            if timeout_secs is not None and (
+                isinstance(timeout_secs, bool) or not isinstance(timeout_secs, (int, float)) or timeout_secs <= 0
+            ):
+                raise ToolError("exec.timeout_secs 必须是正数（秒）")
             if not isinstance(item["parameters"], dict):
                 raise ToolError("parameters 必须是 JSON Schema 对象")
             if not isinstance(item["description"], str) or not item["description"].strip():
@@ -306,7 +426,7 @@ class ToolsPlugin:
                 "name": name,
                 "description": item["description"],
                 "parameters": item["parameters"],
-                "exec": {"cmd": [str(c) for c in cmd], "cwd": cwd_raw},
+                "exec": {"cmd": [str(c) for c in cmd], "cwd": cwd_raw, "timeout_secs": timeout_secs},
                 "skill": skill_name,
                 "dir": str(skill_dir),
             }
@@ -354,6 +474,58 @@ class ToolsPlugin:
             return _err(f"args 必须是对象，收到: {type(args).__name__}", code="BAD_ARGS", field="args")
         return self._exec_command(_SKILL_TOOLS[name], args)
 
+    # ── §八：MCP 工具（stdio 传输第三池） ──────────────────────────────────
+
+    def _mcp_tools_view(self, payload: dict) -> dict:
+        """{"op":"mcp_tools"} → 配置视图（host 工具 tab MCP 区块数据源）：
+        servers 含状态（ready/starting/crashed/stopped/failed），tools 附 enabled。"""
+        servers = [
+            {
+                "name": n,
+                "status": s.status,
+                "tools": sum(1 for e in _MCP_TOOLS.values() if e["server"] == n),
+            }
+            for n, s in _MCP_SERVERS.items()
+        ]
+        servers.extend(
+            {"name": n, "status": "failed", "tools": 0, "error": msg} for n, msg in _MCP_FAILED.items()
+        )
+        tools = [
+            {
+                "name": name,
+                "description": e["description"],
+                "parameters": e["parameters"],
+                "server": e["server"],
+                "enabled": name in _ENABLED,
+            }
+            for name, e in _MCP_TOOLS.items()
+        ]
+        return {"ok": True, "servers": servers, "tools": tools}
+
+    def _call_mcp_tool(self, name: str, payload: dict) -> dict:
+        """MCP 工具执行：启用闸 → 保活 → JSON-RPC tools/call → content 文本拼接回契约形。"""
+        if name not in _ENABLED:
+            return _err(
+                f"tool '{name}' 未启用（MCP 工具需经设置面板/configure 启用；装载≠启用）",
+                code="TOOL_DISABLED",
+            )
+        args = payload.get("args") or {}
+        if not isinstance(args, dict):
+            return _err(f"args 必须是对象，收到: {type(args).__name__}", code="BAD_ARGS", field="args")
+        entry = _MCP_TOOLS[name]
+        server = _MCP_SERVERS.get(entry["server"])
+        if server is None:
+            return _err(f"MCP server '{entry['server']}' 不可用（启动失败或已跳过）", code="MCP_UNAVAILABLE")
+        try:
+            server._ensure_running()  # 崩溃退避重启（窗口内 MCP_UNAVAILABLE）
+            result = server.call_tool(entry["remote"], args, _skill_tool_timeout())
+            text = mcp_mod.content_to_text(result)
+        except mcp_mod.McpError as exc:
+            return _err(str(exc), code=exc.code)
+        except Exception as exc:  # noqa: BLE001 - 失败回喂 LLM，不中断循环
+            return _err(f"MCP 调用失败: {type(exc).__name__}: {exc}", code="MCP_ERROR")
+        return {"ok": True, "result": text}
+
     def _exec_command(self, entry: dict, args: dict) -> dict:
         """子进程执行 exec.cmd：stdin={"args":{...}}，stdout=Wire 同形 JSON。
         cwd 缺省技能目录（相对资源可达）；超时杀进程；输出不合契约 → 字段级错误。"""
@@ -365,7 +537,9 @@ class ToolsPlugin:
             if not _within(cand, Path(entry["dir"]).resolve()):
                 return _err(f"exec.cwd 越界（不得超出技能目录）: {cwd_raw}", code="K400", field="exec.cwd")
             cwd = str(cand)
-        timeout = _skill_tool_timeout()
+        # T0：声明 timeout_secs 优先，缺省回落全局 SKILL_TOOL_TIMEOUT_SECS（install 已保证正数）
+        declared = entry["exec"].get("timeout_secs")
+        timeout = float(declared) if declared is not None else _skill_tool_timeout()
         try:
             proc = subprocess.run(
                 cmd,
@@ -403,6 +577,8 @@ class ToolsPlugin:
         name = payload.get("name")
         if name in _SKILL_TOOLS:
             return self._call_skill_tool(name, payload)
+        if name in _MCP_TOOLS:
+            return self._call_mcp_tool(name, payload)
         if name not in _pool():
             avail = sorted(_ENABLED)
             return _err(f"unknown tool: {name}（可用: {', '.join(avail)}）", code="UNKNOWN_TOOL")
@@ -423,7 +599,9 @@ class ToolsPlugin:
             return _err(f"{type(exc).__name__}: {exc}")
 
     def destroy(self) -> None:
-        pass
+        # §八：MCP server 随插件退出**逆序**回收
+        for server in reversed(list(_MCP_SERVERS.values())):
+            server.stop()
 
 
 if __name__ == "__main__":

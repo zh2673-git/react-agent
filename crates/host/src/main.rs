@@ -63,93 +63,91 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 组装：spawn + 注册 + 探测。任何 provider 起不来 → 可读报错退出（register 吞 K302，所以先探测）。
+/// 组装：并行 spawn + 注册 + 并行探测。memory/llm/tools/assets 互不依赖，串行装配曾让
+/// 最慢单项（llm 云端 ping 71s）拖满全程；并行后总时长 = 最慢单项。探测失败策略分层：
+/// memory/tools 为硬依赖（bail）；llm-adapter 进程存活即注册成功，云端 ping 不通仅 warn
+/// 降级（chat 时自然报错，web 设置可重配）；assets 本就是软依赖。
 async fn assemble(kernel: &Kernel, cfg: &HostConfig) -> anyhow::Result<()> {
-    // 1. memory（TS guest）—— memory.session（模型上下文）+ session.trace（只追加事件日志，Phase 3-1）
     let Some(node) = spawn::find_node() else {
         bail!("node 未找到（--experimental-strip-types 需 >= 22.6）");
     };
+    let Some(py) = spawn::find_interpreter() else {
+        bail!("python 未找到（guest 需要 grpcio；pip install grpcio httpx）");
+    };
+
+    // bash 沙箱探测（文件系统级，构造 tools env 前完成；15s 超时）
+    let mut tools_env = vec![("WORKSPACE_ROOT".into(), config::workspace_root())];
+    tools_env.extend(cfg.passthrough_env());
+    apply_bash_sandbox(&mut tools_env).await;
+
+    // ── 并行 spawn 四插件（互不依赖）──
     let mem_script = cfg.plugins_dir.join("memory").join("memory_plugin.ts");
-    let mem = spawn::spawn_node_ts(
+    let mem_f = spawn::spawn_node_ts(
         node,
         &mem_script,
         manifests::guest_manifest("memory", &["memory.session", "session.trace"], false),
         &[],
-    )
-    .await
-    .context("spawn memory(ts) 失败")?;
-    kernel.register(Arc::new(mem)).await;
-    probe(kernel, "memory", json!({"op": "get", "session_id": "__probe__"}), "memory(ts)").await?;
-
-    // 2. llm-adapter（Python guest）
-    let Some(py) = spawn::find_interpreter() else {
-        bail!("python 未找到（guest 需要 grpcio；pip install grpcio httpx）");
-    };
+    );
     let llm_script = cfg.plugins_dir.join("llm_adapter").join("llm_plugin.py");
     // R1：Concurrent——abort op 必须能在流式 chat 进行中被并发受理（Serial = 插件级锁
     // 排队到 chat 结束后，取消永远迟到）。安全性：Python guest gRPC 4 线程池天然并发；
     // provider 均为请求时读 env 的无状态实现，configure 与 chat 的 env 读写竞争良性
     // （最坏一次请求用旧/新模型，无跨调用可变态）。
-    let llm = spawn::spawn_python(
+    let llm_env = cfg.llm_env();
+    let llm_f = spawn::spawn_python(
         py,
         &llm_script,
         manifests::guest_manifest("llm-adapter", &["llm.chat"], true),
-        &cfg.llm_env(),
-    )
-    .await
-    .context("spawn llm-adapter(py) 失败")?;
-    kernel.register(Arc::new(llm)).await;
-    probe(
-        kernel,
-        "llm-adapter",
-        json!({"op": "chat", "messages": [{"role": "user", "content": "ping"}]}),
-        &format!("llm-adapter(py, provider={})", cfg.llm_provider),
-    )
-    .await?;
-
-    // 3. tools（Python guest）—— 生产级 7 件套，env 透传（工作区边界/搜索链/scope）+ bash 沙箱策略
-    let mut tools_env = vec![("WORKSPACE_ROOT".into(), config::workspace_root())];
-    tools_env.extend(cfg.passthrough_env());
-    apply_bash_sandbox(&mut tools_env).await;
+        &llm_env,
+    );
     let tools_script = cfg.plugins_dir.join("tools").join("tools_plugin.py");
-    let tools = spawn::spawn_python(
+    let tools_f = spawn::spawn_python(
         py,
         &tools_script,
         manifests::guest_manifest("tools", &["tools.exec"], false),
         &tools_env,
-    )
-    .await
-    .context("spawn tools(py) 失败")?;
-    kernel.register(Arc::new(tools)).await;
-    probe(kernel, "tools", json!({"op": "list"}), "tools(py)").await?;
-
-    // 4. assets（Python guest，软依赖）——skills/prompts 注册表；不可用仅 warn 不阻断
+    );
     let mut assets_env = cfg.passthrough_env();
     assets_env.push(("WORKSPACE_ROOT".into(), config::workspace_root()));
     let assets_script = cfg.plugins_dir.join("assets").join("assets_plugin.py");
-    match spawn::spawn_python(
+    let assets_f = spawn::spawn_python(
         py,
         &assets_script,
         manifests::guest_manifest("assets", &["assets.registry"], false),
         &assets_env,
-    )
-    .await
-    {
-        Ok(assets) => {
-            kernel.register(Arc::new(assets)).await;
-            match probe(
-                kernel,
-                "assets",
-                json!({"op": "skills.list"}),
-                "assets(py)",
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(e) => tracing::warn!("assets 探测失败（软依赖，降级为无技能模式）: {e}"),
-            }
-        }
+    );
+    let (mem, llm, tools, assets) = tokio::join!(mem_f, llm_f, tools_f, assets_f);
+
+    let mem = mem.context("spawn memory(ts) 失败")?;
+    let llm = llm.context("spawn llm-adapter(py) 失败")?;
+    let tools = tools.context("spawn tools(py) 失败")?;
+    kernel.register(Arc::new(mem)).await;
+    kernel.register(Arc::new(llm)).await;
+    kernel.register(Arc::new(tools)).await;
+    match assets {
+        Ok(assets) => kernel.register(Arc::new(assets)).await,
         Err(e) => tracing::warn!("spawn assets(py) 失败（软依赖，降级为无技能模式）: {e}"),
+    }
+
+    // ── 并行探测（带超时护栏：慢网络/挂死不得拖死启动）──
+    let llm_payload = json!({"op": "chat", "messages": [{"role": "user", "content": "ping"}]});
+    let p_mem = probe(kernel, "memory", json!({"op": "get", "session_id": "__probe__"}), "memory(ts)", 30);
+    let llm_label = format!("llm-adapter(py, provider={})", cfg.llm_provider);
+    let p_llm = probe(kernel, "llm-adapter", llm_payload, &llm_label, 120);
+    let tools_payload = json!({"op": "list"});
+    let p_tools = probe(kernel, "tools", tools_payload, "tools(py)", 30);
+    let assets_payload = json!({"op": "skills.list"});
+    let p_assets = probe(kernel, "assets", assets_payload, "assets(py)", 30);
+    let (r_mem, r_llm, r_tools, r_assets) = tokio::join!(p_mem, p_llm, p_tools, p_assets);
+
+    r_mem.context("memory 探测失败")?;
+    r_tools.context("tools 探测失败")?;
+    if let Err(e) = r_llm {
+        // 硬依赖判定收窄：guest 进程存活 = 依赖就位；云端联通性降级 warn（chat 时自然报错）
+        tracing::warn!("llm-adapter 云端 ping 未通过（启动继续，chat 时会报错，可在 web 设置重配）: {e}");
+    }
+    if let Err(e) = r_assets {
+        tracing::warn!("assets 探测失败（软依赖，降级为无技能模式）: {e}");
     }
 
     // 5. agent-loop（InProcess，硬依赖已全部就位）
@@ -222,11 +220,20 @@ async fn probe_sandbox(helper: &std::path::Path) -> anyhow::Result<()> {
     }
 }
 
-async fn probe(kernel: &Kernel, target: &str, payload: Value, label: &str) -> anyhow::Result<()> {
-    let r = kernel
-        .dispatch(Envelope::new(PluginId::new(target), payload))
-        .await
-        .map_err(|e| anyhow::anyhow!("{label} dispatch 失败: {e}"))?;
+async fn probe(
+    kernel: &Kernel,
+    target: &str,
+    payload: Value,
+    label: &str,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        kernel.dispatch(Envelope::new(PluginId::new(target), payload)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("{label} 探测超时（>{timeout_secs}s）"))?
+    .map_err(|e| anyhow::anyhow!("{label} dispatch 失败: {e}"))?;
     if r.get("ok") != Some(&json!(true)) {
         bail!("{label} 探测失败: {r}");
     }

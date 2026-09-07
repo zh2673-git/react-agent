@@ -1,4 +1,9 @@
-"""mock provider：MOCK_SCRIPT（JSON 数组逐次弹出，耗尽后停在最后一个）；无脚本回 pong。"""
+"""mock provider：MOCK_SCRIPT（JSON 数组逐次弹出，耗尽后停在最后一个）；无脚本回 pong。
+
+MOCK_CAPTURE（可选，e2e 诊断缝）：设为文件路径时，每次 chat 先把请求 payload
+（messages/tools 等）以 JSONL 追加落盘，供测试断言 system 提示词组装链；
+落盘失败静默忽略（诊断缝不影响主链路）。
+"""
 
 import json
 import os
@@ -8,7 +13,19 @@ from .base import err, norm
 _state = {"seq": 0}
 
 
+def _capture(payload: dict) -> None:
+    path = os.environ.get("MOCK_CAPTURE")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
 def chat(payload: dict) -> dict:
+    _capture(payload)
     script = os.environ.get("MOCK_SCRIPT")
     if not script:
         return norm("pong", [], "mock", "stop")

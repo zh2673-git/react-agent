@@ -72,39 +72,77 @@ impl Frontend for WebFrontend {
 
 // ── HTTP 最小实现 ──
 
-/// 定位 web 前端静态文件 `web-dist/{name}`（白名单：index.html / style.css / app.js，
-/// 杜绝目录穿越），按优先级尝试：
+/// 定位 web 前端静态文件（白名单 + vendor 前缀规则，杜绝目录穿越），按优先级尝试：
 /// 1. 编译期注入的源码目录（`CARGO_MANIFEST_DIR`，`cargo run`/`build` 时有效）；
 /// 2. 相对 cwd 的 `crates/host/web-dist/`（在 workspace 根启动）；
 /// 3. 相对二进制同级的 `web-dist/`（打包发布）。
+///
+/// W11 vendor 前缀规则：monaco 为多文件目录树（40+ 文件），逐文件白名单不现实——
+/// `vendor/<rel>` 以「路径段校验（无 `..`、无反斜杠、无空段）+ 扩展名白名单」放行，
+/// 既覆盖目录树又保证只可能落到 web-dist/vendor/ 下的静态资源。
 fn web_dist_file(name: &str) -> Option<PathBuf> {
     const ALLOWED: &[&str] = &["index.html", "style.css", "app.js"];
-    if !ALLOWED.contains(&name) {
+    const VENDOR_EXTS: &[&str] = &["js", "css", "json", "ttf", "woff", "woff2"];
+    let rel: PathBuf = if ALLOWED.contains(&name) {
+        PathBuf::from(name)
+    } else if let Some(vendor_rel) = name.strip_prefix("vendor/") {
+        // 逐段校验：空段 / 点段（. / ..）/ 反斜杠 / NUL 一律拒绝
+        let mut segs = PathBuf::new();
+        for seg in vendor_rel.split('/') {
+            if seg.is_empty() || seg == "." || seg == ".." || seg.contains('\\') || seg.contains('\0') {
+                return None;
+            }
+            segs.push(seg);
+        }
+        let ext_ok = segs
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| VENDOR_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+            .unwrap_or(false);
+        if !ext_ok {
+            return None;
+        }
+        PathBuf::from("vendor").join(segs)
+    } else {
         return None;
-    }
+    };
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(manifest) = option_env!("CARGO_MANIFEST_DIR") {
-        candidates.push(PathBuf::from(manifest).join("web-dist").join(name));
+        candidates.push(PathBuf::from(manifest).join("web-dist").join(&rel));
     }
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("crates").join("host").join("web-dist").join(name));
+        candidates.push(cwd.join("crates").join("host").join("web-dist").join(&rel));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("web-dist").join(name));
+            candidates.push(parent.join("web-dist").join(&rel));
         }
     }
     candidates.into_iter().find(|p| p.exists())
 }
 
+/// 静态资源 content-type：顶层三件走既有映射；vendor 按扩展名（W11）。
+fn static_content_type(name: &str) -> &'static str {
+    match name {
+        "style.css" => "text/css; charset=utf-8",
+        "app.js" => "text/javascript; charset=utf-8",
+        n if n.starts_with("vendor/") => match n.rsplit('.').next().unwrap_or("") {
+            "css" => "text/css; charset=utf-8",
+            "js" | "mjs" => "text/javascript; charset=utf-8",
+            "json" => "application/json; charset=utf-8",
+            "ttf" => "font/ttf",
+            "woff" => "font/woff",
+            "woff2" => "font/woff2",
+            _ => "application/octet-stream",
+        },
+        _ => "text/html; charset=utf-8",
+    }
+}
+
 /// `GET /`、`/style.css`、`/app.js`：从 `web-dist/` 读取并返回；文件缺失给出明确 500（而非 panic）。
 /// 强制 `no-store`：前端是运行时 serve 的，任何改动刷新即生效，绝不被浏览器缓存旧 JS。
 async fn serve_static(stream: &mut TcpStream, name: &str) -> anyhow::Result<()> {
-    let content_type = match name {
-        "style.css" => "text/css; charset=utf-8",
-        "app.js" => "text/javascript; charset=utf-8",
-        _ => "text/html; charset=utf-8",
-    };
+    let content_type = static_content_type(name);
     match web_dist_file(name) {
         Some(p) => match tokio::fs::read(&p).await {
             Ok(bytes) => {
@@ -187,6 +225,10 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
         ("GET", "/") | ("GET", "/index.html") => serve_static(&mut stream, "index.html").await,
         ("GET", "/style.css") => serve_static(&mut stream, "style.css").await,
         ("GET", "/app.js") => serve_static(&mut stream, "app.js").await,
+        // W11：vendor 静态树（monaco 编辑器等），web_dist_file 内做段级校验 + 扩展名白名单
+        ("GET", r) if r.starts_with("/vendor/") => {
+            serve_static(&mut stream, r.trim_start_matches('/')).await
+        }
         ("GET", "/api/events") => gateway::sse_events(stream, kernel, query).await,
         ("GET", "/api/config") => api::get_config(&mut stream, &kernel).await,
         ("GET", "/api/models") => api::get_models(&mut stream, &kernel, query).await,
@@ -437,5 +479,41 @@ mod tests {
         assert_eq!(q.get("after").unwrap(), "7");
         assert_eq!(q.get("x").unwrap(), "");
         assert!(q.get("missing").is_none());
+    }
+
+    // ── W11：vendor 前缀规则（段级校验 + 扩展名白名单）──
+
+    #[test]
+    fn vendor_paths_resolved_and_rejected() {
+        // 合法路径 → web-dist/vendor/ 下相对路径
+        let hit = web_dist_file("vendor/monaco/vs/loader.js").expect("loader.js 应命中");
+        assert!(hit.ends_with("vendor/monaco/vs/loader.js"), "got {hit:?}");
+        assert!(hit.exists(), "vendor 文件应真实存在");
+
+        // 目录穿越 / 反斜杠 / 点段 / 空段 / 无扩展名一律拒绝
+        for bad in [
+            "vendor/../Cargo.toml",
+            "vendor/monaco/../../lib.rs",
+            "vendor/monaco/vs\\base\\worker/workerMain.js",
+            "vendor/./x.js",
+            "vendor//x.js",
+            "vendor/x",
+            "vendor/monaco/vs/loader.rs",
+        ] {
+            assert!(web_dist_file(bad).is_none(), "{bad} 应被拒绝");
+        }
+        // 非 vendor 且不在顶层白名单 → 拒绝
+        assert!(web_dist_file("app2.js").is_none());
+    }
+
+    #[test]
+    fn vendor_content_types_by_ext() {
+        assert_eq!(static_content_type("vendor/a/b.js"), "text/javascript; charset=utf-8");
+        assert_eq!(static_content_type("vendor/a.css"), "text/css; charset=utf-8");
+        assert_eq!(static_content_type("vendor/x/codicon.ttf"), "font/ttf");
+        assert_eq!(static_content_type("vendor/x.woff2"), "font/woff2");
+        assert_eq!(static_content_type("vendor/x.bin"), "application/octet-stream");
+        assert_eq!(static_content_type("style.css"), "text/css; charset=utf-8");
+        assert_eq!(static_content_type("index.html"), "text/html; charset=utf-8");
     }
 }

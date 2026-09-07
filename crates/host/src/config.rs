@@ -114,9 +114,10 @@ impl HostConfig {
     /// 从父进程透传给 guest 的可选环境变量（存在才传；guest 内部各自读缺省）。
     pub fn passthrough_env(&self) -> Vec<(String, String)> {
         const KEYS: &[&str] = &[
-            // tools：工作区边界 / scope / 搜索链
+            // tools：工作区边界 / scope / 搜索链 / MCP server 声明
             "WORKSPACE_ROOT",
             "TOOLS_ENABLED",
+            "MCP_SERVERS",
             "SEARCH_REGION",
             "SEARCH_BACKEND",
             "BOCHA_API_KEY",
@@ -267,6 +268,13 @@ pub fn apply_config_file_to_env() -> usize {
             set("TOOLS_ENABLED", names.join(","));
         }
     }
+    // MCP server 声明（tools PLAN §八）：整体 JSON 序列化为 MCP_SERVERS env。只走持久通道
+    // （server 子进程生命周期归 tools 插件 init/destroy，热改无意义）——改后需重启 host。
+    if let Some(mcp) = cfg.get("mcp_servers").filter(|v| v.is_object()) {
+        if let Ok(s) = serde_json::to_string(mcp) {
+            set("MCP_SERVERS", s);
+        }
+    }
     // agent 段（P5/E1）：键名即 agent-loop 参数，字符串原样、其余 JSON 标量转串。
     if let Some(agent) = cfg.get("agent").filter(|v| v.is_object()) {
         if let Some(obj) = agent.as_object() {
@@ -286,7 +294,17 @@ pub fn apply_config_file_to_env() -> usize {
 }
 
 /// 工具全集名（与 plugins/tools/tools_plugin.py 的 ALL_TOOLS 保持同步）。
-pub const ALL_TOOL_NAMES: [&str; 7] = ["read_file", "write_file", "edit_file", "list_dir", "bash", "web_search", "web_read"];
+pub const ALL_TOOL_NAMES: [&str; 9] = [
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "bash",
+    "web_search",
+    "web_read",
+    "grep",
+    "symbols_search",
+];
 
 #[cfg(test)]
 mod tests {

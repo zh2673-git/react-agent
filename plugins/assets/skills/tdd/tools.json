@@ -1,0 +1,25 @@
+[
+  {
+    "name": "run_tests",
+    "description": "Run the workspace test suite with fixed probes (cargo test / python -m pytest / npm test). Does NOT accept arbitrary commands. Returns exit code, pass flag, duration and output tails.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": ["cargo", "pytest", "npm"],
+          "description": "Force a specific runner; omit to auto-detect (first match wins: cargo > pytest > npm)"
+        },
+        "extra": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Extra args appended to the test command (e.g. a test-name filter). Max 16 items, each <= 200 chars."
+        }
+      }
+    },
+    "exec": {
+      "cmd": ["python", "run_tests.py"],
+      "timeout_secs": 900
+    }
+  }
+]

@@ -4,9 +4,23 @@ __pycache__/
 *.pyc
 plugins/memory/data/
 outputs/
-plugins/assets/skills/gongwen-format/scripts/*.json*
 *.log
 .stream/
 config.json
 PLAN.md
 project-development-prompt.md
+
+# ── 用户自定义件不入库（出厂件显式白名单，随 git 管理）──
+# 技能：整目录忽略，仅预置 4 件回白（用户技能如 gongwen-format 及未来新建自动忽略；
+# 技能配套工具 tools.json/执行体随技能目录一并忽略）
+plugins/assets/skills/*
+!plugins/assets/skills/project-dev/
+!plugins/assets/skills/repo-explorer/
+!plugins/assets/skills/tdd/
+!plugins/assets/skills/web-research/
+# 第三方/用户工具：只保留内置内核（tools_plugin.py + tools/ 子包）与文档
+plugins/tools/*
+!plugins/tools/tools_plugin.py
+!plugins/tools/tools/
+!plugins/tools/PLAN.md
+!plugins/tools/README.md
