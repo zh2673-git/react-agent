@@ -139,13 +139,51 @@ fn static_content_type(name: &str) -> &'static str {
     }
 }
 
+/// W17 迭代六：index.html serve 时注入实例工作区标识（`window.RA_WS`）。
+/// 前端会话列表 localStorage 以它做命名空间——会话归属**工作区**而非端口（源）：
+/// 多实例端口动态分配、可被不同工作区复用，按端口存列表会跨工作区串显（用户实测：
+/// test 工作区的会话出现在代码根工作区的界面）；绑工作区后实例复活换端口也不丢会话。
+/// 找不到 `<head>` 时原样返回（前端退化为空后缀 key，不影响功能）。
+fn inject_ws_anchor(html: &str, ws: &str) -> String {
+    let tag = format!("<script>window.RA_WS={}</script>", json!(ws));
+    match html.find("<head>") {
+        Some(pos) => {
+            let mut out = String::with_capacity(html.len() + tag.len());
+            out.push_str(&html[..pos + "<head>".len()]);
+            out.push_str(&tag);
+            out.push_str(&html[pos + "<head>".len()..]);
+            out
+        }
+        None => html.to_string(),
+    }
+}
+
+/// 实例当前工作区（WORKSPACE_ROOT 优先，与文件树/undo 端点同口径）。
+fn instance_workspace() -> String {
+    let raw = std::env::var_os("WORKSPACE_ROOT")
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_else(|| crate::config::workspace_dir().to_string_lossy().into_owned());
+    norm_ws_key(&raw)
+}
+
+/// localStorage key 形态稳定化：剥一个尾部斜杠（`D:\ws\` 与 `D:\ws` 必须同 key）。
+/// 驱动器根 `D:\` 会剥成 `D:`——形态依然恒定，key 稳定性不受影响。
+fn norm_ws_key(ws: &str) -> String {
+    ws.strip_suffix(['/', '\\']).unwrap_or(ws).to_string()
+}
+
 /// `GET /`、`/style.css`、`/app.js`：从 `web-dist/` 读取并返回；文件缺失给出明确 500（而非 panic）。
 /// 强制 `no-store`：前端是运行时 serve 的，任何改动刷新即生效，绝不被浏览器缓存旧 JS。
 async fn serve_static(stream: &mut TcpStream, name: &str) -> anyhow::Result<()> {
     let content_type = static_content_type(name);
     match web_dist_file(name) {
         Some(p) => match tokio::fs::read(&p).await {
-            Ok(bytes) => {
+            Ok(mut bytes) => {
+                if name == "index.html" {
+                    if let Ok(html) = std::str::from_utf8(&bytes) {
+                        bytes = inject_ws_anchor(html, &instance_workspace()).into_bytes();
+                    }
+                }
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     bytes.len()
@@ -245,8 +283,16 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
             api::delete_skill(&mut stream, r.trim_start_matches("/api/skills/")).await
         }
         ("POST", "/api/reveal") => api::reveal_target(&mut stream, query).await,
+        // W17 多窗口多实例：spawn 自身起新实例 / 清单探活 / 停止（任意窗口可再开窗口）
+        ("POST", "/api/instances") => api::create_instance(&mut stream, &body).await,
+        ("GET", "/api/instances") => api::list_instances(&mut stream).await,
+        ("POST", "/api/pick-folder") => api::pick_folder(&mut stream).await,
+        ("DELETE", r) if r.starts_with("/api/instances/") => {
+            api::delete_instance(&mut stream, r.trim_start_matches("/api/instances/")).await
+        }
         ("GET", "/api/tree") => files::list_workspace_tree(&mut stream, query).await,
         ("GET", "/api/fc-snapshot") => files::serve_undo_snapshot(&mut stream, query).await,
+        ("GET", "/api/session-exists") => api::session_exists(&mut stream, query).await,
         ("GET", r) if r.starts_with("/files/") => {
             files::serve_workspace_file(&mut stream, r.trim_start_matches("/files/"), query).await
         }
@@ -532,5 +578,29 @@ mod tests {
         assert_eq!(static_content_type("vendor/x.bin"), "application/octet-stream");
         assert_eq!(static_content_type("style.css"), "text/css; charset=utf-8");
         assert_eq!(static_content_type("index.html"), "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn ws_anchor_injected_right_after_head() {
+        let html = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body></body></html>";
+        let out = inject_ws_anchor(html, r"D:\ws a\b");
+        // json! 序列化负责引号与反斜杠转义，产出合法 JS 字面量
+        assert!(out.contains(r#"<head><script>window.RA_WS="D:\\ws a\\b"</script>"#), "{out}");
+        assert!(out.ends_with("</body></html>"), "其余内容原样保留");
+    }
+
+    #[test]
+    fn ws_anchor_without_head_is_noop() {
+        let html = "<html><body>hi</body></html>";
+        assert_eq!(inject_ws_anchor(html, "D:\\ws"), html);
+    }
+
+    #[test]
+    fn norm_ws_key_strips_single_trailing_slash() {
+        assert_eq!(super::norm_ws_key(r"D:\ws\"), r"D:\ws");
+        assert_eq!(super::norm_ws_key("D:/ws/"), "D:/ws");
+        assert_eq!(super::norm_ws_key(r"D:\"), "D:");
+        assert_eq!(super::norm_ws_key("/ws//"), "/ws/");
+        assert_eq!(super::norm_ws_key("D:\\ws"), "D:\\ws");
     }
 }

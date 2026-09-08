@@ -18,6 +18,7 @@
 - 三家 LLM 全覆盖：OpenAI 兼容（可换 base_url 适配 DeepSeek 等）、Anthropic、Ollama；另带 **mock** provider 供离线测试
 - 生产级工具 9 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read / symbols_search（全部免费默认无 key）；另有 **MCP 外接池**（stdio 服务器，`mcp__{server}__{tool}` 命名空间，见 env 表 `MCP_SERVERS` 与 §八）与技能配套工具两池，统一白名单启用
 - 双前端：REPL（默认）/ Web 网关（HTTP+SSE，Cursor 暖色系事件流式会话）：左侧会话栏（自动命名 + 持久化）、「思考与工具」过程框（思考链 + 工具卡内联 diff，可折叠回看）、每轮「📝 文件变更」chip（Monaco 双栏 diff 对比变更前后 + 回滚撤销）、🔗 来源溯源抽屉、产物文件卡片 + 📁 工作区文件树、📎 附件上传、消息回滚/重新生成（文件改动随回滚一并撤销）、subagent 实时框、富 markdown；刷新恢复 = 日志重放
+- **多窗口多实例**（W17）：启动缺省即 8710 主窗口（自动恢复上次工作区）；侧栏「▣ 新窗口」→「📂 浏览文件夹…」弹原生选择框选任意文件夹即开独立窗口（**实例名自动取文件夹名**，host spawn 自身：独立会话/回滚/配置/端口，并行互不感知；同一文件夹已开着就直接复用该窗口）；**任意窗口都可再开新窗口**（实例平等），首次建窗自动继承模型配置；也可命令行 `start-window.cmd <工作区路径>`
 - **Web 配置中心**（08）：右上角 ⚙ 侧边抽屉四标签——LLM（provider/model/站点预设/key，ollama 显原生窗口，热生效 + 落盘 config.json）、工具（内置/技能/MCP 三池分组折叠）、技能（SKILL.md 在线编辑 + 配套工具启停，出厂件删除保护）、Agent（max_rounds/系统提示词/上下文窗口热通道）；配置源文件一键「在编辑器中打开」
 - **自扩展**（08）：L1 技能自扩展（skills 根在工作区内时授权模型 write_file 自建技能，文件即注册表，下轮对话可见）；L2 工具自扩展（`tools.reload` 装载 + 配置中心启用，两步分离）；R9 技能自造闭环（`skill_install` 编排 + 语言无关配套工具，前端内联卡一键启用；装载≠启用≠可见）。**已实证**：`gongwen-format` 公文写作技能即 agent 对话中自建（SKILL.md 与配套工具均模型一次生成，跨会话可用，非人工预置）
 - subagent：保留工具 `task` 委派子任务（新 session 复用全链路，深度防嵌套）；过程框内嵌「子代理」实时框，子代理思考流与工具卡实时透传（trace 镜像 + 子旁路流式）
@@ -42,7 +43,7 @@
 
 ```
 crates/agent-loop        ReAct 编排插件（InProcess，仅依赖 agent-kernel-sdk）
-crates/host              宿主二进制：装配、spawn、探测、双前端（frontend repl + web/ 网关）、sandbox-run 助手；web-dist/ 为 web 前端三文件 index.html+style.css+app.js + vendor/（monaco 本地资源，运行时 serve，非内嵌）
+crates/host              宿主二进制：装配、spawn、探测、双前端（frontend repl + web/ 网关）、sandbox-run 助手；web-dist/ 为 web 前端 index.html+style.css + vendor/（monaco 本地资源 + app.js 拆分出的五模块 app-{core,stream,files,settings,events}.js，运行时 serve，非内嵌）
 plugins/llm_adapter      LLM 适配器（Python guest，providers/ 按 vendor 分 pack）
 plugins/tools            工具注册与执行（Python guest，纯 stdlib，files/bash/web/grep 分文件）
 plugins/assets           skills/prompts 注册表（Python guest，开放标准 SKILL.md）
@@ -100,9 +101,10 @@ LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-xxx cargo run -p react-agent-hos
 
 ## 前端开发（无构建）
 
-Web 前端是 `crates/host/web-dist/` 三件套（index.html + style.css + app.js，原生 JS 无框架、无构建步骤），由后端 `GET /` 运行时读取 serve。
+Web 前端是 `crates/host/web-dist/`（index.html + style.css，原生 JS 无框架、无构建步骤；脚本为 `vendor/` 下五模块 `app-{core,stream,files,settings,events}.js`，经 defer 按文档序加载共享全局作用域），由后端 `GET /` 运行时读取 serve。
 
 - **默认（推荐）**：`cargo run -p react-agent-host`（或 `start.cmd`）起 8710，浏览器开 `http://127.0.0.1:8710` 即同时拿到前端与 `/api`。改 `web-dist/` 任一文件后**刷新浏览器即生效**（无需重编 host；若页面不更新按 `Ctrl+Shift+R` 硬刷规避缓存）。
+- **多窗口**：Web 侧栏「▣ 新窗口」按钮（📂 弹原生文件夹选择框 → 创建并打开，实例名自动取文件夹名，无需手填路径/起名）；或命令行 `start-window.cmd <工作区路径>`。API 直呼见 [host README「多实例」](crates/host/README.md)。
 - **前后端分离（独立端口，HMR）**：后端 `cargo run -p react-agent-host`（8710 作 API 源），前端用 `vite` 起在 `crates/host/web-dist/`（已内置 `vite.config.js`，`/api` 自动反代回 8710）：
   ```bash
   cd crates/host/web-dist && npm install && npm run dev   # 默认 http://localhost:5173
@@ -147,6 +149,7 @@ Web 前端是 `crates/host/web-dist/` 三件套（index.html + style.css + app.j
 | `BASH_SANDBOX` | `on` | on=sandbox-run 受限令牌沙箱（探测失败 fail-closed 移除 bash）；off=显式豁免直跑 |
 | `REACT_FRONTEND` | `repl` | 前端选择：repl / web |
 | `WEB_ADDR` | `127.0.0.1:8710` | web 网关监听地址 |
+| `REACT_INSTANCE_NAME` | 空（主实例） | W17 多窗口：实例名（由 `/api/instances` 或 `start-window.cmd` 自动设置/派生，手工启动无需关心）；子实例头部显示徽章，数据存于代码根 `.instances/{name}/`；主实例启动自动恢复 `.instances/.last-workspace` 记忆的工作区 |
 | `CONFIG_FILE` | `<workspace>/config.json` | 配置中心持久化文件（启动时应用为 env，Web 保存后落盘） |
 | `RUST_LOG` | `warn,react_agent_host=info` | 日志 |
 

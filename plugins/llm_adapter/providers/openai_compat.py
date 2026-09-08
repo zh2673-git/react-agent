@@ -239,6 +239,17 @@ def _stream_once(endpoint: dict, body: dict, sink: StreamSink, provider_label: s
         return err(message)
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
+    # 碎片合并（write 反复 MISSING_ARG 的根因修复）：部分兼容网关会把 tool_call 的
+    # arguments 尾部增量发在**无 name 的新 index** 下（name 只在首帧），按 index 分桶后
+    # 具名桶只剩首帧残片（如 `{"backup": false`），无名桶被下方 `if v["name"]` 过滤丢弃
+    # → arguments 残缺 → as_object 落 _raw → 工具 MISSING_ARG 反复重试。此处把无名碎片
+    # 按出现顺序并回唯一具名调用（仅恰一个具名调用时合并，多调用场景不猜归属）。
+    named = [v for v in calls.values() if v["name"]]
+    if len(named) == 1:
+        for v in calls.values():  # dict 保插入序，按到达顺序追加
+            if not v["name"] and v["arguments"]:
+                named[0]["arguments"] += v["arguments"]
+
     # 未上报 usage → None（前端据此不显示统计条，而不是显示一串 0）
     usage = map_usage(usage_raw) if usage_raw else None
     sink.end(usage, elapsed_ms)

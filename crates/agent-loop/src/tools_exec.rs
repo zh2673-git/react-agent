@@ -174,15 +174,10 @@ impl AgentLoopPlugin {
         }
     }
 
-    /// 纯函数：从工具调用与结果推导 file_change 事件（None = 不登记）。
-    /// 失败的写/编辑不登记；path 归一为正斜杠（与产物登记同款）。
-    /// 结果内带 undo 引用（files.py 变更快照，R15 回滚撤销 + 双侧 diff 数据源）→ 原样透传。
-    pub(super) fn file_change_event_for(tc: &ToolCall, result: &Value) -> Option<Value> {
-        Self::file_change_events_for(tc, result).into_iter().next()
-    }
-
     /// 多事件版（W16）：write/edit 单事件；bash 从 `result.changes[]` 展开多事件（op=bash，
     /// 带 undo 引用——回滚撤销与 diff 视图与 write/edit 同协议）。
+    /// 失败的写/编辑不登记；path 归一为正斜杠（与产物登记同款）；
+    /// 结果内带 undo 引用（files.py 变更快照，R15 回滚撤销 + 双侧 diff 数据源）→ 原样透传。
     pub(super) fn file_change_events_for(tc: &ToolCall, result: &Value) -> Vec<Value> {
         if result.get("ok") != Some(&json!(true)) {
             return Vec::new();

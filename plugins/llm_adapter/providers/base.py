@@ -196,11 +196,20 @@ def map_usage(u: dict | None) -> dict:
 
 
 def as_object(args) -> dict:
-    """OpenAI 兼容端点的 arguments 是 JSON 字符串，Anthropic 是对象——统一为对象。"""
+    """OpenAI 兼容端点的 arguments 是 JSON 字符串，Anthropic 是对象——统一为对象。
+
+    解析失败落 `{"_raw": 原串}`（工具侧据此报可读错误并触发模型一次重试），
+    同时打 stderr 诊断（进 host 日志，供事后查证上游截断形态）。
+    """
     if isinstance(args, str):
         try:
             return json.loads(args)
         except json.JSONDecodeError:
+            print(
+                f"[llm_adapter] tool_call arguments 非法 JSON(len={len(args)}): "
+                f"{args[:80]}…{args[-40:] if len(args) > 120 else ''}",
+                flush=True,
+            )
             return {"_raw": args}
     return args if isinstance(args, dict) else {}
 

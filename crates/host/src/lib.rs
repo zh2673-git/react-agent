@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod frontend;
+pub mod instances;
 pub mod manifests;
 pub mod spawn;
 pub mod web;

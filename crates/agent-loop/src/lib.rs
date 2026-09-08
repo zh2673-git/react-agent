@@ -282,15 +282,21 @@ mod tests {
         let tc = |name: &str| ToolCall { id: "1".into(), name: name.into(), arguments: json!({}) };
         let ok = |path: &str| json!({"ok": true, "result": {"path": path}});
         // 成功 write/edit → 事件（path 归一正斜杠）
-        let ev = AgentLoopPlugin::file_change_event_for(&tc("write_file"), &ok(r"D:\ws\outputs\a.md")).unwrap();
+        let ev = AgentLoopPlugin::file_change_events_for(&tc("write_file"), &ok(r"D:\ws\outputs\a.md"))
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(ev["path"], json!("D:/ws/outputs/a.md"), "反斜杠归一");
         assert_eq!(ev["op"], json!("write"));
-        let ev = AgentLoopPlugin::file_change_event_for(&tc("edit_file"), &ok("x.md")).unwrap();
+        let ev = AgentLoopPlugin::file_change_events_for(&tc("edit_file"), &ok("x.md"))
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(ev["op"], json!("edit"));
         // 失败 / 非文件工具 / 缺 path → 不登记
-        assert!(AgentLoopPlugin::file_change_event_for(&tc("write_file"), &json!({"ok": false})).is_none());
-        assert!(AgentLoopPlugin::file_change_event_for(&tc("bash"), &ok("x")).is_none());
-        assert!(AgentLoopPlugin::file_change_event_for(&tc("edit_file"), &json!({"ok": true, "result": {}})).is_none());
+        assert!(AgentLoopPlugin::file_change_events_for(&tc("write_file"), &json!({"ok": false})).is_empty());
+        assert!(AgentLoopPlugin::file_change_events_for(&tc("bash"), &ok("x")).is_empty());
+        assert!(AgentLoopPlugin::file_change_events_for(&tc("edit_file"), &json!({"ok": true, "result": {}})).is_empty());
     }
 
     #[test]

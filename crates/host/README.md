@@ -18,7 +18,7 @@ react-agent 的运行时：拉起全部 guest 插件、暴露 Web UI 与 SSE、�
 | `manifests.rs` | `guest_manifest`：Process 域 manifest 构造（api_version 必须 0.1） |
 | `spawn.rs` | guest 子进程 spawn（python / node），注入 `PYTHONPATH` 与 provider env |
 | `bin/sandbox-run.rs` | bash 沙箱助手（与宿主二进制同目录；`tools` 插件的 `BASH_SANDBOX=on` 依赖它） |
-| `web-dist/` | 前端三件套 `index.html + style.css + app.js`（原生 JS 无构建）+ `vendor/`（Monaco 本地资源，运行时 serve 非内嵌）；`render()` 等全局函数在 `app.js` |
+| `web-dist/` | 前端 `index.html + style.css`（原生 JS 无构建）+ `vendor/`（W17 迭代八起 app.js 拆为五模块 `app-{core,stream,files,settings,events}.js` 与 Monaco 本地资源同住 vendor/ 前缀，运行时 serve 非内嵌）；`render()` 等全局函数在 `vendor/app-events.js` |
 
 ## 启动流程（`assemble`）
 
@@ -94,6 +94,15 @@ react-agent 的运行时：拉起全部 guest 插件、暴露 Web UI 与 SSE、�
 - `PUT /api/skills/{name}` body `{"content":SKILL.md全文}` → 写入（frontmatter name 须与目录名一致；名字仅字母数字/_/-）；写入自动打标 `origin: user`
 - `DELETE /api/skills/{name}` → 删除技能目录；出厂件（frontmatter 显式 `origin: preset`，预置技能归 git 管理）拒删 K403，缺省视为用户件可删
 
+### 多实例（W17 多窗口）
+
+- `POST /api/instances` body `{"workspace":str,"name"?:str}` → VSCode 式多窗口：**name 可选**（缺省自动取工作区文件夹名，`derive_name`：路径末段 + 非法字符替换 + 驱动器根/空回退 `ws` + 截 32 字符）→ 探测空闲端口（8711 起，上限 8910）→ 建实例目录 `<代码根>/.instances/{name}/{memory,stream,config.json,instance.json}`（config.json 首次自动复制主实例，api_key 免重配）→ **spawn 自身 exe**（env 覆盖 7 项：`WORKSPACE_ROOT`/`WEB_ADDR`/`MEMORY_DATA_DIR`/`AGENT_STREAM_DIR`/`CONFIG_FILE`/`REACT_INSTANCE_NAME`/`REACT_FRONTEND=web`）→ 等端口就绪（最多 ~15s）→ `{ok,name,port,url,pid}`。工作区路径须为已存在目录。实例名规则 = Windows 目录名安全子集（1-32 字符，不含 `/ \ : * ? " < > |` 与控制字符，允许中文）。同步实现含就绪等待，服务端经 `spawn_blocking` 调用。**同名目录已存在时（目录即注册表）**：同工作区 + 在线 → 直接复用（返回原 url 不重复 spawn，附 `reused:true`）；同工作区 + 离线 → 复活（换新端口，memory/config/会话延续）；异工作区 → 尾部 `-2`…`-99` 找空位
+- `POST /api/pick-folder` → 弹**原生**文件夹选择对话框（host 所在机器；PowerShell STA FolderBrowserDialog，TopMost）→ `{ok,path}`（浏览器拿不到本地绝对路径，必须走 host 弹窗）；取消/无选择 → K400「未选择文件夹」。同步阻塞至用户操作完毕，经 `spawn_blocking` 调用
+- `GET /api/instances` → 实例清单 `[{name,pid,port,url,workspace,created_at,online}]`（online=pid 存活探测；`.instances/` 扫描）
+- `DELETE /api/instances/{name}` → 停止实例（校验名 → 读 instance.json pid → `taskkill /F`，进程已死视为已停；返回 `{ok,name,stopped:pid}`）；主实例不注册于 `.instances/`（无实例目录），故不可按名删除
+- **上次工作区记忆**：`.instances/.last-workspace`（一行路径）——主实例启动时若 env 未显式指定 `WORKSPACE_ROOT` 则恢复它（缺省无需建窗即回到上次工作区）；任何实例启动即回写（启动时写而非退出钩子，强杀不丢；`\\?\` 前缀自动剥离）
+- 前端：侧栏「▣ 新窗口」按钮 → modal（「📂 浏览文件夹…」弹原生选择框 + 免填实例名 + 创建并打开）；子实例头部「▣ 实例名」徽章（启动路径即渲染，主实例隐藏）；子实例与前窗完全平等（同款 UI 可再开新窗口）。命令行等价物：`start-window.cmd <工作区路径>`（实例名自动取文件夹名）
+
 ## 流式目录
 
 - `AGENT_STREAM_DIR`（默认 `<项目根>/.stream`）：宿主 `main.rs` 创建并下发，agent-loop 据此生成旁路路径。
@@ -104,7 +113,7 @@ react-agent 的运行时：拉起全部 guest 插件、暴露 Web UI 与 SSE、�
 
 - 新插件环境变量 ↔ `config.rs::llm_env()` / `passthrough_env()` ↔ `plugins/README.md` 环境变量总表。
 - 旁路路径规则 ↔ `crates/agent-loop/src/lib.rs::stream_file_for`。
-- 事件类型 ↔ `web-dist/app.js::render()`（对未知类型前向兼容忽略，新类型要显示须加 case）。
+- 事件类型 ↔ `web-dist/vendor/app-events.js::render()`（对未知类型前向兼容忽略，新类型要显示须加 case）。
 - `ALL_TOOL_NAMES` ↔ `plugins/tools/README.md`（工具增删要同步）。
 - 设置面板字段 ↔ `plugins/llm_adapter/README.md`（provider 切换自适应）。
 

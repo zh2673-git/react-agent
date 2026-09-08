@@ -32,7 +32,34 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("已从 {} 应用 {applied} 项持久配置", config::config_file().display());
     }
 
+    // W17 多窗口：主实例（env 未显式指定 WORKSPACE_ROOT）缺省恢复上次工作区记忆
+    // （.instances/.last-workspace）；子实例/命令行启动带显式 env，不受影响。
+    if std::env::var("WORKSPACE_ROOT").map(|v| v.trim().is_empty()).unwrap_or(true) {
+        if let Some(ws) = react_agent_host::instances::recall_workspace() {
+            std::env::set_var("WORKSPACE_ROOT", &ws);
+            tracing::info!("已恢复上次工作区: {ws}");
+        }
+    }
+
     let cfg = HostConfig::from_env();
+
+    // W17 修正：主实例显式锚定 memory 数据目录（与 memory 插件缺省同口径 plugins_dir/memory/data）。
+    // 不设时 files.py 缺省锚 WORKSPACE_ROOT（用户工作区），而 /api/fc-snapshot 与 undo 端点
+    // 锚编译期代码根——两侧错位：undo 快照写进用户工作区且 diff 预览必 404。子实例由
+    // instances.rs 显式设置不受影响；显式 env 仍最优先。
+    if std::env::var_os("MEMORY_DATA_DIR").is_none() {
+        std::env::set_var(
+            "MEMORY_DATA_DIR",
+            cfg.plugins_dir.join("memory").join("data"),
+        );
+        tracing::info!(
+            "MEMORY_DATA_DIR 未设置，锚定 {}",
+            cfg.plugins_dir.join("memory").join("data").display()
+        );
+    }
+
+    // W17：启动即记忆当前工作区（下次启动缺省恢复它；强杀无退出钩子也不丢）
+    react_agent_host::instances::remember_workspace(&config::workspace_root());
 
     // 流式旁路目录：建目录后以 env 下发（agent-loop 为 InProcess，同进程读 env；
     // llm-adapter 所需路径由 agent-loop 按同一规则拼出后随 payload 下发）

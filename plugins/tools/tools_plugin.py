@@ -575,6 +575,20 @@ class ToolsPlugin:
 
     def _call(self, payload: dict) -> dict:
         name = payload.get("name")
+        args_any = payload.get("args") or {}
+        # 上游模型输出截断防线：llm_adapter 对解析失败的 arguments 落 {"_raw": 残片}。
+        # 与其让工具报误导性的 MISSING_ARG 'path'（模型会往参数内容上找原因，反复重试），
+        # 不如直接点破「参数不是完整 JSON」，模型一次重试即恢复。
+        if isinstance(args_any, dict) and set(args_any.keys()) == {"_raw"}:
+            raw = args_any.get("_raw")
+            raw = raw if isinstance(raw, str) else ""
+            return _err(
+                f"工具 '{name}' 的 arguments 不是完整合法 JSON（上游模型输出被截断，"
+                f"仅收到 {len(raw)} 字符残片: {raw[:60]}）。请重新完整调用 '{name}'，"
+                "arguments 必须是单个合法 JSON 对象；若内容过长可拆分为多次调用。",
+                code="BAD_ARGS",
+                field="args",
+            )
         if name in _SKILL_TOOLS:
             return self._call_skill_tool(name, payload)
         if name in _MCP_TOOLS:
@@ -588,7 +602,7 @@ class ToolsPlugin:
                 "如需启用请经 configure op 或宿主 TOOLS_ENABLED 调整（装载≠启用）。",
                 code="TOOL_DISABLED",
             )
-        args = payload.get("args") or {}
+        args = args_any
         try:
             if not isinstance(args, dict):
                 return _err(f"args 必须是对象，收到: {type(args).__name__}", code="BAD_ARGS", field="args")

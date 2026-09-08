@@ -8,8 +8,9 @@
 </head>
 <body>
 <aside class="sidebar" id="sidebar">
-  <div class="brand"><span class="logo">R</span><span>react-agent</span></div>
+  <div class="brand"><span class="logo">R</span><span>react-agent</span><span class="inst-badge" id="inst-badge" hidden></span></div>
   <button class="newchat" id="newchat">＋ 新建对话</button>
+  <button class="newchat win" id="btn-newwin" title="新建独立窗口：绑定另一个工作区，独立会话/回滚/配置（多实例并行）">▣ 新窗口</button>
   <div class="sess-label">会话</div>
   <div class="sessions" id="sessions"></div>
 </aside>
@@ -17,7 +18,7 @@
 <div class="main">
   <header>
     <button class="toggle" id="toggle" title="折叠/展开会话栏">☰</button>
-    <span class="title">react-agent <small id="session-tag">session: -</small></span>
+    <span class="title">react-agent <small id="session-tag">session: -</small><small id="ws-tag" title="当前工作区（文件工具/文件树/产物的根）"></small></span>
     <span class="spacer"></span>
     <span class="dot" id="conn"></span>
     <span class="status" id="status"></span>
@@ -109,6 +110,27 @@
   </div>
 </aside>
 
-<script src="/app.js" defer></script>
+<div class="modal-mask" id="win-modal" hidden>
+  <div class="modal">
+    <div class="mhead">▣ 新建窗口（独立实例）</div>
+    <div class="field"><label>工作区文件夹（文件工具/文件树/产物均以此为根）</label>
+      <div style="display:flex; gap:8px">
+        <input id="win-ws" readonly placeholder="点击「浏览文件夹…」选择，无需手填路径">
+        <button type="button" class="btn ghost" id="win-browse" style="white-space:nowrap">📂 浏览文件夹…</button>
+      </div>
+    </div>
+    <p class="hint">新窗口 = 独立 host 进程：独立会话/回滚/配置，端口自动分配（8711 起）；实例名自动取文件夹名（同名窗口已开着就直接复用）。首次建窗自动继承当前窗口的模型配置（api_key 免重配）。数据存于代码根 .instances/，不影响目标项目目录。</p>
+    <div class="row"><button class="btn" id="win-create">创建并打开</button><button class="btn ghost" id="win-cancel">取消</button><span class="flash" id="win-flash"></span></div>
+  </div>
+</div>
+
+<!-- W17 迭代八拆分（原 app.js 单文件 → 五模块，vendor/ 前缀复用既有白名单规则零 Rust 改动；defer 按文档序执行）。
+     顺序约束：events 顶层立即调用 api()/connect()（api 声明在 settings）→ settings 必须先于 events；
+     settings/files 顶层仅赋值与 let 声明，无立即调用，故 core → stream → files → settings → events 安全。 -->
+<script src="/vendor/app-core.js" defer></script>
+<script src="/vendor/app-stream.js" defer></script>
+<script src="/vendor/app-files.js" defer></script>
+<script src="/vendor/app-settings.js" defer></script>
+<script src="/vendor/app-events.js" defer></script>
 </body>
 </html>

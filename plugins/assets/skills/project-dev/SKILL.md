@@ -1,6 +1,6 @@
 ---
 name: project-dev
-description: Meta-methodology orchestrator for project-level work (build-from-scratch / reverse architecture reading / iterative optimization). Decides the working mode, routes phases to companion skills (repo-explorer = reverse reading, tdd = verification), enforces the PLAN.md iteration loop and P/Q/I acceptance. Load FIRST for 做项目/从零开发/设计方案/重构优化/解读分析项目; skip for small one-off edits.
+description: Meta-methodology orchestrator for project-level work (build-from-scratch / reverse architecture reading / iterative optimization). Decides the working mode, routes phases to companion skills (repo-explorer = reverse reading, tdd = verification), enforces the PLAN.md iteration loop and P/Q/I acceptance. Load FIRST for 做项目/从零开发/设计方案/重构优化/大文件拆分/解读分析项目; skip for small one-off edits.
 origin: preset
 ---
 
@@ -64,6 +64,8 @@ origin: preset
 - 迭代循环：Phase 1 更新 PLAN（目标/方案）→ Phase 2 代码 → Phase 3 测试 + 保留/回退决策
   → PLAN 追加迭代记录。评估过不做的方案记 PLAN「已评估不做」，避免重复尝试。
 - 跨模块节奏：先修规则层（正确性），再修时间层（效率/健壮性），最后工程面收敛。
+- 体量治理（评估/拆分大文件）：按 references §3.5 执行——三清单（拆分/不拆/缓拆）+
+  纯搬家纪律 + 拆分引入的新语义边界逐项验证。**行数是引子，域混杂才是依据**。
 
 ## 7. 编码纪律
 
@@ -85,4 +87,5 @@ origin: preset
 |---|---|
 | 读仓库 / 架构审计 | load `repo-explorer`（快速建图档 or 六步深读档） |
 | 跑测试 / 改后验证 | load `tdd`（run_tests） |
+| 体量审计 / 大文件拆分 | read_file references `project-development-prompt.md` §3.5（三清单 + 纯搬家纪律） |
 | 模板与完整公理 | read_file `references/project-development-prompt.md` |
