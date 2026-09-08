@@ -11,6 +11,13 @@
 //! 实例名自动取工作区文件夹名（前端免填）；同一工作区重复创建 → 在线即复用（返回
 //! 原 url），离线即复活（换新端口，会话/config 保留）；主实例启动恢复上次工作区
 //! （.last-workspace，随每次启动记忆）。
+//!
+//! 复活语义（迭代九）：meta 存在 = 想要该实例。主实例启动时对「未手工停止且已死」
+//! 的注册实例自动重新 spawn（换新端口，memory/config/会话延续）；DELETE 手工停止
+//! 打 stopped 标记 → 不自动复活（同工作区 POST 复活路径重写 meta 自然清除标记）。
+//! 探活必须验身份：仅 TCP 连通会「探到别人家」（重启后端口被其他实例/进程复用），
+//! 以 `/api/config` 回显的 instance_name 比对为准。start-window.cmd 直启的实例不注册
+//! instance.json（手工生命周期），不参与自动复活。
 
 use serde_json::{json, Value};
 use std::net::{TcpListener, TcpStream};
@@ -124,13 +131,26 @@ fn port_alive(port: u16) -> bool {
         .unwrap_or(false)
 }
 
-fn pid_alive(pid: u64) -> bool {
-    // Windows：用 tasklist 过滤（轻量：/FI 过滤器）
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-        .unwrap_or(false)
+/// 身份探活：端口连通 **且** 该端口服务的 `/api/config` 回显的 instance_name 与期望一致。
+/// 仅 TCP 探活会「探到别人家」（重启后端口被其他实例/进程复用 → 假在线、复用分派
+/// 指错窗口），必须验身份——子实例启动带 REACT_INSTANCE_NAME，网关 /api/config 回显。
+/// 同步实现（读超时 1.5s 兜底；connection: close 对端写完即关）。
+fn identity_alive(port: u16, expect_name: &str) -> bool {
+    use std::io::{Read, Write};
+    if port == 0 || expect_name.is_empty() {
+        return false;
+    }
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_millis(1500)));
+    let req = format!("GET /api/config HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if s.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf); // 超时按已收字节判定（响应小，通常已完整）
+    String::from_utf8_lossy(&buf).contains(&format!("\"instance_name\":\"{expect_name}\""))
 }
 
 /// 工作区路径规范化比较（casefold + 尾部斜杠归一；仅用于同名冲突判定，不做文件操作）。
@@ -139,15 +159,37 @@ fn same_workspace(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
+/// spawn 自身 exe 为子实例（env 继承后覆盖 7 项，见 create_instance 文档）。返回 pid。
+/// 首建（create_instance）与复活（revive_instances）共用：实例目录/config 由调用方准备
+/// （复活保留旧 config/会话），meta 落盘亦归调用方（两者 meta 字段口径不同）。
+fn spawn_self(dir: &Path, name: &str, workspace: &str, port: u16) -> Result<u64, String> {
+    let ws = PathBuf::from(workspace);
+    let exe = std::env::current_exe().map_err(|e| format!("定位自身 exe 失败: {e}"))?;
+    let child = std::process::Command::new(&exe)
+        .env("REACT_FRONTEND", "web")
+        .env("WORKSPACE_ROOT", ws.canonicalize().unwrap_or(ws))
+        .env("WEB_ADDR", format!("127.0.0.1:{port}"))
+        .env("MEMORY_DATA_DIR", dir.join("memory"))
+        .env("AGENT_STREAM_DIR", dir.join("stream"))
+        .env("CONFIG_FILE", dir.join("config.json"))
+        .env("REACT_INSTANCE_NAME", name)
+        .spawn()
+        .map_err(|e| format!("spawn 实例进程失败: {e}"))?;
+    Ok(u64::from(child.id()))
+}
+
 /// 建实例并 spawn 自身（`name` 传 None → 自动取工作区文件夹名）。同步实现（含就绪等待，
 /// 最多 ~15s），调用方需放 spawn_blocking。
 ///
 /// 同名目录已存在时（目录即注册表）：
-/// - meta.workspace 与本次相同且在线 → 直接复用（返回原 url，不重复 spawn）
-/// - meta.workspace 与本次相同但离线 → 复活（换新端口，memory/config 保留，会话延续）
+/// - meta.workspace 与本次相同且在线（身份探活）→ 直接复用（返回原 url，不重复 spawn）
+/// - meta.workspace 与本次相同但离线 → 复活（换新端口，memory/config 保留，会话延续；
+///   stopped 标记随 meta 重写自然清除）
 /// - meta.workspace 与本次不同 → 名字尾部加 `-2`/`-3`… 找空位
+/// - 目录存在但无 instance.json（脏目录/start-window.cmd 手工实例）→ 视为被占加后缀
+///   （不收编：无 meta 即无法身份探活，避免与手工实例双进程同目录互踩）
 ///
-/// env 继承父进程后覆盖 7 项：WORKSPACE_ROOT / WEB_ADDR / MEMORY_DATA_DIR /
+/// spawn 自身 env 继承父进程后覆盖 7 项：WORKSPACE_ROOT / WEB_ADDR / MEMORY_DATA_DIR /
 /// AGENT_STREAM_DIR / CONFIG_FILE / REACT_INSTANCE_NAME / REACT_FRONTEND。
 /// 其余（LLM_*、SEARCH_* 等）照常继承——子实例默认同模型配置（config.json 亦复制）。
 pub fn create_instance(name: Option<&str>, workspace: &str) -> Result<Value, String> {
@@ -169,14 +211,13 @@ pub fn create_instance(name: Option<&str>, workspace: &str) -> Result<Value, Str
             } else if let Some(meta) = read_instance_meta(&dir) {
                 let prev = meta.get("workspace").and_then(Value::as_str).unwrap_or("");
                 if same_workspace(prev, workspace) {
-                    let pid = meta.get("pid").and_then(Value::as_u64);
                     let port = meta.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
-                    if pid.is_some_and(pid_alive) && port_alive(port) {
+                    if identity_alive(port, &base) {
                         // 同工作区已在线：直接复用（前窗重开同一项目不重复起进程）
                         return Ok(json!({
                             "ok": true, "reused": true, "name": base, "port": port,
                             "url": format!("http://127.0.0.1:{port}"),
-                            "pid": pid.unwrap_or(0),
+                            "pid": meta.get("pid").and_then(Value::as_u64).unwrap_or(0),
                         }));
                     }
                     base // 同工作区离线 → 复活
@@ -208,17 +249,7 @@ pub fn create_instance(name: Option<&str>, workspace: &str) -> Result<Value, Str
             std::fs::copy(&main_cfg, &cfg).map_err(|e| format!("复制主 config 失败: {e}"))?;
         }
     }
-    let exe = std::env::current_exe().map_err(|e| format!("定位自身 exe 失败: {e}"))?;
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.env("REACT_FRONTEND", "web")
-        .env("WORKSPACE_ROOT", ws.canonicalize().unwrap_or(ws))
-        .env("WEB_ADDR", format!("127.0.0.1:{port}"))
-        .env("MEMORY_DATA_DIR", dir.join("memory"))
-        .env("AGENT_STREAM_DIR", dir.join("stream"))
-        .env("CONFIG_FILE", &cfg)
-        .env("REACT_INSTANCE_NAME", &name);
-    let child = cmd.spawn().map_err(|e| format!("spawn 实例进程失败: {e}"))?;
-    let pid = child.id();
+    let pid = spawn_self(&dir, &name, workspace, port)?;
     let meta = json!({
         "name": name,
         "pid": pid,
@@ -339,8 +370,11 @@ pub fn list_instances() -> Vec<Value> {
         let Some(mut meta) = read_instance_meta(&entry.path()) else {
             continue;
         };
+        // online = 身份探活（端口连通且 /api/config 回显的实例名一致）——仅测端口会
+        // 「探到别人家」：重启后端口被其他实例/进程复用时假报在线（迭代五遗留观察）
+        let name = meta.get("name").and_then(Value::as_str).unwrap_or("");
         let port = meta.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
-        let online = port > 0 && port_alive(port);
+        let online = identity_alive(port, name);
         meta["online"] = json!(online);
         meta["url"] = json!(format!("http://127.0.0.1:{port}"));
         out.push(meta);
@@ -351,11 +385,12 @@ pub fn list_instances() -> Vec<Value> {
     out
 }
 
-/// 停止实例：杀 instance.json 记录的 pid（数据目录保留，同工作区 POST 可复活换新端口）。
+/// 停止实例：杀 instance.json 记录的 pid，并打 `stopped:true` 标记（数据目录保留；
+/// 主实例启动的自动复活跳过手工停止的实例，同工作区 POST 复活路径重写 meta 清除标记）。
 pub fn stop_instance(name: &str) -> Result<Value, String> {
     validate_name(name)?;
     let dir = instance_dir(name);
-    let meta = read_instance_meta(&dir).ok_or_else(|| format!("实例 {name} 不存在"))?;
+    let mut meta = read_instance_meta(&dir).ok_or_else(|| format!("实例 {name} 不存在"))?;
     let pid = meta.get("pid").and_then(Value::as_u64).ok_or("instance.json 缺 pid")?;
     let out = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/F"])
@@ -365,7 +400,77 @@ pub fn stop_instance(name: &str) -> Result<Value, String> {
         // 进程可能已退出（探活误报/用户手工关）——清 pid 视为已停
         tracing::warn!("taskkill pid {pid} 非零退出（可能已退出）: {}", String::from_utf8_lossy(&out.stderr));
     }
+    meta["stopped"] = json!(true); // 手工停止语义：不参与启动自动复活（写失败仅影响该语义）
+    let _ = std::fs::write(dir.join("instance.json"), serde_json::to_string_pretty(&meta).unwrap_or_default());
     Ok(json!({"ok": true, "name": name, "stopped": pid}))
+}
+
+/// 主实例启动自动复活（W17 迭代九）：扫 `.instances/`，对「未手工停止（无 stopped
+/// 标记）且已死（身份探活失败）」的注册实例按原目录/工作区重新 spawn——换新端口，
+/// memory/config/会话延续（数据目录即注册表，复活沿用原 dir）。
+/// 后台线程调用：串行 spawn + 逐个就绪等待（防端口探测竞态与启动风暴），不阻塞主实例。
+/// 复活不改 .last-workspace（那是主实例自己的工作区记忆）。
+pub fn revive_instances() -> usize {
+    let Ok(rd) = std::fs::read_dir(instances_root()) else {
+        return 0;
+    };
+    let mut revived = 0usize;
+    for entry in rd.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Some(meta) = read_instance_meta(&dir) else {
+            continue;
+        };
+        let name = meta.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let port = meta.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+        let ws = meta.get("workspace").and_then(Value::as_str).unwrap_or("").to_string();
+        if name.is_empty() || ws.is_empty() || validate_name(&name).is_err() {
+            continue;
+        }
+        if meta.get("stopped").and_then(Value::as_bool).unwrap_or(false) {
+            tracing::info!("实例 {name} 曾手工停止，跳过自动复活");
+            continue;
+        }
+        if identity_alive(port, &name) {
+            continue; // 仍在运行（杀主不杀子：子进程独立于父，存活则无需复活）
+        }
+        if !Path::new(&ws).is_dir() {
+            tracing::warn!("实例 {name} 工作区已消失，跳过自动复活: {ws}");
+            continue;
+        }
+        let Some(new_port) = find_free_port(8711) else {
+            tracing::warn!("实例 {name} 复活失败：8711-8910 无空闲端口");
+            continue;
+        };
+        match spawn_self(&dir, &name, &ws, new_port) {
+            Ok(pid) => {
+                // meta 回写新 pid/port（保留 created_at）；重写不带 stopped → 标记自然清除
+                let mut m = meta.clone();
+                m["pid"] = json!(pid);
+                m["port"] = json!(new_port);
+                let _ = std::fs::write(
+                    dir.join("instance.json"),
+                    serde_json::to_string_pretty(&m).unwrap_or_default(),
+                );
+                tracing::info!("已复活实例 {name}: http://127.0.0.1:{new_port} (pid {pid})");
+                revived += 1;
+            }
+            Err(e) => tracing::warn!("实例 {name} 复活失败: {e}"),
+        }
+        // 就绪等待（最多 ~15s）再轮到下一个
+        for _ in 0..75 {
+            if identity_alive(new_port, &name) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    if revived > 0 {
+        tracing::info!("子实例自动复活完成: {revived} 个");
+    }
+    revived
 }
 
 #[cfg(test)]
@@ -407,5 +512,42 @@ mod tests {
     fn 端口探测返回可绑定端口() {
         let p = find_free_port(8711).expect("应找到空闲端口");
         assert!(TcpListener::bind(("127.0.0.1", p)).is_ok());
+    }
+
+    /// 身份探活：起一个只会回固定 /api/config 响应的假服务（两次 accept 供两次探活）。
+    #[test]
+    fn 身份探活_名字匹配才在线() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let body = r#"{"ok":true,"config":{"instance_name":"ws-a","model":"m"}}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let h = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut s, _)) = l.accept() {
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf);
+                    let _ = s.write_all(resp.as_bytes());
+                } // s 在此 drop → connection close → 客户端 read_to_end 收尾
+            }
+        });
+        assert!(identity_alive(port, "ws-a"), "名字一致 → 在线");
+        assert!(!identity_alive(port, "ws-b"), "名字不符 = 别人家，必须离线");
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn 身份探活_端口未监听即离线() {
+        // bind 后立刻 drop：拿到一个当前必然无人监听的端口
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(!identity_alive(port, "ws-a"));
+        assert!(!identity_alive(0, "ws-a")); // port=0 卫语句
+        assert!(!identity_alive(port, "")); // 空名卫语句
     }
 }

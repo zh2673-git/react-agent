@@ -119,7 +119,7 @@
         <button type="button" class="btn ghost" id="win-browse" style="white-space:nowrap">📂 浏览文件夹…</button>
       </div>
     </div>
-    <p class="hint">新窗口 = 独立 host 进程：独立会话/回滚/配置，端口自动分配（8711 起）；实例名自动取文件夹名（同名窗口已开着就直接复用）。首次建窗自动继承当前窗口的模型配置（api_key 免重配）。数据存于代码根 .instances/，不影响目标项目目录。</p>
+    <p class="hint">新窗口 = 独立 host 进程：独立会话/回滚/配置，端口自动分配（8711 起）；实例名自动取文件夹名（同名窗口已开着就直接复用）。首次建窗自动继承当前窗口的模型配置（api_key 免重配）。数据存于代码根 .instances/，不影响目标项目目录。重启本主窗口后，未手动停止的子窗口会自动复活（换新端口，会话保留）。</p>
     <div class="row"><button class="btn" id="win-create">创建并打开</button><button class="btn ghost" id="win-cancel">取消</button><span class="flash" id="win-flash"></span></div>
   </div>
 </div>
