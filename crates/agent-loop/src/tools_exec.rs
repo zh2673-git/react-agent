@@ -105,6 +105,9 @@ impl AgentLoopPlugin {
         self.detect_artifacts(src, session_id, tc, result).await;
         // 来源登记：web 检索/阅读的引用链接结构化落账，前端渲染溯源卡（信息溯源）
         self.detect_sources(src, session_id, tc, result).await;
+        // 变更登记（V2 执行可见性）：write/edit 成功 → file_change 事件结构化落账，
+        // 前端聚合为头部「📝 文件变更」chip + 抽屉（随时可答「agent 动了哪些文件」）
+        self.detect_file_changes(src, session_id, round, tc, result).await;
     }
 
     /// 产物检测：write_file/edit_file 是结构化结果直接取 path/bytes；bash 从输出文本
@@ -149,6 +152,72 @@ impl AgentLoopPlugin {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 变更登记（执行可见性 V2 + W16）：write/edit 成功 → `file_change` 事件 {path, op,
+    /// round}；bash（W16 追溯半）结果带 `changes[]`（bash.py 快照区前后比对）→ 逐条转发
+    /// 为 op=bash 事件（新增/修改/删除 + undo 引用）。事件进既有 trace（只追加）、SSE 透传、
+    /// schema 只增不改。区外改动（噪音/流/产物/工作区外）不产生事件。子代理变更经 trace
+    /// 镜像自动汇入父会话（打 sub 标签）。
+    pub(super) async fn detect_file_changes(
+        &self,
+        src: &Envelope,
+        session_id: &str,
+        round: u32,
+        tc: &ToolCall,
+        result: &Value,
+    ) {
+        for mut ev in Self::file_change_events_for(tc, result) {
+            ev["round"] = json!(round);
+            self.trace(src, session_id, ev).await;
+        }
+    }
+
+    /// 纯函数：从工具调用与结果推导 file_change 事件（None = 不登记）。
+    /// 失败的写/编辑不登记；path 归一为正斜杠（与产物登记同款）。
+    /// 结果内带 undo 引用（files.py 变更快照，R15 回滚撤销 + 双侧 diff 数据源）→ 原样透传。
+    pub(super) fn file_change_event_for(tc: &ToolCall, result: &Value) -> Option<Value> {
+        Self::file_change_events_for(tc, result).into_iter().next()
+    }
+
+    /// 多事件版（W16）：write/edit 单事件；bash 从 `result.changes[]` 展开多事件（op=bash，
+    /// 带 undo 引用——回滚撤销与 diff 视图与 write/edit 同协议）。
+    pub(super) fn file_change_events_for(tc: &ToolCall, result: &Value) -> Vec<Value> {
+        if result.get("ok") != Some(&json!(true)) {
+            return Vec::new();
+        }
+        match tc.name.as_str() {
+            "write_file" | "edit_file" => {
+                let op = if tc.name == "write_file" { "write" } else { "edit" };
+                let inner = result.get("result").cloned().unwrap_or(json!({}));
+                let Some(path) = inner.get("path").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                let mut ev = json!({"type": "file_change", "path": path.replace('\\', "/"), "op": op});
+                if let Some(u) = inner.get("undo") {
+                    ev["undo"] = u.clone();
+                }
+                vec![ev]
+            }
+            "bash" => result
+                .get("result")
+                .and_then(|r| r.get("changes"))
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|c| {
+                            let path = c.get("path").and_then(Value::as_str)?.replace('\\', "/");
+                            let mut ev = json!({"type": "file_change", "path": path, "op": "bash"});
+                            if let Some(u) = c.get("undo") {
+                                ev["undo"] = u.clone();
+                            }
+                            Some(ev)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
         }
     }
 

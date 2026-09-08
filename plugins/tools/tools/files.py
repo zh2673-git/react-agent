@@ -5,6 +5,14 @@ v3 增强（2026-09-06，PLAN §6）：编码探测（BOM/UTF-8/GBK 回退，结
 「行尾空白 + 换行符」容错匹配 + 失败候选线索 + unified diff 回显 + 按探测编码回写；
 list_dir 递归 + mtime + 排序 + 条目上限 + 噪音剪枝。写统一 newline=""（不翻译换行，
 保持文件原有 LF/CRLF 风格——修复旧版 edit/write 把 LF 文件改写成 CRLF 的隐性问题）。
+
+v6 核心写保护（2026-09-08，自扩展安全边界）：write_file/edit_file 追加「核心路径黑名单」
+——agent 自扩展只能走四条固定途径（SKILL.md / 技能 tools.json / plugins/tools/*.py 新
+文件 / config.json 的 mcp_servers），对 agent 自身运行体（crates 源树、memory/llm_adapter
+插件、内置工具实现、config.json、.git）的写入默认拒绝（fail-closed）。技能根目录（自扩展
+主通道）显式豁免。逃生舱：env ALLOW_CORE_WRITE=1（config.json tools.allow_core_write 持久
+通道映射，改后重启 host 生效）。诚实边界：bash 间接写不经此闸（靠 SYSTEM.md 纪律 + bash
+沙箱兜底）。
 """
 
 import difflib
@@ -12,6 +20,7 @@ import fnmatch
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 
 from . import ToolError, optional_int, require, workspace_root
@@ -25,6 +34,72 @@ _MAX_LIST_ENTRIES = 5000
 _NOISE_DIRS = frozenset(
     {".git", "node_modules", "target", "__pycache__", ".venv", "venv", "dist", "build", ".idea"}
 )
+
+# ── 核心写保护（v6）：禁止 write_file/edit_file 触碰的路径（相对 WORKSPACE_ROOT，normcase
+# 前缀匹配）。原则：agent 的运行体（宿主源码、内核插件、工具实现、配置）不可自改；自扩展
+# 走白名单途径。skills root 单独豁免（SKILLS_DIR 或 plugins/assets/skills）。 ──
+_CORE_BLOCKLIST = (
+    "crates",                       # Rust 源树（host/agent-loop + web-dist 前端）
+    "plugins/memory",               # 内核插件：trace 记忆
+    "plugins/llm_adapter",          # 内核插件：模型适配
+    "plugins/assets",               # 内核插件：SYSTEM.md/出厂技能（skills root 内豁免）
+    "plugins/tools/tools",          # 内置 9 件工具实现包
+    "plugins/tools/tools_plugin.py",  # 工具插件分派层（装载/启用闸所在）
+    "config.json",                  # 密钥与运行配置（防自改授权/密钥）
+    ".git",                         # 版本库（防篡改历史/回退能力）
+)
+# 说明：plugins/tools 顶层不在黑名单——L2 自扩展通道（放新 .py 工具模块），
+# 仅内置模块名（files/bash/web/grep/symbols/mcp/__init__）在 _is_core_path 内单独保护。
+
+
+def _core_write_allowed() -> bool:
+    return os.environ.get("ALLOW_CORE_WRITE", "").strip() == "1"
+
+
+def _skills_root_real() -> Path:
+    env = os.environ.get("SKILLS_DIR")
+    base = Path(env) if env else Path(workspace_root()) / "plugins" / "assets" / "skills"
+    return Path(os.path.realpath(base))
+
+
+def _is_core_path(real: Path) -> bool:
+    """real 是否落在核心黑名单内（skills root 显式豁免——自扩展主通道不可断）。"""
+    ws_real = Path(os.path.realpath(workspace_root()))
+    try:
+        rel = real.relative_to(ws_real)
+    except ValueError:
+        return False  # 工作区外的软链/重定向：越界闸已拦，此处不再判
+    parts = rel.parts
+    sk = _skills_root_real()
+    if str(real).startswith(str(sk) + os.sep) or real == sk:
+        return False  # 技能目录：SKILL.md / tools.json / 技能工具执行体的合法落点
+    rel_low = os.path.normcase(str(rel))
+    for entry in _CORE_BLOCKLIST:
+        e = os.path.normcase(entry)
+        if rel_low == e or rel_low.startswith(e + os.sep):
+            return True
+    # plugins/tools 顶层：只允许新建/改非内置模块 .py（L2 自扩展），内置名保护
+    if len(parts) >= 3 and parts[0] == "plugins" and parts[1] == "tools":
+        name = parts[2]
+        if name in {"files", "bash", "web", "grep", "symbols", "mcp", "__init__", "__pycache__"}:
+            return True
+    return False
+
+
+def _guard_write(real: Path, path_str: str) -> Path:
+    """写入闸（write_file/edit_file 专用）：核心黑名单默认拒绝，ALLOW_CORE_WRITE=1 放行。"""
+    if _core_write_allowed():
+        return real
+    if _is_core_path(real):
+        raise ToolError(
+            f"核心路径写入被拒绝: '{_display(real)}'——这是 agent 自身的运行体（宿主源码/内核"
+            "插件/内置工具/配置），自扩展只能走固定途径（skills 目录写 SKILL.md、技能目录放 "
+            "tools.json、plugins/tools/ 顶层放新工具 .py、config.json 声明 mcp_servers）。"
+            "确需修改核心请直接向用户说明，由用户自行修改或显式开启 ALLOW_CORE_WRITE=1。",
+            code="CORE_PROTECTED",
+            field="path",
+        )
+    return real
 
 
 def _guard(path_str: str) -> Path:
@@ -144,7 +219,7 @@ def _read_file(args: dict) -> str:
 
 
 def _write_file(args: dict) -> dict:
-    real = _guard(require(args, "path"))
+    real = _guard_write(_guard(require(args, "path")), require(args, "path"))
     content = args.get("content")
     if not isinstance(content, str):
         raise ToolError("缺少必填参数 'content'（string，全量覆盖写入）", code="MISSING_ARG", field="content")
@@ -156,8 +231,10 @@ def _write_file(args: dict) -> dict:
         "action": "overwritten" if existed else "written",
     }
     old_text: str | None = None
+    before_raw: bytes | None = None
     if existed:
         old_raw = real.read_bytes()
+        before_raw = old_raw
         if _sniff_binary(old_raw) is None:
             old_text, _, _ = _read_text(real)
         if bool(args.get("backup", True)):  # 覆盖前备份（.bak 只留最近一份）
@@ -181,6 +258,8 @@ def _write_file(args: dict) -> dict:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+    if (snap := _snapshot_change(before_raw, real.read_bytes())) is not None:
+        result["undo"] = snap
     return result
 
 
@@ -210,7 +289,7 @@ def _line_candidates(text: str, needle: str, limit: int = 3) -> list[str]:
 
 
 def _edit_file(args: dict) -> dict:
-    real = _guard(require(args, "path"))
+    real = _guard_write(_guard(require(args, "path")), require(args, "path"))
     old = require(args, "old_string")
     new = require(args, "new_string")
     replace_all = bool(args.get("replace_all", False))
@@ -248,21 +327,65 @@ def _edit_file(args: dict) -> dict:
         new_text = _fuzzy_re(old).sub(lambda m: new_used, text, count=0 if replace_all else 1)
     else:
         new_text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+    before_raw = real.read_bytes()  # 变更前原始字节（快照与精确恢复依据）
     diff = "\n".join(difflib.unified_diff(text.splitlines(), new_text.splitlines(), lineterm="", n=1))
     if len(diff) > _DIFF_MAX_CHARS:
         diff = diff[:_DIFF_MAX_CHARS] + "\n…[diff 过长已截断]"
     _write_newline_safe(real, new_text, encoding=write_enc)
-    return {
+    result = {
         "path": _display(real),
         "replacements": count if replace_all else 1,
         "match_mode": mode,
         "action": "edited",
         "diff": diff,
     }
+    if (snap := _snapshot_change(before_raw, real.read_bytes())) is not None:
+        result["undo"] = snap
+    return result
 
 
 def _fmt_mtime(st: os.stat_result) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
+
+
+# ── 变更快照（回滚撤销 + 双侧 diff 数据源）：write_file/edit_file 成功后把变更前后的
+# 原始字节落 MEMORY_DATA_DIR/undo/<id>.{before,after}（工作区外，不进文件树）。事件只带
+# 引用不带内容——trace 不膨胀；undo 侧按 id 取字节对，after 与当前文件逐字节比对做冲突
+# 检测（agent 写完后人又改过 → 跳过撤销，绝不硬覆盖）。超限或 IO 失败 → 无 undo 引用，
+# 前端 diff 降级（edit 由 old/new 重构、write 新建 before=空、覆盖场景仅单侧）。
+_UNDO_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _undo_dir() -> Path:
+    base = os.environ.get("MEMORY_DATA_DIR") or str(
+        Path(workspace_root()) / "plugins" / "memory" / "data"
+    )
+    d = Path(base) / "undo"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _snapshot_change(before_raw: bytes | None, after_raw: bytes | None) -> dict | None:
+    """写后快照。before_raw=None 表示新建（undo 时整文件删除）；after_raw=None 表示
+    文件被删除（W16 bash 删除追溯：undo 时还原 before 字节）。"""
+    try:
+        if (after_raw is not None and len(after_raw) > _UNDO_MAX_BYTES) or (
+            before_raw is not None and len(before_raw) > _UNDO_MAX_BYTES
+        ):
+            return None
+        uid = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        (_undo_dir() / f"{uid}.before").write_bytes(before_raw or b"")
+        if after_raw is not None:
+            (_undo_dir() / f"{uid}.after").write_bytes(after_raw)
+        return {
+            "id": uid,
+            "created": before_raw is None,
+            "deleted": after_raw is None,
+            "bytes_before": 0 if before_raw is None else len(before_raw),
+            "bytes_after": 0 if after_raw is None else len(after_raw),
+        }
+    except OSError:
+        return None
 
 
 def _list_dir(args: dict) -> str:

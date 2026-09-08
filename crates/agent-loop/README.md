@@ -88,10 +88,12 @@ react-agent 的大脑：把"用户一句话"变成"多轮感知 → 规划 → �
   后续 `assistant` 增量经 `stream_delta` 显示，最终 `assistant` 事件带完整内容。
 - 多轮 `usage` 在 `UsageAcc` 里累计（用户看总消耗）；`elapsed_ms` 取本轮 LLM 耗时。
 
-> **sid 唯一性（已知限制）**：当前 `sid` 形如 `s-{rand}-{round}`，`round` 是 ReAct 轮次，**跨不同对话回合
-> 不保证唯一**——同一会话连续两轮若都只有 1 轮 ReAct，会生成相同 sid（如 `s-xxx-r1`）。前端按 sid 去重时
-> 可能误把后一回合的流式动画当作「已完成重连帧」忽略（直接显示最终答案，无打字效果）。若要全局唯一，
-> 建议 sid 改为含会话内自增序号或时间戳（如 `s-{rand}-t{mono_inc}`），并同步 host `stream_file` 规则。
+> **sid 唯一性（已修复，2026-09-08）**：`sid` 形如 `{session}-r{N}`，N 为 per session
+> 单调递增序号（首个以 unix 毫秒为种子，`next_sid`）——跨对话回合不再碰撞。旧实现
+> N = 回合内 rounds（每对话回合重置），连续两轮 rounds 相同会生成相同 sid，前端
+> doneSids 去重可能误吞后一回合的流式动画（直接显示最终答案，无打字效果）。
+> 形状保持 `{session}-r{digits}`：llm-adapter `_SID_RE`（`^(.*)-r\d+$` 反解会话 id 供
+> abort/cancel 对位）与 host `stream_file` 均无需改动。
 
 ## 改动时的联动点
 

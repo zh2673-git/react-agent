@@ -322,7 +322,7 @@ impl AgentLoopPlugin {
             if let Some(v) = self.check_stop(env, &req.session_id, &budget, &usage).await {
                 return v;
             }
-            let sid = format!("{}-r{}", req.session_id, rounds);
+            let sid = self.next_sid(&req.session_id); // 单调唯一（跨回合不碰撞），形状不变
             let stream = stream_path.as_deref().map(|p| (p, sid.as_str()));
             // P7/R5：发送前逐级收紧（token 闸启用且工作集超发送预算时）——窗口减半 →
             // tool_result 限额减半 → 仍超限即 CONTEXT_OVERFLOW，请求不发出。
@@ -445,7 +445,7 @@ impl AgentLoopPlugin {
         }
         // 轮次耗尽：最后一轮不带工具，强制收敛（同样先过发送前收紧）
         rounds += 1;
-        let sid = format!("{}-r{}", req.session_id, rounds);
+        let sid = self.next_sid(&req.session_id); // 单调唯一，形状不变
         let stream = stream_path.as_deref().map(|p| (p, sid.as_str()));
         messages = match context::tighten_for_context(messages) {
             Ok(m) => m,

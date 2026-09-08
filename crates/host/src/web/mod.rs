@@ -245,6 +245,8 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
             api::delete_skill(&mut stream, r.trim_start_matches("/api/skills/")).await
         }
         ("POST", "/api/reveal") => api::reveal_target(&mut stream, query).await,
+        ("GET", "/api/tree") => files::list_workspace_tree(&mut stream, query).await,
+        ("GET", "/api/fc-snapshot") => files::serve_undo_snapshot(&mut stream, query).await,
         ("GET", r) if r.starts_with("/files/") => {
             files::serve_workspace_file(&mut stream, r.trim_start_matches("/files/"), query).await
         }
@@ -297,6 +299,14 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
             let Some(idx) = req.get("upto_user_index").and_then(Value::as_u64) else {
                 return json_resp(&mut stream, 400, bad_request("缺 upto_user_index", Some("upto_user_index"))).await;
             };
+            // R15 文件撤销：memory 物理截断**之前**先读 trace 收集区间内带 undo 引用的
+            // 变更事件；截断成功后倒序恢复（冲突检测：文件被改过即跳过，绝不硬覆盖）。
+            // body `undo_files:false` 可显式关闭（缺省撤销）。bash 间接改的文件无事件、不追踪。
+            let undo_items = if req.get("undo_files").and_then(Value::as_bool) != Some(false) {
+                files::collect_undo_items(session, idx)
+            } else {
+                Vec::new()
+            };
             match dispatch_or_err(
                 &kernel,
                 "memory",
@@ -304,7 +314,14 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
             )
             .await
             {
-                Ok(v) => json_resp(&mut stream, 200, v).await,
+                Ok(mut v) => {
+                    if !undo_items.is_empty() {
+                        let (undone, skipped) = files::undo_file_changes(&undo_items);
+                        v["undone"] = json!(undone);
+                        v["skipped"] = json!(skipped);
+                    }
+                    json_resp(&mut stream, 200, v).await
+                }
                 Err(e) => json_resp(&mut stream, 502, e).await,
             }
         }

@@ -33,7 +33,7 @@ react-agent 的运行时：拉起全部 guest 插件、暴露 Web UI 与 SSE、�
 ## Web 与 SSE
 
 - 静态根：`crates/host/web-dist/`（运行时 serve，非编译内嵌——改 HTML 刷新即生效）。
-- `/api/*`：配置读写、会话、技能 CRUD、chat（含 R3 attachments 透传校验）/ cancel（R1 双通道）/ rollback（R2 回滚转发）等（见 `frontend.rs`；API 表见根 README）。
+- `/api/*`：配置读写、会话、技能 CRUD、chat（含 R3 attachments 透传校验）/ cancel（R1 双通道）/ rollback（R2 回滚转发 + W15 文件撤销：截断前收集区间内带 undo 引用的 file_change 事件，倒序恢复快照，冲突跳过报告）/ fc-snapshot（W15 变更快照读取）等（见 `web/mod.rs`；API 表见根 README）。
 - `/api/events`（SSE）：`sse_events` 每 50~300ms（流式进行中）/ 300ms（空闲）轮询一次：
   - `memory.session.trace.read`（`after` 游标推进）→ 转成 `trace_*` 事件；
   - `.stream/<session>.jsonl` 旁路 → 转成 `stream_*` 事件（`start` / `delta` / `end` / `error`，
@@ -75,5 +75,6 @@ react-agent 的运行时：拉起全部 guest 插件、暴露 Web UI 与 SSE、�
   检查命中即关流，**单轮长生成可即时中断**；llm-adapter 已为 Concurrent 语义可即时受理，abort
   dispatch 失败仅 warn 降级——轮次边界取消仍有效）。前端发送期间显示「停止」按钮。详见
   agent-loop README「运行中断（停止）」与 llm_adapter README「abort」。
-- **sid 跨对话不保证唯一**：同 round 的不同对话回合 sid 相同，重连去重（`doneSids`）可能误忽略后一回合的
-  流式动画（直接显示最终答案）。属已知退化，不影响最终内容完整性。
+- **sid 已修复（历史限制）**：sid 现形如 `{session}-r{N}`（N 为 per session 单调序号，unix
+  毫秒种子），相邻对话回合不再碰撞。旧版 rounds 每回合重置导致 doneSids 去重误吞流式动画的
+  问题已消除，细节见 `crates/agent-loop/README.md`「流式编排」。

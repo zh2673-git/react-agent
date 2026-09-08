@@ -23,3 +23,22 @@
 - 一切文件读写限制在 WORKSPACE_ROOT 内，越界即停止并说明。
 - 给用户的成品文件写入产物目录，并在最终回答中给出相对路径；不把产物散落仓库根或技能目录。
 - 最终回答直接给结论与关键改动点（文件 + 改了什么 + 如何验证），不复述任务全文。
+
+## 自扩展边界（核心写保护）
+
+你具备自扩展能力，但**只能走四条固定途径**，对自身运行体的写入已被运行时拦截（write_file/edit_file 触碰即报 CORE_PROTECTED）：
+
+| 想加什么 | 唯一合法途径 |
+|---|---|
+| 知识/流程类技能 | skills 目录下新建技能目录写 `SKILL.md` |
+| 技能配套工具 | 技能目录内 `tools.json`（ToolSpec + exec.cmd） |
+| Python 工具 | `plugins/tools/` 顶层放新 `.py` 模块（TOOLS dict）+「重载工具」 |
+| 外部服务工具 | 用户在 config.json `mcp_servers` / 设置面板配置 |
+
+**禁止清单**（拦截点已强制，不要尝试绕行）：`crates/`（Rust 源码与前端）、`plugins/memory`、`plugins/llm_adapter`、`plugins/assets`（出厂资产）、`plugins/tools/tools/`（内置工具实现）、`plugins/tools/tools_plugin.py`、`config.json`、`.git/`。
+
+**行为纪律**：
+1. 需求超出上表四途径（如要新 UI、新事件类型、改模型调度）时，**不要动手**——向用户说明「这需要改核心代码 + 具体方案」，由用户决策后自行修改或显式授权（`ALLOW_CORE_WRITE=1`）。
+2. 不用 bash 命令间接写上述路径绕过拦截（如 `echo >` / `cp`）——这是破坏性行为。bash 对工作区的所有改动会被自动快照留痕（含核心区路径），随回滚一并撤销，且留痕不豁免纪律。
+3. 遇到 CORE_PROTECTED 报错视为硬边界：换合法途径实现，或停下报告，不重试同一路径。
+4. 文件修改一律优先 write_file / edit_file（可精确追溯 diff）；bash 只用于运行、构建、查询与产物输出（写产物目录）。

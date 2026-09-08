@@ -94,6 +94,11 @@ pub struct AgentLoopPlugin {
     /// 回合开始时间（per session）：兜底产物扫描的「新鲜度」基准——只有本轮生成
     /// （mtime ≥ 回合开始）的文件才登记为 artifact，ls/git 输出里的历史文件不再刷卡。
     turn_starts: Mutex<std::collections::HashMap<String, std::time::SystemTime>>,
+    /// 流式 sid 单调序（sid 唯一性修复）：per session 递增，首个 sid 以 unix 毫秒为
+    /// 基准种子——跨对话回合（rounds 重置）不再生成相同 sid；跨 host 重启也因毫秒
+    /// 种子不同而不碰撞。形状保持 `{session}-r{digits}`：llm-adapter 的
+    /// `_SID_RE`（`^(.*)-r\d+$`）无需改动即可反解会话 id（abort/cancel 对位）。
+    sid_seq: Mutex<std::collections::HashMap<String, u64>>,
     /// 子代理事件镜像（R11）：sub_session → parent_session。run_subagent 委派期间
     /// 注册，trace() 据此把子会话事件同步写一份到父 trace（打 `sub` 标签），前端
     /// 过程框内的「子代理」框据此实时/重放渲染——否则子代理只有一个静态图标，
@@ -133,6 +138,7 @@ pub fn new(max_rounds: usize) -> PluginInstance {
         sub_counter: AtomicU64::new(0),
         cancels: Mutex::new(HashSet::new()),
         turn_starts: Mutex::new(std::collections::HashMap::new()),
+        sid_seq: Mutex::new(std::collections::HashMap::new()),
         mirrors: Mutex::new(std::collections::HashMap::new()),
     })
 }
@@ -160,6 +166,22 @@ fn tool_result_limit() -> usize {
 }
 
 impl AgentLoopPlugin {
+    /// 生成下一轮流式 sid（sid 唯一性修复）：`{session}-r{N}`，N 为 per session 单调
+    /// 递增序号，首个 sid 以 unix 毫秒为种子。跨对话回合不再碰撞（旧 bug：每回合
+    /// rounds 从 1 重新计数，前端 doneSids 去重把后一回合的流式动画误判为已定稿帧）。
+    pub(crate) fn next_sid(&self, session_id: &str) -> String {
+        let mut m = self.sid_seq.lock().unwrap();
+        let n = match m.get(session_id) {
+            Some(v) => v + 1,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(1),
+        };
+        m.insert(session_id.to_string(), n);
+        format!("{session_id}-r{n}")
+    }
+
     /// 跨插件调用便捷封装：复制 trace_id/priority，附 deadline。
     async fn call(
         &self,
@@ -253,6 +275,60 @@ mod tests {
             .collect();
         let items = AgentLoopPlugin::extract_sources("web_search", &json!({ "results": results }));
         assert_eq!(items.len(), 10, "溯源卡上限 10 条");
+    }
+
+    #[test]
+    fn file_change_event_only_for_successful_file_tools() {
+        let tc = |name: &str| ToolCall { id: "1".into(), name: name.into(), arguments: json!({}) };
+        let ok = |path: &str| json!({"ok": true, "result": {"path": path}});
+        // 成功 write/edit → 事件（path 归一正斜杠）
+        let ev = AgentLoopPlugin::file_change_event_for(&tc("write_file"), &ok(r"D:\ws\outputs\a.md")).unwrap();
+        assert_eq!(ev["path"], json!("D:/ws/outputs/a.md"), "反斜杠归一");
+        assert_eq!(ev["op"], json!("write"));
+        let ev = AgentLoopPlugin::file_change_event_for(&tc("edit_file"), &ok("x.md")).unwrap();
+        assert_eq!(ev["op"], json!("edit"));
+        // 失败 / 非文件工具 / 缺 path → 不登记
+        assert!(AgentLoopPlugin::file_change_event_for(&tc("write_file"), &json!({"ok": false})).is_none());
+        assert!(AgentLoopPlugin::file_change_event_for(&tc("bash"), &ok("x")).is_none());
+        assert!(AgentLoopPlugin::file_change_event_for(&tc("edit_file"), &json!({"ok": true, "result": {}})).is_none());
+    }
+
+    #[test]
+    fn next_sid_monotonic_and_shape_stable() {
+        // 直接构造结构体（tests 模块在 crate root 子级，可访问私有字段）
+        let p = AgentLoopPlugin {
+            max_rounds: 8,
+            manifest: Manifest {
+                name: PluginId::new(ID),
+                kind: PluginKind::Orchestrator,
+                version: Version::new(0, 1, 0),
+                api_version: ApiVersion::new(1, 0),
+                capabilities: vec![Capability::new("agent.chat")],
+                dependencies: vec![],
+                domain: Domain::InProcess,
+                semantics: Semantics::Concurrent,
+                priority: 1,
+                max_inflight: Some(8),
+                fuel_limit: None,
+                host_timeout_ms: None,
+                epoch_interval_ms: None,
+                subscriptions: vec![],
+            },
+            host: OnceLock::new(),
+            sub_counter: AtomicU64::new(0),
+            cancels: Mutex::new(HashSet::new()),
+            turn_starts: Mutex::new(std::collections::HashMap::new()),
+            sid_seq: Mutex::new(std::collections::HashMap::new()),
+            mirrors: Mutex::new(std::collections::HashMap::new()),
+        };
+        let s1 = p.next_sid("s-x");
+        let s2 = p.next_sid("s-x");
+        let s3 = p.next_sid("s-x#sub-1");
+        let digits_tail = |s: &str| s.rsplit("-r").next().is_some_and(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()));
+        // 形状保持 {session}-r{digits}：llm-adapter `_SID_RE` 反解会话 id 无需改动
+        assert!(digits_tail(&s1) && digits_tail(&s2) && digits_tail(&s3), "{s1} {s2} {s3}");
+        assert_ne!(s1, s2, "同一会话相邻 sid 必须不同（跨对话回合唯一）");
+        assert!(s3.starts_with("s-x#sub-1-r"), "子会话独立计数: {s3}");
     }
 
     #[test]

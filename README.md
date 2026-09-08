@@ -17,7 +17,7 @@
 - ReAct 循环：感知(读记忆)→规划(LLM+工具清单)→行动(执行工具/保留名路由)→观察(写回记忆)→收敛；全程发射事件（trace）+ 逐轮进度回显
 - 三家 LLM 全覆盖：OpenAI 兼容（可换 base_url 适配 DeepSeek 等）、Anthropic、Ollama；另带 **mock** provider 供离线测试
 - 生产级工具 9 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read / symbols_search（全部免费默认无 key）；另有 **MCP 外接池**（stdio 服务器，`mcp__{server}__{tool}` 命名空间，见 env 表 `MCP_SERVERS` 与 §八）与技能配套工具两池，统一白名单启用
-- 双前端：REPL（默认）/ Web 网关（HTTP+SSE，Cursor 暖色系事件流式会话：左侧会话栏 + 自动命名 + 持久化、「思考与工具」过程框（思考链 + 工具卡状态点，可折叠回看）、🔗 来源 chip 溯源抽屉、产物文件卡片（预览/下载）、📎 附件上传、消息回滚/重新生成、subagent 实时框、富 markdown（表格/代码块复制），刷新恢复 = 日志重放）
+- 双前端：REPL（默认）/ Web 网关（HTTP+SSE，Cursor 暖色系事件流式会话：左侧会话栏 + 自动命名 + 持久化、「思考与工具」过程框（思考链 + 工具卡状态点，可折叠回看；工具卡内联 diff——edit 红绿行级 / write 新增 / bash 回显）、每轮「📝 文件变更」chip（点击定位工具卡 / ⇄ 双栏 diff 对比变更前后）、🔗 来源 chip 溯源抽屉、产物文件卡片 + 📁 工作区文件树（任意文件只读预览/下载）、📎 附件上传、消息回滚/重新生成（文件改动随回滚一并撤销）、subagent 实时框、富 markdown（表格/代码块复制），刷新恢复 = 日志重放）
 - **Web 配置中心**（08）：右上角 ⚙ 侧边抽屉四标签——LLM（provider/model/站点预设/base_url/api_key，ollama 另显模型原生窗口，热生效 + 落盘 config.json）、工具（内置/技能/MCP 三池分组折叠，条目展开看参数 schema；MCP 组内 server 总开关 + API Key 配置）、技能（SKILL.md 在线编辑 + R9 配套工具就地启停；来源徽章区分出厂/用户，出厂件删除保护）、Agent（max_rounds/系统提示词/上下文窗口等热通道）；配置源文件一键「在编辑器中打开」
 - **自扩展**（08）：L1 技能自扩展——skills 根在 WORKSPACE_ROOT 内时系统提示词授权模型用 write_file 自建技能（文件即注册表，下轮对话自动可见）；L2 工具自扩展——`tools.reload` 动态装载新工具模块（装载≠启用，白名单两步分离）；R9 技能自造闭环——`skill_install` 编排 + 语言无关配套工具（tools.json 声明 + 任意语言执行体），前端内联卡一键启用（装载≠启用≠可见，见「配置中心与自扩展」）。**已实证**：`gongwen-format`（公文格式写作，用户自建件，随 gitignore 用户件规则**不入库**）即 agent 在对话中自建的技能——SKILL.md 与配套工具（tools.json + Python 执行体）均由模型一次生成，内联卡启用后跨会话可用，非人工预置
 - subagent：保留工具 `task` 委派子任务（新 session 复用全链路，深度防嵌套）；前端「思考与工具」过程框内嵌套「子代理」实时框——子代理的思考流与工具卡实时透传呈现（trace 事件镜像 + 子旁路流式），委派不再"图标一闪就卡住"
@@ -28,7 +28,7 @@
 
 > 实机动图轮播（`REACT_FRONTEND=web` 默认形态）：会话流（左侧会话栏自动命名 + 持久化，刷新即恢复）→
 > 「思考与工具」过程框展开（💭 思考链 + 工具卡状态点，可折叠回看）→ 🔗 来源 chip 溯源抽屉 →
-> ⚙ 设置面板：LLM（模型/站点/key）· 技能（自建技能 gongwen-format 及配套工具启停区）· Agent（max_rounds/上下文窗口热通道）。
+> ⚙ 设置面板：LLM（模型/站点/key）· 工具 · 技能（自建技能 gongwen-format 及配套工具启停区）· Agent（max_rounds/上下文窗口热通道）。
 > 图中会话即 agent 实际运行记录——工具清单查询 + 联网查天气 + 自动落盘会话命名。
 
 ## 目录
@@ -40,7 +40,7 @@ plugins/llm_adapter      LLM 适配器（Python guest，providers/ 按 vendor �
 plugins/tools            工具注册与执行（Python guest，纯 stdlib，files/bash/web/grep 分文件）
 plugins/assets           skills/prompts 注册表（Python guest，开放标准 SKILL.md）
 plugins/memory           会话记忆 + 事件日志（TS guest，strip-types）
-docs/                    方案与设计文档（01 总纲 / 02 架构 / 03 模块契约 / 04-07 分模块四层设计）
+docs/                    方案与设计文档（01 总纲 / 02 架构 / 03 模块设计 / 04-07 分模块四层设计 / 08 web 配置中心与自扩展）
 ```
 
 > **关于 web-dist/vendor（≈11MB）**：Monaco Editor 本地静态资源随源码库分发（不入 npm/CDN 链路），
@@ -93,9 +93,9 @@ LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-xxx cargo run -p react-agent-hos
 
 ## 前端开发（无构建）
 
-Web 前端是单文件 `crates/host/web-dist/index.html`（内联 CSS/JS，无框架、无构建步骤），由后端 `GET /` 运行时读取 serve。
+Web 前端是 `crates/host/web-dist/` 三件套（index.html + style.css + app.js，原生 JS 无框架、无构建步骤），由后端 `GET /` 运行时读取 serve。
 
-- **默认（推荐）**：`cargo run -p react-agent-host`（或 `start.cmd`）起 8710，浏览器开 `http://127.0.0.1:8710` 即同时拿到前端与 `/api`。改 `web-dist/index.html` 后**刷新浏览器即生效**（无需重编 host；若页面不更新按 `Ctrl+Shift+R` 硬刷规避缓存）。
+- **默认（推荐）**：`cargo run -p react-agent-host`（或 `start.cmd`）起 8710，浏览器开 `http://127.0.0.1:8710` 即同时拿到前端与 `/api`。改 `web-dist/` 任一文件后**刷新浏览器即生效**（无需重编 host；若页面不更新按 `Ctrl+Shift+R` 硬刷规避缓存）。
 - **前后端分离（独立端口，HMR）**：后端 `cargo run -p react-agent-host`（8710 作 API 源），前端用 `vite` 起在 `crates/host/web-dist/`（已内置 `vite.config.js`，`/api` 自动反代回 8710）：
   ```bash
   cd crates/host/web-dist && npm install && npm run dev   # 默认 http://localhost:5173
@@ -125,6 +125,8 @@ Web 前端是单文件 `crates/host/web-dist/index.html`（内联 CSS/JS，无�
 | `MEMORY_DATA_DIR` | `plugins/memory/data` | memory 会话与事件日志持久化目录 |
 | `WORKSPACE_ROOT` | 进程 cwd | 文件工具越界拦截根（realpath 前缀校验） |
 | `TOOLS_ENABLED` | 全开 | 逗号分隔白名单，如 `read_file,write_file,bash`（R9：技能工具名持久化后重启 → 延迟启用，install 时自动生效，不再启动失败） |
+| `ALLOW_CORE_WRITE` | `0`（拒绝） | **核心写保护逃生舱**（v6 自扩展安全边界）：`write_file`/`edit_file` 默认拒绝触碰 agent 自身运行体（`crates/`、`plugins/memory`、`plugins/llm_adapter`、`plugins/assets`（skills 根内豁免）、`plugins/tools/tools/`、`plugins/tools/tools_plugin.py`、`config.json`、`.git/`，报 `CORE_PROTECTED`）；自扩展合法途径 = skills 目录 SKILL.md / 技能 tools.json / `plugins/tools/` 顶层新 .py / config.json `mcp_servers`。置 `1` 放行（config.json `tools.allow_core_write: true` 持久通道，改后重启 host）。诚实边界：bash 间接写不经此闸，但 W16 起**自动快照留痕**（含核心区路径），随回滚一并撤销（SYSTEM.md 纪律 + bash 沙箱兜底 + 留痕） |
+| `BASH_WRITE_TRACE` | `on` | **W16 bash 文件追溯**：on=每次 bash 执行前后对快照区（工作区 − 噪音目录/`.stream`/产物目录/`MEMORY_DATA_DIR`/`.git`）比对，变更（新增/修改/删除）写 undo 快照并随结果返回 `changes[]` → agent-loop 转发为 op=bash 的 `file_change` 事件，与 write/edit 同一 diff/回滚链路；off=关闭快照。快照区 pre-copy 上限 32MB/4000 文件（超限退化为 stat 比对、变更无 undo 引用）；工作区外改动不追踪；同 mtime+size 的内容替换不检测 |
 | `SKILL_TOOL_TIMEOUT_SECS` | `60` | R9 技能工具子进程执行超时（超时杀进程，字段级错误） |
 | `MCP_SERVERS` | — | §八 MCP server 声明（整体 JSON：`{"名称":{"command":[...],"args"?,"env"?}}`），host 自 config.json `mcp_servers` 透传；改后需重启 host |
 | `SEARCH_REGION` | `cn` | cn（Bing→搜狗→百度零 key 直连）/ global（ddgs→DDG→Bing） |
@@ -173,7 +175,7 @@ e2e：tools(9 工具往返 + MCP echo 三模式)、memory(append/get/clear/summa
 - 扩展 `{"op":"models.list","provider"?}` → `{"ok":true,"models":[str],"models_meta"?}`（openai/deepseek 走 `/v1/models`；ollama 走 `/api/tags` + 逐模型 `/api/show` 探测原生窗口；anthropic/mock 走静态清单；`models_meta` 为可选扩展 `[{"name","ctx_limit"?}]`——模型原生上下文窗口，取不到省略键，其他 provider 不带；失败 `{"ok":false,"error":{...}}`）
 
 **tools**（`tools.exec`）
-- `{"op":"list"}` → `{"ok":true,"tools":[ToolSpec]}`（生产级 8 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read，受 `TOOLS_ENABLED` 裁剪）
+- `{"op":"list"}` → `{"ok":true,"tools":[ToolSpec]}`（生产级 9 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read / symbols_search，受 `TOOLS_ENABLED` 裁剪）
 - `{"op":"list","all":true}` → 额外含未启用工具，各项附 `"enabled":bool`（配置中心视图）
 - `{"op":"call","name":str,"args":object}` → `{"ok":true,"result":any}` | `{"ok":false,"error":{"code","message","field"?}}`（字段级错误：哪个参数错、合法值是什么）
 - 扩展 `{"op":"configure","enabled":[str,...]}` → 运行时整体替换白名单（未知名 → 字段级 400）
@@ -201,12 +203,15 @@ e2e：tools(9 工具往返 + MCP echo 三模式)、memory(append/get/clear/summa
 - Event 建议形状 `{type, ts, ...}`；存储 `<MEMORY_DATA_DIR>/traces/<session>.jsonl`
 
 **web 网关**（host 级，非插件）
-- `GET /` → 单页（Cursor 暖色系事件流式会话：米色纸感底 + 半透明炭黑 CTA，主题 token 见 crates/host/PLAN.md W1；左侧会话栏持久化、工具调用状态点卡片、富 markdown 代码块复制 + ⚙ 设置面板：LLM / 工具 / 技能 / Agent）
+- `GET /` → 单页（Cursor 暖色系事件流式会话：米色纸感底 + 半透明炭黑 CTA，主题 token 见 crates/host/PLAN.md W1；左侧会话栏持久化、工具调用状态点卡片、富 markdown 代码块复制 + 头部 📁 文件树 / ⚙ 设置面板：LLM / 工具 / 技能 / Agent；文件变更 chip 已下沉至每轮答案下方）
 - `GET /vendor/{path}` → W11 静态资源树（monaco 编辑器本地化于 `web-dist/vendor/`）：路径段校验（无 `..`/反斜杠/空段）+ 扩展名白名单（js/css/json/ttf/woff/woff2）防穿越；产物文件卡预览走「本地 vendor → CDN → 纯文本」三级降级链
+- `GET /api/tree?limit=` → 工作区文件清单（W14 文件树数据源）：递归扫 WORKSPACE_ROOT（剪枝噪音/点目录，不跟 symlink），深度 6 / 条目 3000（≤20000）双上限 + `truncated` 标记；扁平 `[{path,size}]` 正斜杠输出，与 `/files` 同一 WORKSPACE_ROOT 口径
+- `GET /files/{path}[?download=1]` → 按扩展名 mime 服务工作区内任意文件（realpath ⊆ WORKSPACE_ROOT，64MB 上限）：产物卡与文件树预览/下载共用通道
+- `GET /api/fc-snapshot?id=&side=before|after` → W15 变更快照读取（write/edit 落在 `MEMORY_DATA_DIR/undo/<id>.{before,after}` 的原始字节）；id 严格格式校验（13 位毫秒时间戳 + 8 位小写 hex）防路径穿越；前端 diff 视图数据源
 - `GET /api/events?session=&after=` → SSE（从 0 全量重放 + 实时增量）
 - `POST /api/chat` body `{"session_id":str,"message":str,"attachments"?:[{"name","mime","data_b64"}]}` → 阻塞至收敛，回 agent.chat 响应（attachments 可选：图片走多模态映射、文本文件内嵌 content；上限 4 个、单个 ≤2MB，host 校验形状与体量，非法即 K400）
 - `POST /api/chat/cancel?session=` → 取消运行中的 chat：agent-loop `cancel`（工具波次间 + 轮次边界收敛 K499）+ llm-adapter `abort`（流式逐帧检查命中即关流，单轮长生成无需等轮次边界），立即返回
-- `POST /api/chat/rollback` body `{"session_id":str,"upto_user_index":int}` → R2 回滚：memory 消息与 trace 事件**同源物理截断**到第 N 条 user 消息之前（0 基）。**计数口径以 trace user 事件为准（UI 真相源）**；memory 经压缩只剩「标记 + 最近 K 条」，两侧按**尾部对齐**（压缩只裁头部）定消息切点：回滚点在保留区 → 保压缩标记、截到该轮前；落在摘要区 → 标记与消息全清（摘要与回滚区间重叠，保留即上下文残留）；无 trace 文件的纯 memory 会话按 memory 侧计数，标记随截断一并丢弃。越界整体失败不落盘；只清对话层——工具产物文件与技能目录不回滚；前端 user 气泡 hover「⤺ 回滚」、答案 hover「↻ 重新生成」（= 回滚该问题 + 自动重发原文与附件）
+- `POST /api/chat/rollback` body `{"session_id":str,"upto_user_index":int}` → R2 回滚：memory 消息与 trace 事件**同源物理截断**到第 N 条 user 消息之前（0 基）。**计数口径以 trace user 事件为准（UI 真相源）**；memory 经压缩只剩「标记 + 最近 K 条」，两侧按**尾部对齐**（压缩只裁头部）定消息切点：回滚点在保留区 → 保压缩标记、截到该轮前；落在摘要区 → 标记与消息全清（摘要与回滚区间重叠，保留即上下文残留）；无 trace 文件的纯 memory 会话按 memory 侧计数，标记随截断一并丢弃。越界整体失败不落盘。**W15 文件撤销**：截断前读 trace 收集区间内带 undo 引用的 `file_change` 事件，截断成功后**倒序恢复**——created（新建）删除文件、deleted（W16 bash 删除）在文件仍不存在时还原 before 快照字节（被重建则跳过）、覆盖/编辑还原 before 快照字节；冲突检测：当前文件与 after 快照逐字节不一致（agent 写完后又被人改过）→ 跳过并报告，绝不硬覆盖；bash 间接改文件经 W16 快照同样记事件（op=bash）并随回滚撤销（`BASH_WRITE_TRACE=off` 关闭）。body 可选 `undo_files:false` 显式关闭；响应新增 `undone[]`/`skipped[]`；技能目录与产物登记不受影响；前端 user 气泡 hover「⤺ 回滚」（确认框预列将被撤销的文件）、答案 hover「↻ 重新生成」（= 回滚该问题 + 自动重发原文与附件）
 - `GET /api/config` → 配置视图（llm：config.json > env 缺省，key 只回 key_set+尾 4 位；tools 三池聚合数组——每项 `{name,enabled,pool:"builtin"|"skill"|"mcp",description,parameters}` 附 `skill`/`mcp_server` 来源字段，前端按 pool 分组渲染：内置平铺，技能/MCP 池按来源折叠分组 + 组头总开关（三态），MCP 组 ready 在前 failed 垫底；`mcp:{servers, declared}`——servers 为运行状态，declared 为 config.json 声明视图（command/cwd + env 各键脱敏为 `key_set`/`key_tail`），key 配置内嵌于前端「MCP 外接」各服务折叠组内（填 Key → 保存仅落盘 → 重启 host 生效）；skills_count；agent 参数视图）
 - `PUT /api/config` → 分段合并落盘 + 热应用：`llm` 逐字段（null 不覆盖，key 热应用 env）；`tools.enabled` 白名单整体替换（configure 热生效）；`agent` 逐字段（null 不覆盖）；`mcp_servers` 按 server 名合并——command/cwd 未传保留原值，env 逐键合并（空串=不动），**仅落盘**（server 子进程生命周期归插件 init/destroy，改后需重启 host）
 - `GET /api/models` → 转发 llm-adapter `models.list`，返回当前 provider 可用模型 id（前端「拉取模型」按钮；配好 base_url/key 后自动填充
@@ -222,7 +227,7 @@ e2e：tools(9 工具往返 + MCP echo 三模式)、memory(append/get/clear/summa
 - **配置中心**：Web 设置面板保存 → llm-adapter/tools configure op 热生效（env）→ merge 落 `config.json`；重启时 `apply_config_file_to_env` 还原。env 仍是一切配置之源（spawn 复用既有机制）
 - **L1 技能自扩展**：assets `skills.list` 回传 root，agent-loop 判定 root ⊆ WORKSPACE_ROOT 后在系统提示词注入授权段——模型用 `write_file` 写 `<skills-root>/<name>/SKILL.md` 即完成注册（list 每次重扫，下轮对话可见，无需 reload）。授权≠边界：真正的硬边界仍是文件工具 realpath 越界拦截
 - **L2 工具自扩展**：把符合 ToolSpec 三元组（name/description/parameters/run）的 `TOOLS` dict 放进 `plugins/tools/` 下的新 .py 文件，对话中说「重载工具」→ `tools.reload` 装载进池；再经配置中心勾选启用（装载≠启用，写与启用两步分离）
-- **R9 技能自造闭环**：模型调 `skill_install(name)` 完成技能包安装编排——assets `skills.load` 取 SKILL.md + frontmatter `tools:` 声明 → `tools.install` fail-closed 装载配套工具（语言无关：tools.json 声明 + 任意语言执行体，子进程 stdin/stdout JSON 协议）→ trace `skill_installed` 事件 → 前端过程框内联卡「技能已就绪 · N 件待启用」。**三层作用域**：装载（进池不可调用）≠ 启用（一键启用过配置闸，全局持久）≠ 可见（仅 `load_skill` 后该技能已启用工具进入本会话工具清单，会话技能集由 trace 重放推导）。工具归属技能界面（技能 tab 内启停），内置 8 件冻结不扩展
+- **R9 技能自造闭环**：模型调 `skill_install(name)` 完成技能包安装编排——assets `skills.load` 取 SKILL.md + frontmatter `tools:` 声明 → `tools.install` fail-closed 装载配套工具（语言无关：tools.json 声明 + 任意语言执行体，子进程 stdin/stdout JSON 协议）→ trace `skill_installed` 事件 → 前端过程框内联卡「技能已就绪 · N 件待启用」。**三层作用域**：装载（进池不可调用）≠ 启用（一键启用过配置闸，全局持久）≠ 可见（仅 `load_skill` 后该技能已启用工具进入本会话工具清单，会话技能集由 trace 重放推导）。工具归属技能界面（技能 tab 内启停），内置 9 件冻结不扩展
 - **过程框交互（W7-W9）**：「思考与工具」过程框固定宽度（820px）恒定高度（16vh）内滚，内容实时贴底滑动显示最新（用户上滚即暂停跟随，回底自动恢复），模型思考链带「💭 思考」标签按轮混排在工具卡之间；流式期间产物/来源卡先收纳在框内（与过程同框不散落），正式答案出现时过程框自动收起、卡片移出置底展示在答案下方（回合异常终止时留在框内仍可见）。`task` 委派在框内嵌套「子代理」实时框：子代理思考流与工具卡实时透传（trace 事件镜像 + 子旁路流式，`user` 事件不镜像以保回滚定位真相源；刷新重放显示工具卡与各轮答案，思考流仅实时可见）
 
 ## 架构要点（内核约束的落点）
@@ -234,7 +239,7 @@ e2e：tools(9 工具往返 + MCP echo 三模式)、memory(append/get/clear/summa
 - **循环无跨调用可变态**：ReAct 状态在局部变量 + memory 插件，插件本体 `&self`（A1）；每步转发带 deadline（A2）
 - Rust 插件仅依赖 `agent-kernel-sdk`；仅 host 依赖 kernel（process feature）+ process —— 规则防穿透
 
-## 已知限制（摘要）
+## 可靠性与执行可见性（现状摘要）
 
 - **运行中断（停止）**：已支持（P2/T1 + R1 补强）。`POST /api/chat/cancel?session=` 双通道置位：
   agent-loop `cancel`（**工具波次间 + 轮次边界**以 K499 收敛，单轮多波工具不等全轮跑完）+ llm-adapter
@@ -242,14 +247,22 @@ e2e：tools(9 工具往返 + MCP echo 三模式)、memory(append/get/clear/summa
   cancel 置位后随即 abort 阻塞中的 /api/chat（UI 即时解锁，服务端到最近检查点自然收敛，memory/trace 照常落盘）。
   正在执行中的单个工具调用不可中断（bash 子进程等到命令结束/超时）。机制详见
   `crates/agent-loop/README.md`「运行中断（停止）」与 `plugins/llm_adapter/README.md`「abort」。
-- **sid 跨对话不保证唯一**：同 round 的不同对话回合生成相同 sid，极端情况下后一回合的流式动画被去重逻辑误忽略
-  （直接显示最终答案，无打字效果）。细节与修复建议见 `crates/agent-loop/README.md`「流式编排」。
+- **sid 跨对话唯一（已修复）**：sid 形如 `{session}-r{N}`，N 为 per session 单调序号
+  （unix 毫秒种子），相邻对话回合不再碰撞——此前 rounds 每回合重置，相同 sid 会被前端
+  doneSids 去重误吞流式动画。细节见 `crates/agent-loop/README.md`「流式编排」。
+- **执行可见性（V1+V2+W15+W16）**：工具卡内联 diff（edit 红绿行级 / write 新增 / bash 命令回显，
+  >500 行折叠）+ 每轮答案下方「📝 文件变更」chip（🔗 来源同款收纳；点击开抽屉列表，条目
+  「⇄ diff」开 Monaco DiffEditor 双栏对比**完整文件内容**的变更前后，并定位工具卡）。数据源：
+  tool_call args（V1）、`file_change` 事件（V2，write/edit 成功时由 agent-loop 落 trace）、
+  变更快照（W15 files.py + **W16 bash.py**：把变更前后原始字节落
+  `MEMORY_DATA_DIR/undo/<id>.{before,after}`，事件携带 `undo:{id,created,deleted,bytes_*}` 引用——
+  diff 数据源三级降级：快照 → args 重构 → 单侧当前内容；**W16 起 bash 也记事件**：
+  bash.py 对快照区执行前后自动比对，新增/修改/删除随结果 `changes[]` 转发为 op=bash 事件
+  （抽屉徽章「脚本」，删除型单侧显示删除前内容），与 write/edit 同一回滚撤销链路）。
+  回滚撤销见 `/api/chat/rollback`。子代理变更经镜像汇入同池。
 - SSE 增量续传、刷新恢复、断线不重绘不重复的完整数据流设计见 `crates/host/README.md`「数据流设计要点」。
 
 ## Roadmap（后续方向）
 
-- **agent 自造技能并自然呈现在 UI——已落地（R9，方案 B 档位）**：`skill_install` 保留名编排 +
-  语言无关命令工具（tools.json + 任意语言执行体）+ 前端内联卡与一键启用已实现并通过全链路
-  验证（详见 `crates/agent-loop/PLAN.md` R9）。自动化档位取方案 B：装载全自动、启用保留人工
-  一键确认（配置闸）、会话可见由 `load_skill` 驱动。后续增强方向：会话级临时启用的授权策略、
-  命令工具执行沙箱化（复用 BASH_SANDBOX 受限令牌思路）、技能来源审计。
+- **R9 增强**：会话级临时启用的授权策略、命令工具执行沙箱化（复用 BASH_SANDBOX 受限令牌思路）、技能来源审计
+- **产物卡在线编辑**：Monaco 从只读预览升级为 edit→save（写回需过文件工具同一越界闸与核心写保护）

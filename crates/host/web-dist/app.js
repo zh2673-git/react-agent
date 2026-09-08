@@ -337,7 +337,8 @@ function renderSubEvent(ev) {
   const s = ensureSubBox(ev.sub);
   switch (ev.type) {
     case "tool_call": {
-      const card = el(`<details class="tool" open><summary><span class="statedot"></span><span class="name">⚙ ${esc(ev.name)}</span><span class="round">round ${esc(ev.round)}</span><span class="ms"></span><span class="chev">›</span></summary><div class="body"><div class="sec"><div class="lbl">参数</div><pre class="result-pre">${esc(JSON.stringify(ev.args ?? {}, null, 2))}</pre></div><div class="sec result-sec" style="display:none"><div class="lbl">结果</div><div class="result-pre result-body"></div></div></div></details>`);
+      const card = el(`<details class="tool" open><summary><span class="statedot"></span><span class="name">⚙ ${esc(ev.name)}</span><span class="round">round ${esc(ev.round)}</span><span class="ms"></span><span class="chev">›</span></summary><div class="body"><div class="sec"><div class="lbl">参数</div><pre class="result-pre">${esc(JSON.stringify(ev.args ?? {}, null, 2))}</pre></div>${renderFileDiff(ev)}<div class="sec result-sec" style="display:none"><div class="lbl">结果</div><div class="result-pre result-body"></div></div></div></details>`);
+      tagFileCard(card, ev); // V2：子代理文件卡同样可从变更抽屉定位
       s.body.appendChild(card);
       pending.set(`sub:${ev.sub}|${ev.round}|${ev.name}`, card); // key 带 sub 前缀，与主框 pending 不串位
       break;
@@ -456,6 +457,164 @@ function renderAssistant(ev, ts) {
   settleTurnEnd();
 }
 
+// ── V1 工具卡内联 diff：edit_file 红绿行级 / write_file 全绿新增 / bash 命令回显。
+// 数据全部来自 tool_call 事件的 args（已验证全量传输），零后端改动；>500 行折叠为
+// 统计防大文件渲染卡顿。返回 HTML 片段（无变更语义的工具返回空串）。
+function renderFileDiff(ev) {
+  const a = ev.args ?? {};
+  if (ev.name === "edit_file" && typeof a.old_string === "string" && typeof a.new_string === "string") {
+    const oldL = a.old_string.split("\n"), newL = a.new_string.split("\n");
+    const head = `<div class="lbl">变更 · ${esc(a.path ?? "")}</div>`;
+    if (oldL.length + newL.length > 500) {
+      return `<div class="sec">${head}<pre class="diff-stats">~${oldL.length} 行替换为 ~${newL.length} 行（内容过长，diff 已折叠）</pre></div>`;
+    }
+    const rows = [
+      ...oldL.map((l) => `<div class="dl del">- ${esc(l)}</div>`),
+      ...newL.map((l) => `<div class="dl add">+ ${esc(l)}</div>`),
+    ].join("");
+    return `<div class="sec">${head}<pre class="diff">${rows}</pre></div>`;
+  }
+  if (ev.name === "write_file" && typeof a.content === "string") {
+    const lines = a.content.split("\n");
+    const head = `<div class="lbl">变更 · ${esc(a.path ?? "")}</div>`;
+    if (lines.length > 500) {
+      return `<div class="sec">${head}<pre class="diff-stats">+${lines.length} 行（内容过长，已折叠）</pre></div>`;
+    }
+    return `<div class="sec">${head}<pre class="diff">${lines.map((l) => `<div class="dl add">+ ${esc(l)}</div>`).join("")}</pre></div>`;
+  }
+  if (ev.name === "bash" && typeof a.command === "string" && a.command) {
+    return `<div class="sec"><div class="lbl">命令</div><pre class="cmd-echo">${esc(a.command)}</pre></div>`;
+  }
+  return "";
+}
+// 给文件工具卡打变更定位标记（变更抽屉「点击定位工具卡」的匹配依据）+ 暂存 args
+// （无快照时 diff 视图用 old/new 反向重构变更前内容）。
+function tagFileCard(card, ev) {
+  if (ev.name === "write_file" || ev.name === "edit_file") {
+    card._fcpath = String(ev.args?.path ?? "").replace(/\\/g, "/").toLowerCase();
+    card._fcround = ev.round;
+    card._fcsub = ev.sub ?? "";
+    card._fcargs = ev.args ?? null;
+  }
+}
+
+// ── 文件变更（R15 重构）：file_change 事件按回合聚合为答案下方「📝 文件变更 (N)」
+// chip（与 🔗 来源同款收纳），点击滑出该轮抽屉；条目点击定位过程框工具卡，⇄ diff
+// 打开双侧对比（快照 → args 重构 → 单侧 降级链）。子代理镜像事件同样汇入。fcSeen
+// 兼做回滚撤销的区间索引（记录 turn）。
+const fcSeen = new Map(); // 事件唯一键 → {path, op, round, sub, ts, undo, turn}
+let turnFcBox = null;
+function renderFileChange(ev) {
+  const p = String(ev.path ?? "").replace(/\\/g, "/");
+  if (!p) return;
+  const key = `${p}|${ev.op ?? ""}|${ev.round ?? ""}|${ev.sub ?? ""}|${ev.ts ?? 0}`;
+  if (fcSeen.has(key)) return;
+  const it = { path: p, op: ev.op ?? "write", round: ev.round ?? "", sub: ev.sub ?? "", ts: ev.ts ?? 0, undo: ev.undo ?? null, turn: Math.max(0, userTurns.length - 1) };
+  fcSeen.set(key, it);
+  wsTreeCache = null; // 文件有变更 → 文件树缓存失效（下次打开重新拉取）
+  const chip = turnFcBox ?? el(`<div class="srcchip" title="点击查看该轮文件变更">📝 文件变更 <span class="cnt">0</span></div>`);
+  chip._items = chip._items ?? [];
+  chip._items.push(it);
+  chip.querySelector(".cnt").textContent = chip._items.length;
+  chip.onclick = () => openFcDrawer(chip._items);
+  if (!turnFcBox) { ensureTurnTail().appendChild(chip); turnFcBox = chip; scrollFeed(); }
+}
+function resetFileChanges() { fcSeen.clear(); }
+function openFcDrawer(items) {
+  let d = $("fc-drawer");
+  if (!d) {
+    d = el(`<div id="fc-drawer" class="sd-overlay"><div class="sd-panel"><div class="sd-head"><span>📝 文件变更</span><button class="btn ghost sd-close">关闭</button></div><div class="sd-body"></div></div></div>`);
+    document.body.appendChild(d);
+    d.onclick = (e) => { if (e.target === d) d.classList.remove("open"); };
+    d.querySelector(".sd-close").onclick = () => d.classList.remove("open");
+  }
+  const body = d.querySelector(".sd-body");
+  body.innerHTML = "";
+  if (!items?.length) body.innerHTML = '<div class="fc-empty">该轮尚无文件变更（write_file / edit_file 成功及 bash 快照区改动时记录）</div>';
+  for (const it of items ?? []) {
+    const row = el(`<div class="sd-item fc-item" title="点击定位对应工具卡"><span class="fc-op ${it.op === "edit" ? "edit" : "write"}">${{ edit: "编辑", bash: "脚本", write: "写入" }[it.op] ?? it.op}</span><span class="fc-path">${esc(it.path)}</span><span class="u">${it.sub ? `子代理 ${esc(it.sub)}` : `round ${esc(it.round)}`}</span><button class="btn ghost fc-diff" title="对比变更前后内容">⇄ diff</button></div>`);
+    row.onclick = () => { d.classList.remove("open"); locateFileChange(it); };
+    row.querySelector(".fc-diff").onclick = (e) => { e.stopPropagation(); d.classList.remove("open"); openFcDiff(it); };
+    body.appendChild(row);
+  }
+  d.classList.add("open");
+}
+function locateFileChange(it) {
+  const cards = [...document.querySelectorAll("#feed details.tool")].filter(
+    (c) => c._fcpath === it.path.toLowerCase() && String(c._fcround) === String(it.round) && !it.sub === !c._fcsub
+  );
+  const card = cards[cards.length - 1]; // 同轮同路径多次变更 → 定位最近一张
+  if (!card) return;
+  card.open = true;
+  card.scrollIntoView({ behavior: "smooth", block: "center" });
+  card.classList.add("fc-flash");
+  setTimeout(() => card.classList.remove("fc-flash"), 1600);
+}
+
+// ── W14 工作区文件树：头部「📁」→ 左侧滑出面板。数据源 GET /api/tree（扁平清单，
+// 剪枝噪音/点目录），前端建树；点击文件复用产物卡同一条预览链（文本→Monaco/md 富
+// 渲染；html/图片/pdf→新标签原生渲染；其余→/files?download=1 下载）。
+let wsTreeCache = null;
+function toggleWsTree() {
+  let d = $("ws-drawer");
+  if (!d) {
+    d = el(`<div id="ws-drawer" class="wsp-overlay"><div class="wsp-panel"><div class="wsp-head"><span>📁 工作区文件</span><span class="wsp-cnt"></span><button class="btn ghost wsp-close">关闭</button></div><div class="wsp-body"></div></div></div>`);
+    document.body.appendChild(d);
+    d.onclick = (e) => { if (e.target === d) d.classList.remove("open"); };
+    d.querySelector(".wsp-close").onclick = () => d.classList.remove("open");
+  }
+  const opening = !d.classList.contains("open");
+  d.classList.toggle("open", opening);
+  if (opening) loadWsTree(d.querySelector(".wsp-body"), d.querySelector(".wsp-cnt"));
+}
+async function loadWsTree(body, cnt) {
+  body.innerHTML = '<div class="wsp-empty">加载中…</div>';
+  try {
+    if (!wsTreeCache) {
+      const r = await fetch("/api/tree");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      wsTreeCache = await r.json();
+    }
+    cnt.textContent = `${wsTreeCache.count} 个文件` + (wsTreeCache.truncated ? "（已截断）" : "");
+    body.innerHTML = "";
+    body.appendChild(buildWsTree(wsTreeCache.files.map((f) => f.path)));
+  } catch (e) { body.innerHTML = `<div class="wsp-empty">加载失败: ${esc(e.message)}</div>`; }
+}
+function buildWsTree(paths) {
+  const root = { dirs: new Map(), files: [] };
+  for (const p of paths) {
+    const segs = p.split("/");
+    let node = root;
+    for (let i = 0; i < segs.length - 1; i++) {
+      if (!node.dirs.has(segs[i])) node.dirs.set(segs[i], { dirs: new Map(), files: [] });
+      node = node.dirs.get(segs[i]);
+    }
+    node.files.push(segs[segs.length - 1]);
+  }
+  const build = (node, prefix) => {
+    const box = el(`<div class="wsp-dir"></div>`);
+    for (const [name, child] of [...node.dirs.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      const det = el(`<details open><summary>📁 ${esc(name)}</summary></details>`);
+      det.appendChild(build(child, prefix + name + "/"));
+      box.appendChild(det);
+    }
+    for (const f of node.files.sort((a, b) => a.localeCompare(b))) {
+      const full = prefix + f;
+      const row = el(`<div class="wsp-file" title="${esc(full)}">📄 ${esc(f)}</div>`);
+      row.onclick = () => openWsFile(full);
+      box.appendChild(row);
+    }
+    return box;
+  };
+  return build(root, "");
+}
+function openWsFile(path) {
+  const ext = (path.includes(".") ? path.split(".").pop() : "").toLowerCase();
+  if (PREVIEW_TEXT_EXTS.includes(ext)) previewTextFile(path, ext);
+  else if (PREVIEW_NATIVE_EXTS.includes(ext)) window.open(filesUrl(path), "_blank");
+  else window.open(filesUrl(path, true), "_blank");
+}
+
 // ── 事件渲染 ──
 const pending = new Map();
 // R2：本回合内已渲染的 user 轮次（idx = trace 内第几条 user 事件，0 基）。
@@ -471,9 +630,9 @@ const turnArtifactPaths = new Set(); // 同回合同路径只出一张卡（writ
 function render(ev) {
   const ts = ev.ts ? new Date(ev.ts).toLocaleTimeString() : "";
   // R11 子代理事件路由：带 sub 标签的事件（镜像 trace + 子流式帧）进子框，不与主链
-  // 渲染（气泡/答案卡/主 pending 表）串线；artifact/sources 除外——子代理生成的成品
-  // 文件与引用来源同样汇入主回合的卡片收纳区。
-  if (ev.sub && ev.type !== "artifact" && ev.type !== "sources") {
+  // 渲染（气泡/答案卡/主 pending 表）串线；artifact/sources/file_change 除外——子代理
+  // 生成的成品文件、引用来源与文件变更同样汇入主链卡片收纳区。
+  if (ev.sub && ev.type !== "artifact" && ev.type !== "sources" && ev.type !== "file_change") {
     const t = String(ev.type);
     if (t === "stream_start") subStreamStart(ev);
     else if (t === "stream_delta") subStreamDelta(ev);
@@ -489,7 +648,7 @@ function render(ev) {
       processBox = processBody = processThink = null; // 过程链框按用户回合划分
       subBoxes.clear(); // 子代理框按用户回合划分（引用随 DOM 重建，旧引用弃用）
       roundCards = []; // 答案卡按用户回合累积，新回合清空
-      turnArtifacts = []; turnSourceBox = null; turnSourceUrls.clear(); turnArtifactPaths.clear(); turnTail = null; // 回合级卡片追踪归位（卡已在 DOM，仅弃引用）
+      turnArtifacts = []; turnSourceBox = null; turnSourceUrls.clear(); turnArtifactPaths.clear(); turnTail = null; turnFcBox = null; // 回合级卡片追踪归位（卡已在 DOM，仅弃引用）
       const idx = userTurns.length;
       userTurns.push({ idx, text: ev.text ?? "", atts: ev.attachments ?? [] });
       // R3 附件重放：图片缩略图 / 文件条（trace user 事件带全量 b64）
@@ -512,6 +671,9 @@ function render(ev) {
     case "sources":
       renderSourcesCard(ev); // 信息溯源：web 检索/阅读引用链接
       break;
+    case "file_change":
+      renderFileChange(ev); // R15：按回合聚合 chip + 抽屉（定位 / diff），兼回滚撤销索引
+      break;
     case "stream_start":
       if (!(ev.sid && doneSids.has(ev.sid))) startStream(ev.sid);
       break;
@@ -526,7 +688,8 @@ function render(ev) {
       break;
     case "tool_call": {
       ensureProcessBox(); // 工具卡与思考段同框（过程链）
-      const card = el(`<details class="tool" open><summary><span class="statedot"></span><span class="name">⚙ ${esc(ev.name)}</span><span class="round">round ${esc(ev.round)}</span><span class="ms"></span><span class="chev">›</span></summary><div class="body"><div class="sec"><div class="lbl">参数</div><pre class="result-pre">${esc(JSON.stringify(ev.args ?? {}, null, 2))}</pre></div><div class="sec result-sec" style="display:none"><div class="lbl">结果</div><div class="result-pre result-body"></div></div></div></details>`);
+      const card = el(`<details class="tool" open><summary><span class="statedot"></span><span class="name">⚙ ${esc(ev.name)}</span><span class="round">round ${esc(ev.round)}</span><span class="ms"></span><span class="chev">›</span></summary><div class="body"><div class="sec"><div class="lbl">参数</div><pre class="result-pre">${esc(JSON.stringify(ev.args ?? {}, null, 2))}</pre></div>${renderFileDiff(ev)}<div class="sec result-sec" style="display:none"><div class="lbl">结果</div><div class="result-pre result-body"></div></div></div></details>`);
+      tagFileCard(card, ev); // V2：文件工具卡打定位标记（抽屉点击回跳）
       processBody.appendChild(card);
       pending.set(`${ev.round}|${ev.name}`, card);
       break;
@@ -617,7 +780,7 @@ let es = null, lastAfter = 0;
 function connect(after) {
   after = after || 0;
   if (es) es.close();
-  if (after === 0) { feed.innerHTML = ""; pending.clear(); lastAfter = 0; doneSids.clear(); processBox = processBody = processThink = null; subBoxes.clear(); userTurns = []; turnArtifacts = []; turnSourceBox = null; turnSourceUrls.clear(); turnArtifactPaths.clear(); turnTail = null; } // 首屏/切换/回滚后：清空后全量重放
+  if (after === 0) { feed.innerHTML = ""; pending.clear(); lastAfter = 0; doneSids.clear(); processBox = processBody = processThink = null; subBoxes.clear(); userTurns = []; turnArtifacts = []; turnSourceBox = null; turnSourceUrls.clear(); turnArtifactPaths.clear(); turnTail = null; turnFcBox = null; resetFileChanges(); } // 首屏/切换/回滚后：清空后全量重放
   // 清 DOM 后流式句柄一并失效，避免继续写入已移除的气泡
   streamSid = streamCard = streamBody = streamStats = null;
   es = new EventSource(`/api/events?session=${encodeURIComponent(session)}&after=${after}`);
@@ -701,14 +864,23 @@ async function send(presetText, presetAtts) {
 sendBtn.onclick = () => send();
 
 // R2 回滚：物理截断到第 idx 条 user 消息之前（该问题及其后全部删除，memory 消息与
-// trace 事件同源截断）。resend=true 为「重新生成」：截掉该问题后立即重发原文+附件。
+// trace 事件同源截断）。R15：区间内 agent 的文件改动随回滚一并撤销（host 冲突检测：
+// 变更后又被人工改过的文件自动跳过，绝不硬覆盖）。resend=true 为「重新生成」。
 async function rollbackTo(idx, resend, ut) {
   if (sendBtn.disabled) { setStatus("对话进行中，请先停止或等待完成"); return; }
-  if (!confirm(resend ? "回滚本问题并重新生成回答？" : "回滚到该问题之前？（该问题及其后的对话将被删除）")) return;
+  const affected = [...fcSeen.values()].filter((e) => e.turn >= idx);
+  const fileList = affected.slice(0, 8).map((e) => `${{ edit: "编辑", bash: "脚本", write: "写入" }[e.op] ?? e.op} ${e.path}`).join("\n");
+  const undoNote = affected.length
+    ? `\n\n同时撤销该轮起 agent 的文件改动（${affected.length} 个）：\n${fileList}${affected.length > 8 ? `\n…等共 ${affected.length} 个` : ""}\n（变更后又被手动修改的文件将自动跳过）`
+    : "";
+  if (!confirm(resend ? `回滚本问题并重新生成回答？${undoNote}` : `回滚到该问题之前？（该问题及其后的对话将被删除）${undoNote}`)) return;
   try {
-    await api("POST", "/api/chat/rollback", { session_id: session, upto_user_index: idx });
+    const v = await api("POST", "/api/chat/rollback", { session_id: session, upto_user_index: idx });
+    const un = v.undone?.length ?? 0, sk = v.skipped?.length ?? 0;
+    var undoMsg = (un || sk) ? `已撤销 ${un} 个文件改动` + (sk ? `，${sk} 个跳过（文件已被修改）` : "") : null;
   } catch (e) { setStatus("回滚失败: " + e.message); return; }
   connect(0); // 全量重放截断后的历史（重置 SSE 游标）
+  if (undoMsg) setStatus(undoMsg);
   if (resend && ut) send(ut.text, ut.atts || []);
 }
 
@@ -1202,11 +1374,7 @@ function renderArtifactCard(ev) {
   const ext = (name.includes(".") ? name.split(".").pop() : "").toLowerCase();
   const card = el(`<div class="artcard"><span class="ico">📄</span><span class="nm">${esc(name)}</span><span class="src" title="${esc(ev.path)}">${esc(ev.path)}${ev.tool ? " · " + esc(ev.tool) : ""}</span><span class="open">${PREVIEW_TEXT_EXTS.includes(ext) || PREVIEW_NATIVE_EXTS.includes(ext) ? "查看" : "下载"}</span></div>`);
   card._artpath = key; // R12：最终答案「提及过滤」按此键匹配（文件名命中或全路径命中）
-  card.querySelector(".open").onclick = () => {
-    if (PREVIEW_TEXT_EXTS.includes(ext)) previewTextFile(ev.path, ext);
-    else if (PREVIEW_NATIVE_EXTS.includes(ext)) window.open(filesUrl(ev.path), "_blank");
-    else window.open(filesUrl(ev.path, true), "_blank");
-  };
+  card.querySelector(".open").onclick = () => openWsFile(ev.path); // W14：与文件树共用一条预览链
   ensureTurnTail().appendChild(card);
   turnArtifacts.push(card); // 回合收敛时移到最终答案之后置底
   scrollFeed();
@@ -1253,6 +1421,8 @@ function settleTurnEnd() {
   turnArtifacts = [];
   if (turnSourceBox) feed.appendChild(turnSourceBox);
   turnSourceBox = null;
+  if (turnFcBox) feed.appendChild(turnFcBox); // 📝 文件变更 chip 同款置底
+  turnFcBox = null;
   turnTail?.remove();
   turnTail = null;
 }
@@ -1274,8 +1444,15 @@ function filterArtifactsByAnswer(answer) {
 // 先探测 loader.js 可达性（GET，仅 ~10KB）再注入，保证同页只加载一个 AMD loader，
 // 规避双 loader 注册表互踩；editor.main 装载失败则调用方退回纯文本兜底。
 const MONACO_LANGS = { js: "javascript", ts: "typescript", py: "python", rs: "rust", css: "css", xml: "xml", yml: "yaml", yaml: "yaml", json: "json", csv: "plaintext", txt: "plaintext", log: "plaintext" };
-let monacoReady = null, previewEditor = null;
-function disposePreviewEditor() { if (previewEditor) { try { previewEditor.dispose(); } catch {} previewEditor = null; } }
+let monacoReady = null, previewEditor = null, previewDiff = null;
+function disposePreviewEditor() {
+  if (previewEditor) { try { previewEditor.dispose(); } catch {} previewEditor = null; }
+  if (previewDiff) {
+    try { previewDiff.models.forEach((m) => m.dispose()); } catch {}
+    try { previewDiff.ed.dispose(); } catch {}
+    previewDiff = null;
+  }
+}
 function tryMonacoBase(base) {
   // 探测 + 注入：fetch loader.js（CDN 需 CORS，jsdelivr 支持；本地同源无碍）
   return fetch(base + "/loader.js", { cache: "no-store" })
@@ -1321,11 +1498,14 @@ function ensurePreviewOverlay() {
   }
   return overlay;
 }
+let previewSeq = 0; // 预览时序令牌：连续切换文件时丢弃迟到的旧响应，防慢请求回写覆盖新预览
 async function previewTextFile(path, ext) {
+  const seq = ++previewSeq;
   try {
     const r = await fetch(filesUrl(path));
     if (!r.ok) throw new Error("HTTP " + r.status);
     const text = await r.text();
+    if (seq !== previewSeq) return; // 已有更新的预览请求，本次结果作废
     const overlay = ensurePreviewOverlay();
     overlay.querySelector(".fp-name").textContent = path;
     const body = overlay.querySelector(".fp-body");
@@ -1343,6 +1523,82 @@ async function previewTextFile(path, ext) {
     }
     overlay.style.display = "flex";
   } catch (e) { setStatus("文件预览失败: " + e.message); }
+}
+
+// ── 变更对比（R15）：数据源三级降级——① 变更快照（/api/fc-snapshot，精确历史双栏）；
+// ② edit 无快照时用工具卡 args（old/new）对当前内容反向重构（replace_all 全量替换）；
+// ③ 重构不了（write 覆盖无快照等）仅单侧显示当前内容。Monaco DiffEditor 双栏对比，
+// 本地 vendor 不可达时退化为上下排布的两段 <pre>。
+async function fetchSnap(id, side) {
+  const r = await fetch(`/api/fc-snapshot?id=${encodeURIComponent(id)}&side=${side}`);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.text();
+}
+async function openFcDiff(it) {
+  const seq = ++previewSeq;
+  const overlay = ensurePreviewOverlay();
+  overlay.querySelector(".fp-name").textContent = `${it.path} · 变更对比`;
+  const body = overlay.querySelector(".fp-body");
+  disposePreviewEditor();
+  body.innerHTML = '<div class="wsp-empty">加载中…</div>';
+  overlay.style.display = "flex";
+  let before = null, after = null, note = "";
+  try {
+    if (it.undo?.id) {
+      before = it.undo.created ? "" : await fetchSnap(it.undo.id, "before");
+      after = it.undo.deleted ? null : await fetchSnap(it.undo.id, "after");
+      if (it.undo.deleted) note = "文件在该次脚本执行中被删除，仅显示删除前完整内容（回滚可还原）";
+    } else {
+      const r = await fetch(filesUrl(it.path));
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      after = await r.text();
+      if (it.op === "edit") {
+        // 降级②：从工具卡暂存的 args 反向重构变更前内容
+        const cards = [...document.querySelectorAll("#feed details.tool")].filter(
+          (c) => c._fcpath === it.path.toLowerCase() && String(c._fcround) === String(it.round) && !it.sub === !c._fcsub
+        );
+        const a = cards[cards.length - 1]?._fcargs;
+        if (a && typeof a.old_string === "string" && typeof a.new_string === "string" && after.includes(a.new_string)) {
+          before = a.replace_all ? after.split(a.new_string).join(a.old_string) : after.replace(a.new_string, a.old_string);
+        }
+        if (before == null) note = "无变更快照且无法从编辑参数精确重构，仅显示当前内容";
+      } else {
+        note = "覆盖写入且无变更快照，变更前内容不可重建，仅显示当前内容";
+      }
+    }
+  } catch (e) {
+    if (seq === previewSeq) body.innerHTML = `<div class="wsp-empty">变更内容加载失败: ${esc(e.message)}</div>`;
+    return;
+  }
+  if (seq !== previewSeq) return; // 已有更新的预览请求，本次作废
+  const ext = (it.path.includes(".") ? it.path.split(".").pop() : "").toLowerCase();
+  const lang = MONACO_LANGS[ext] || "plaintext";
+  const noteHtml = note ? `<div class="fp-note">${esc(note)}</div>` : "";
+  if (before != null && after != null && (await ensureMonaco())) {
+    body.innerHTML = `${noteHtml}<div id="fp-monaco" style="height:${note ? "calc(100% - 30px)" : "100%"}"></div>`;
+    const orig = monaco.editor.createModel(before, lang);
+    const mod = monaco.editor.createModel(after, lang);
+    const de = monaco.editor.createDiffEditor($("fp-monaco"), {
+      readOnly: true, renderSideBySide: true, automaticLayout: true,
+      fontSize: 13, minimap: { enabled: false }, scrollBeyondLastLine: false,
+    });
+    de.setModel({ original: orig, modified: mod });
+    previewDiff = { ed: de, models: [orig, mod] };
+  } else if (before != null) {
+    if (after != null) {
+      body.innerHTML = `${noteHtml}<div class="fp-note">变更前</div><pre>${esc(before)}</pre><div class="fp-note">变更后</div><pre>${esc(after)}</pre>`;
+    } else {
+      body.innerHTML = `${noteHtml}<div class="fp-note">删除前</div><pre>${esc(before)}</pre>`;
+    }
+  } else if (await ensureMonaco()) {
+    body.innerHTML = `${noteHtml}<div id="fp-monaco" style="height:${note ? "calc(100% - 30px)" : "100%"}"></div>`;
+    previewEditor = monaco.editor.create($("fp-monaco"), {
+      value: after, language: lang, readOnly: true,
+      minimap: { enabled: false }, automaticLayout: true, fontSize: 13, scrollBeyondLastLine: false,
+    });
+  } else {
+    body.innerHTML = `${noteHtml}<pre>${esc(after)}</pre>`;
+  }
 }
 
 async function openSkill(name) {
@@ -1375,6 +1631,8 @@ async function reveal(target, name, flashId) {
   } catch (e) { flash(flashId, false, e.message); }
 }
 $("llm-reveal").onclick = () => reveal("config", null, "llm-flash");
+// ── W14 工作区文件树入口（头部 📁）──
+$("btn-tree").onclick = toggleWsTree;
 $("tools-reveal").onclick = () => reveal("tools", null, "tools-flash");
 $("skills-reveal").onclick = () => reveal("skills", null, "skill-flash");
 $("skill-new").onclick = () => {

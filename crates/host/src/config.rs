@@ -117,6 +117,7 @@ impl HostConfig {
             // tools：工作区边界 / scope / 搜索链 / MCP server 声明
             "WORKSPACE_ROOT",
             "TOOLS_ENABLED",
+            "ALLOW_CORE_WRITE",
             "MCP_SERVERS",
             "SEARCH_REGION",
             "SEARCH_BACKEND",
@@ -126,6 +127,8 @@ impl HostConfig {
             // assets：资产目录
             "SKILLS_DIR",
             "PROMPTS_DIR",
+            // tools（files.py 变更快照落盘目录，与 memory 同源）
+            "MEMORY_DATA_DIR",
             // agent-loop（InProcess 自读，但 WSL/远程场景下保持子进程一致）
             "AGENT_SYSTEM_PROMPT",
             "PROMPT",
@@ -267,6 +270,11 @@ pub fn apply_config_file_to_env() -> usize {
         if !names.is_empty() {
             set("TOOLS_ENABLED", names.join(","));
         }
+    }
+    // 核心写保护逃生舱（v6 自扩展安全边界）：默认关（核心路径写拒绝），显式开才放行。
+    // 持久通道 → env，guest 子进程经 passthrough_env 继承——改后需重启 host。
+    if let Some(allow) = cfg.get("tools").and_then(|t| t.get("allow_core_write")).and_then(Value::as_bool) {
+        set("ALLOW_CORE_WRITE", if allow { "1".to_string() } else { "0".to_string() });
     }
     // MCP server 声明（tools PLAN §八）：整体 JSON 序列化为 MCP_SERVERS env。只走持久通道
     // （server 子进程生命周期归 tools 插件 init/destroy，热改无意义）——改后需重启 host。
