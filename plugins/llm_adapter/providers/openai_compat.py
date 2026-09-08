@@ -9,6 +9,7 @@ import os
 import time
 
 from .base import (
+    PROVIDER_DEADLINE,
     StreamSink,
     abort_requested,
     as_object,
@@ -107,7 +108,7 @@ def _chat_once(endpoint: dict, body: dict, provider_label: str) -> dict:
     import httpx
 
     start = time.monotonic()
-    resp = httpx.post(f"{endpoint['base_url']}/chat/completions", json=body, headers=endpoint["headers"], timeout=120.0)
+    resp = httpx.post(f"{endpoint['base_url']}/chat/completions", json=body, headers=endpoint["headers"], timeout=httpx.Timeout(PROVIDER_DEADLINE, connect=10.0))
     elapsed_ms = int((time.monotonic() - start) * 1000)
     if resp.status_code >= 400:
         return err_from_resp(provider_label, resp.status_code, resp.text)
@@ -174,7 +175,7 @@ def _stream_once(endpoint: dict, body: dict, sink: StreamSink, provider_label: s
             f"{endpoint['base_url']}/chat/completions",
             json=stream_body,
             headers=endpoint["headers"],
-            timeout=120.0,
+            timeout=httpx.Timeout(PROVIDER_DEADLINE, connect=10.0),
         ) as resp:
             if resp.status_code >= 400:
                 resp.read()
@@ -192,6 +193,16 @@ def _stream_once(endpoint: dict, body: dict, sink: StreamSink, provider_label: s
                     message = "已被用户取消"
                     sink.error(message)
                     return err(message, code="K499")
+                # 总时限守卫（K502 雪崩修复）：httpx 的 timeout 是 per-read 不是 total，
+                # 涓流可无限续命；必须赶在内核 K502 abort（120s）前主动收敛成业务错误
+                # （message 含 timeout → agent-loop T3 正常重试，且不泄漏 guest 线程）。
+                if time.monotonic() - start > PROVIDER_DEADLINE:
+                    message = (
+                        f"{provider_label} provider timeout: 流式总时长超过 {PROVIDER_DEADLINE:.0f}s"
+                        "（上游慢/限流），已在内核 K502 前主动收敛"
+                    )
+                    sink.error(message)
+                    return err(message)
                 line = raw.strip() if isinstance(raw, str) else raw.decode("utf-8", "replace").strip()
                 if not line:
                     continue

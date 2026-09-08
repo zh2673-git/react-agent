@@ -619,4 +619,6 @@ class ToolsPlugin:
 
 
 if __name__ == "__main__":
-    serve(ToolsPlugin())
+    # 扩池（缺省 4）：bash/web 长调用被 K502 式 abort 时泄漏的 handler 线程会占坑，
+    # 与 llm-adapter 同一动力学（纵深防御）。
+    serve(ToolsPlugin(), max_workers=16)

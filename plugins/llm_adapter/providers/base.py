@@ -29,6 +29,14 @@ import re
 import threading
 import time
 
+# ── provider 总时限（K502 雪崩修复）──────────────────────────────────────
+# 内核 LLM_DEADLINE=120s（agent-loop）是唯一总闸：provider 超时若 >= 120s，内核
+# K502 抢先 abort——gRPC 取消不会中断 guest 线程，Python 侧继续占坑等 httpx 超时
+# （流式的 timeout 是 per-read 不是 total，涓流可无限续命）→ 线程池耗尽连环 K502。
+# 故 provider 侧必须在内核之前主动收敛：非流式 timeout 与流式总守卫都取
+# PROVIDER_DEADLINE（略小于 120s），干净业务错误（message 含 timeout）→ T3 正常重试。
+PROVIDER_DEADLINE = 110.0
+
 
 # ── 取消（R1 停止失效修复）──────────────────────────────────────────────
 # host cancel 端点在 agent-loop cancel（轮次边界收敛）之外，向本插件并行 dispatch

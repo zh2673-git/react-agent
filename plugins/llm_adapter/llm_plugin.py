@@ -140,4 +140,6 @@ def sorted_providers() -> list:
 
 
 if __name__ == "__main__":
-    serve(LlmAdapterPlugin())
+    # max_workers 缺省 4：K502 abort 泄漏的 handler 线程（httpx 不随 gRPC 取消中断）
+    # 会占坑排队，连环 K502 雪崩到整会话。扩池 + provider 侧 PROVIDER_DEADLINE 提前收敛双保险。
+    serve(LlmAdapterPlugin(), max_workers=16)
