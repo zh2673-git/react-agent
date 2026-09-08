@@ -344,3 +344,64 @@
   无从发现该填 key」死锁；池级短路放行条件同步放宽（`items.length === 0 &&
   cfgMcp.servers` 非空不 continue）。真实数据实测：amap key 空 → 组可见、
   failed 灯、占位文案含「填好 Key 保存后重启 host 重试」。
+
+## 九、媒体生成（生图/生视频）：媒体模型接入方案（2026-09-09 立项，待实施）
+
+> 用户需求：支持生图、生视频的模型。本节为方案（未实施）；实施时按切片推进，
+> host/前端切片的迭代记录分别落各自模块 PLAN，本节维护总纲与状态。
+
+### 审计结论（挂接点，全部已对码）
+
+| 层 | 现状 | 结论 |
+|----|------|------|
+| 工具层 | 技能工具 = SKILL.md + tools.json（ToolSpec `exec.cmd` 子进程，stdin `{"args":{...}}` / stdout JSON，`tools_plugin.py` L530-572）；`exec.timeout_secs` 契约已有（§七 T0）；内置 9 件冻结 | 生图/生视频走**技能包 + 技能工具**，零内核/内置改动，符合「只加文件」不变式 |
+| 配置层 | config.json `llm` 段 → `PUT /api/config` 落盘（`web/api/config.rs` L242）+ env 热应用；guest 侧 `passthrough_env` 白名单（`config.rs` L115-129，`BOCHA_API_KEY` 等 key 透传先例） | 新增 `media` 配置段 + `MEDIA_*` env 键，沿用同两条既有管道 |
+| 产物层 | `PRODUCT_EXTS`（`agent-loop/src/tools_exec.rs` L349）含图片 png/jpg/jpeg/gif/webp/svg，**无视频**；前端产物卡点击分流（`app-files.js` L160-165）图片/ html/svg/pdf → 新标签原生渲染 | 图片零改动即通；视频加扩展名 + 前端 `<video>` 内联增强 |
+| 对话层 | `llm.chat` 流式管线按 text/reasoning 帧设计 | 模型直出多模态（如 gemini-image）不在本轮（见已评估不做） |
+| 超时约束 | bash 超时上限 60s（`docs/05` L22-32）；技能工具 `timeout_secs` 可声明但长任务不可靠 | 视频生成（1-10 分钟级）采用**两段式工具**（submit/poll），不改超时契约 |
+
+### 方案：技能包 `media-gen` + 三切片
+
+**M1 生图切片**——`skills/media-gen/`（SKILL.md + tools.json）+ 技能工具 `image_gen.py`：
+- 调 OpenAI 兼容 `/v1/images/generations`（`b64_json` 或 url 下载二选一），成品落
+  产物目录（outputs 规约实施时对码），返回 `{ok, path, bytes, note}`
+- 参数：`prompt`（必填）/ `size` / `n` / `model`（可覆盖默认）
+- 产物卡经既有 PRODUCT_EXTS 图片分支自然呈现，前端零改动
+
+**M2 生视频切片**——两段式贴合 ReAct 循环与超时契约：
+- `video_submit.py`：提交异步任务 → `{ok, task_id, note}`（立即返回，不阻塞）
+- `video_poll.py`：`task_id` → 查状态；`succeeded` 即下载视频落盘返回 path；
+  `running/failed` 返回状态与原因，agent 决定继续轮询或报错
+- provider 形态参数化：提交/查询/下载三 URL 模板 + 轮询间隔/上限，兼容硅基流动/
+  可灵/即梦类「提交→轮询→取片」API 形状；站点差异以 media 配置适配，不做代码级 provider
+
+**M3 配置与前端切片**：
+- config.json 新 `media` 段：`{image:{base_url,model,key}, video:{base_url,submit_url,query_url,model,key,poll_interval,poll_timeout}}`
+  → `PUT /api/config` 增 media 分支校验落盘 + `apply_config_file_to_env` 映射
+  `MEDIA_IMAGE_*` / `MEDIA_VIDEO_*` + `passthrough_env` 增键（tools guest → 技能工具
+  子进程按既有 env 继承链取得）
+- 设置面板 LLM tab 增「媒体模型」区（生图/生视频各一组 base_url/model/key 字段，
+  复用既有保存链）；key 掩码回显同 llm.key 规则
+- `PRODUCT_EXTS` 两处同步加 `mp4/webm/mov`（agent-loop 探测 + host 侧产物过滤，
+  实施时 grep 全仓对齐）；产物卡视频内联 `<video controls preload=metadata>` 预览
+  （新标签原生播放为兜底）
+- SYSTEM.md 补一段媒体工具使用纪律（何时选生图/生视频、产物引用规约）
+
+### 已评估不做
+
+- **对话模型直出多模态**（chat 返回图片帧）：流式协议需新事件类型 + 各 provider 差异大，
+  等真实需求立项
+- **llm-adapter 内做 media op**：媒体模型与对话模型的配置/生命周期耦合，且 llm-adapter
+  的流式旁路管道对同步/轮询型 API 无收益；工具层直连更简单
+- **host 内嵌独立生图 UI**（绕过 agent）：与 agent 平台定位不符，远期可选
+
+### 验证契约（P/Q/I）
+
+- **P**：media 段 PUT 落盘 + env 映射 + 透传（PUT 后 tools guest 内 env 可见）；
+  技能三作用域闸门（装载→启用→load_skill 后工具可见）既有机制零改动通过
+- **Q**：mock 生图端点（本地 http server）出图 → outputs 落盘 → 产物卡可见可预览；
+  mock 视频端点 submit→poll（running 若干次）→succeeded→下载全链路；failed/超时
+  路径报错可读；无 media 配置时工具返回「未配置」引导文案而非异常
+- **I**：既有测试全绿（改动面 = passthrough_env 增键 / PRODUCT_EXTS 增量 / put_config
+  media 分支，均为增量不改既有语义）；`cargo test --workspace` + 技能工具协议单测
+- **状态**：M1/M2/M3 均未实施；实施顺序 M1 → M3（先让生图端到端可见）→ M2
