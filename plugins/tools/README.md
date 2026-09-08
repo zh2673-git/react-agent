@@ -9,8 +9,8 @@
 |---|---|
 | `tools_plugin.py` | 瘦分派层：init 装配 scope → list 过滤 → call 校验分发 → `ToolError` 转字段级错误 |
 | `tools/__init__.py` | `ToolError`（唯一受控错误通道）、`workspace_root()`、`require()`、`optional_int()` |
-| `tools/files.py` | `read_file` / `write_file` / `edit_file` / `list_dir`（含 `_guard` 等共用助手） |
-| `tools/bash.py` | `bash` |
+| `tools/files.py` | `read_file` / `write_file` / `edit_file` / `list_dir`（`_guard` 越界拦截、`_guard_write` v6 核心写保护、`_snapshot_change` W15 变更快照、undo 落盘） |
+| `tools/bash.py` | `bash`（沙箱策略 + W16 快照区执行前后比对 → `changes[]` 追溯） |
 | `tools/web.py` | `web_search` / `web_read` |
 | `tools/grep.py` | `grep`（正则内容搜索，复用 files 的 `_guard`/`_display`/`_decode`） |
 | `tools/symbols.py` | `symbols_search`（tree-sitter 语法级符号检索；缺依赖时本模块不装载） |
@@ -39,7 +39,7 @@
 | `write_file` | files | 整体覆盖写，父目录自动创建 |
 | `edit_file` | files | 精确字符串替换（`old_string` 必须完全匹配，含空白） |
 | `list_dir` | files | 支持 glob |
-| `bash` | bash | 受沙箱策略约束（见下） |
+| `bash` | bash | 受沙箱策略约束（见下）；W16 起执行前后自动快照比对，间接改文件同样可追溯（见「bash 文件追溯」） |
 | `web_search` | web | 返回 `[{title,url,snippet}]`，后端可配 |
 | `web_read` | web | 网页转 markdown 文本 |
 | `grep` | grep | 正则内容搜索 `path:line: text`，剪枝噪音/二进制/大文件 |
@@ -58,6 +58,34 @@
 - 动态装载是 **fail-closed**：单模块 import 失败 → 跳过并回 `skipped`，该模块旧工具原样保留；
   **内置工具名不可被覆盖**（重名检查 + `_BUILTIN_MODULES`）。
 - 保留名 `load_skill` 不在本注册表，由 `agent-loop` 路由给 assets。
+
+## 核心写保护（v6 自扩展安全边界）
+
+`_guard_write`（write_file / edit_file 专用，在越界拦截之后）：核心黑名单**默认拒绝**，报
+`CORE_PROTECTED`——agent 自身运行体不可被模型改动：`crates/`、`plugins/memory`、
+`plugins/llm_adapter`、`plugins/assets`（skills 根内豁免）、`plugins/tools/tools/`、
+`plugins/tools/tools_plugin.py`、`config.json`、`.git/`。
+
+- **自扩展合法途径**（白名单）：skills 目录 SKILL.md / 技能 tools.json / `plugins/tools/` 顶层
+  新 .py / config.json `mcp_servers`。
+- **逃生舱**：env `ALLOW_CORE_WRITE=1`（config.json `tools.allow_core_write: true` 持久通道，改后重启
+  host）。确需改核心时模型应向用户说明，由用户自行修改或显式开启。
+- **诚实边界**：bash 间接写不经此闸——但 W16 起自动快照留痕（含核心区路径），随回滚一并撤销
+  （SYSTEM.md 纪律 + `BASH_SANDBOX` 沙箱兜底 + 留痕三防线）。
+
+## bash 文件追溯（W16）
+
+bash 对文件的间接修改（curl 下载、mv 重命名、脚本生成等）无法像 write/edit 那样预知路径，
+采用**执行前后快照区比对**实现同一追溯链路：
+
+- 快照区 = 工作区 − 噪音目录/`.stream`/产物目录/`MEMORY_DATA_DIR`/`.git`；执行前 pre-copy
+  （上限 32MB / 4000 文件，超限退化为 stat 比对、变更无 undo 引用），执行后逐文件比对内容。
+- 变更（新增/修改/删除）→ 结果附 `changes[]`（`{path, kind, undo?}`，undo 引用
+  `_snapshot_change` 落 `MEMORY_DATA_DIR/undo/<id>.{before,after}` 原始字节，删除型 before 有值
+  after 为 None）→ agent-loop 逐条转发为 op=bash 的 `file_change` 事件 → 与 write/edit 同一
+  diff 视图 / 回滚撤销链路（见 agent-loop README「执行可见性」）。
+- **关闭**：`BASH_WRITE_TRACE=off`。**诚实边界**：工作区外改动不追踪；同 mtime+size 的
+  内容替换不检测。
 
 ## 新增工具
 
@@ -83,7 +111,9 @@
 |---|---|
 | `WORKSPACE_ROOT` | 越界拦截根（缺省取进程 cwd，宿主会显式下发） |
 | `TOOLS_ENABLED` | 白名单，逗号分隔 |
+| `ALLOW_CORE_WRITE` | `1` 放行核心写保护（缺省 `0` 拒绝报 `CORE_PROTECTED`；持久通道 config.json `tools.allow_core_write`） |
 | `BASH_SANDBOX` | `on`（缺省，需 sandbox-run 助手；助手缺失则 fail-closed 直接把 bash 移出白名单）/ `off`（显式豁免） |
+| `BASH_WRITE_TRACE` | on（缺省）= bash 执行前后快照区比对追溯；off=关闭快照 |
 | `SEARCH_BACKEND` / `SEARCH_REGION` | 搜索后端与区域 |
 | `BOCHA_API_KEY` / `BAIDU_API_KEY` / `TAVILY_API_KEY` | 搜索服务鉴权 |
 

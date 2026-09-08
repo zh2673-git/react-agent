@@ -17,10 +17,10 @@
 - ReAct 循环：感知(读记忆)→规划(LLM+工具清单)→行动(执行工具/保留名路由)→观察(写回记忆)→收敛；全程发射事件（trace）+ 逐轮进度回显
 - 三家 LLM 全覆盖：OpenAI 兼容（可换 base_url 适配 DeepSeek 等）、Anthropic、Ollama；另带 **mock** provider 供离线测试
 - 生产级工具 9 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read / symbols_search（全部免费默认无 key）；另有 **MCP 外接池**（stdio 服务器，`mcp__{server}__{tool}` 命名空间，见 env 表 `MCP_SERVERS` 与 §八）与技能配套工具两池，统一白名单启用
-- 双前端：REPL（默认）/ Web 网关（HTTP+SSE，Cursor 暖色系事件流式会话：左侧会话栏 + 自动命名 + 持久化、「思考与工具」过程框（思考链 + 工具卡状态点，可折叠回看；工具卡内联 diff——edit 红绿行级 / write 新增 / bash 回显）、每轮「📝 文件变更」chip（点击定位工具卡 / ⇄ 双栏 diff 对比变更前后）、🔗 来源 chip 溯源抽屉、产物文件卡片 + 📁 工作区文件树（任意文件只读预览/下载）、📎 附件上传、消息回滚/重新生成（文件改动随回滚一并撤销）、subagent 实时框、富 markdown（表格/代码块复制），刷新恢复 = 日志重放）
-- **Web 配置中心**（08）：右上角 ⚙ 侧边抽屉四标签——LLM（provider/model/站点预设/base_url/api_key，ollama 另显模型原生窗口，热生效 + 落盘 config.json）、工具（内置/技能/MCP 三池分组折叠，条目展开看参数 schema；MCP 组内 server 总开关 + API Key 配置）、技能（SKILL.md 在线编辑 + R9 配套工具就地启停；来源徽章区分出厂/用户，出厂件删除保护）、Agent（max_rounds/系统提示词/上下文窗口等热通道）；配置源文件一键「在编辑器中打开」
-- **自扩展**（08）：L1 技能自扩展——skills 根在 WORKSPACE_ROOT 内时系统提示词授权模型用 write_file 自建技能（文件即注册表，下轮对话自动可见）；L2 工具自扩展——`tools.reload` 动态装载新工具模块（装载≠启用，白名单两步分离）；R9 技能自造闭环——`skill_install` 编排 + 语言无关配套工具（tools.json 声明 + 任意语言执行体），前端内联卡一键启用（装载≠启用≠可见，见「配置中心与自扩展」）。**已实证**：`gongwen-format`（公文格式写作，用户自建件，随 gitignore 用户件规则**不入库**）即 agent 在对话中自建的技能——SKILL.md 与配套工具（tools.json + Python 执行体）均由模型一次生成，内联卡启用后跨会话可用，非人工预置
-- subagent：保留工具 `task` 委派子任务（新 session 复用全链路，深度防嵌套）；前端「思考与工具」过程框内嵌套「子代理」实时框——子代理的思考流与工具卡实时透传呈现（trace 事件镜像 + 子旁路流式），委派不再"图标一闪就卡住"
+- 双前端：REPL（默认）/ Web 网关（HTTP+SSE，Cursor 暖色系事件流式会话）：左侧会话栏（自动命名 + 持久化）、「思考与工具」过程框（思考链 + 工具卡内联 diff，可折叠回看）、每轮「📝 文件变更」chip（Monaco 双栏 diff 对比变更前后 + 回滚撤销）、🔗 来源溯源抽屉、产物文件卡片 + 📁 工作区文件树、📎 附件上传、消息回滚/重新生成（文件改动随回滚一并撤销）、subagent 实时框、富 markdown；刷新恢复 = 日志重放
+- **Web 配置中心**（08）：右上角 ⚙ 侧边抽屉四标签——LLM（provider/model/站点预设/key，ollama 显原生窗口，热生效 + 落盘 config.json）、工具（内置/技能/MCP 三池分组折叠）、技能（SKILL.md 在线编辑 + 配套工具启停，出厂件删除保护）、Agent（max_rounds/系统提示词/上下文窗口热通道）；配置源文件一键「在编辑器中打开」
+- **自扩展**（08）：L1 技能自扩展（skills 根在工作区内时授权模型 write_file 自建技能，文件即注册表，下轮对话可见）；L2 工具自扩展（`tools.reload` 装载 + 配置中心启用，两步分离）；R9 技能自造闭环（`skill_install` 编排 + 语言无关配套工具，前端内联卡一键启用；装载≠启用≠可见）。**已实证**：`gongwen-format` 公文写作技能即 agent 对话中自建（SKILL.md 与配套工具均模型一次生成，跨会话可用，非人工预置）
+- subagent：保留工具 `task` 委派子任务（新 session 复用全链路，深度防嵌套）；过程框内嵌「子代理」实时框，子代理思考流与工具卡实时透传（trace 镜像 + 子旁路流式）
 
 ## 界面一览
 
@@ -30,6 +30,13 @@
 > 「思考与工具」过程框展开（💭 思考链 + 工具卡状态点，可折叠回看）→ 🔗 来源 chip 溯源抽屉 →
 > ⚙ 设置面板：LLM（模型/站点/key）· 工具 · 技能（自建技能 gongwen-format 及配套工具启停区）· Agent（max_rounds/上下文窗口热通道）。
 > 图中会话即 agent 实际运行记录——工具清单查询 + 联网查天气 + 自动落盘会话命名。
+
+![文件变更与回滚](docs/images/file-changes.gif)
+
+> **执行可见性实机演示**：write_file 写入与 bash 脚本删除 → 每轮答案下方「📝 文件变更 (2)」chip →
+> 抽屉列表（「写入」/「脚本」徽章 + round 标注）→ ⇄ Monaco 双栏全文 diff（变更前后对比；
+> 删除型显示删除前完整内容并注明回滚可还原）——bash 间接改动与 write/edit 同一追溯链路（W15+W16），
+> 回滚时所有变更可一并撤销。
 
 ## 目录
 
@@ -154,81 +161,26 @@ e2e：tools(9 工具往返 + MCP echo 三模式)、memory(append/get/clear/summa
 
 > 注意：若测试失败提前退出，guest 子进程可能残留（占用内存无害）；可用 `Get-Process python,node` 检查清理。测试内已将 guest stderr 指向 null，cargo 不会再被泄漏进程扣住。
 
-## Wire 契约（Contracts）
+## Wire 契约（最小契约）
 
-跨插件 payload 均为 JSON；业务错误走 payload 内 `{"ok":false,"error":{...}}`，`KernelError` 仅承载传输/生命周期失败。路由按 `Envelope.target`；op 分派在 payload 的 `"op"` 字段。
+跨插件 payload 均为 JSON；业务错误走 payload 内 `{"ok":false,"error":{...}}`（`code` / `message` / `field` 字段级定位），`KernelError` 仅承载传输/生命周期失败。路由按 `Envelope.target`，op 分派在 payload 的 `"op"` 字段。各 capability 的**完整 op 清单与字段语义**见各模块 README：
 
-**agent-loop**（`agent.chat`）
-- req `{"op":"chat","session_id":str,"user_text":str,"attachments"?:[Attachment]}`（attachments：host 已校验，图片走多模态映射、文本文件内嵌 content，见「用户附件」）
-- resp `{"ok":true,"answer":str,"rounds":int,"steps":[{"round":int,"tool":str,"ms":int}],"session_id":str}` | `{"ok":false,"error":{...}}`
-- 保留工具名（不进 tools.list，由 agent-loop 路由）：`load_skill`→assets `skills.load`（成功发 `skill_loaded` trace 事件，会话技能集重放推导依据）；`skill_install`→R9 技能安装编排（assets skills.load 取声明 → tools.install fail-closed 装载 → trace `skill_installed`）；`task`→子代理（新 session 复用 agent.chat，深度防嵌套）
-- **产物登记**：write_file/edit_file 成功 → trace `{"type":"artifact","path","tool","bytes"?}` 事件；bash/最终答案文本经扩展名启发式扫描兜底（双闸：二进制成品任意位置放行；md/html/txt 等文本类仅产物目录 `AGENT_OUTPUT_DIR` 内放行——避免 rg/ls 输出把整仓文档刷成卡）；前端渲染可点击文件卡片（流式期间在过程框内，回合收敛后置底展示在最终答案下方），`GET /files/{path}` 服务内容（realpath ⊆ WORKSPACE_ROOT，`?download=1` 下载）。**提及过滤（W9.3）**：最终答案收敛时只保留答案文本点名的文件（路径或文件名匹配，大小写/路径分隔符归一；一条都没点名则不过滤防误杀）——中间草稿等未提及产物自动移除
-- **来源登记（信息溯源）**：web_search 成功 → trace `{"type":"sources","tool","items":[{"title","url"}]}`（web_read 单 URL 同款）；URL http/https 白名单 + 去重 + 上限 10 条；前端回合内累计去重折叠为一张「🔗 来源 (N)」chip 卡，点击右侧滑出抽屉逐条查看标题与链接（W9.3），与产物卡一并置底，方便回答依据溯源
-
-**llm-adapter**（`llm.chat`）
-- req `{"op":"chat","provider"?:"openai"|"anthropic"|"ollama"|"mock","messages":[Msg],"tools"?:[ToolSpec],"stream_path"?,"sid"?,"num_ctx"?:int}`（`num_ctx` 源自 `LLM_CONTEXT_TOKENS`，0/缺省不下发；仅 ollama native 映射 `options.num_ctx`）
-- Msg = `{"role":"system"|"user"|"assistant"|"tool","content":str|null,"tool_calls"?:[{"id","name","arguments":object}],"tool_call_id"?:str,"attachments"?:[{"name","mime","data_b64"}]}`（attachments 仅图片，provider 按协议映射）
-- ToolSpec = `{"name","description","parameters":json-schema}`
-- resp `{"ok":true,"content":str|null,"tool_calls":[{"id","name","arguments":object}],"model":str,"finish_reason":"stop"|"tool_calls"}`
-- 扩展 `{"op":"configure","provider"?,"model"?,"base_url"?,"api_key"?}` → `{"ok":true,"applied":{...}}`（08 运行时热配置：更新本进程 env；api_key 只回 api_key_set）
-- 扩展 `{"op":"abort","session_id":str}` → `{"ok":true,"session_id","note"}`（R1 取消：置位进程级取消注册表，流式循环逐帧检查命中即关流返回 K499；时间戳语义防误伤陈旧信号，详见 `plugins/llm_adapter/README.md`）
-- 扩展 `{"op":"models.list","provider"?}` → `{"ok":true,"models":[str],"models_meta"?}`（openai/deepseek 走 `/v1/models`；ollama 走 `/api/tags` + 逐模型 `/api/show` 探测原生窗口；anthropic/mock 走静态清单；`models_meta` 为可选扩展 `[{"name","ctx_limit"?}]`——模型原生上下文窗口，取不到省略键，其他 provider 不带；失败 `{"ok":false,"error":{...}}`）
-
-**tools**（`tools.exec`）
-- `{"op":"list"}` → `{"ok":true,"tools":[ToolSpec]}`（生产级 9 件：read_file / write_file / edit_file / list_dir / grep / bash / web_search / web_read / symbols_search，受 `TOOLS_ENABLED` 裁剪）
-- `{"op":"list","all":true}` → 额外含未启用工具，各项附 `"enabled":bool`（配置中心视图）
-- `{"op":"call","name":str,"args":object}` → `{"ok":true,"result":any}` | `{"ok":false,"error":{"code","message","field"?}}`（字段级错误：哪个参数错、合法值是什么）
-- 扩展 `{"op":"configure","enabled":[str,...]}` → 运行时整体替换白名单（未知名 → 字段级 400）
-- 扩展 `{"op":"reload"}` → 扫描 tools/ 目录动态装载新模块 → `{"ok":true,"loaded":[...],"added":[...],"skipped":[...]}`（**装载≠启用**：新工具进可用池不进白名单，需 configure 启用；内置不可覆盖，单模块失败跳过 fail-closed）
-- 扩展 `{"op":"install","path":str,"skill"?}` → `{"ok":true,"skill","loaded","skipped","pending"}`（R9：定点装载技能包内 tools.json——数组，每项 ToolSpec + `exec:{cmd:[...],"cwd"?}`；装载进技能工具池，不可调用、不进 list、不启用。校验 fail-closed：realpath ⊆ WORKSPACE_ROOT 且 ⊆ skills 根，name 不与内置/已装载冲突，单项失败跳过；`skill` 缺省回退目录名）
-- 扩展 `{"op":"skill_tools","skills":[str]?,"all"?}` → `{"ok":true,"tools":[ToolSpec + "skill" + "enabled"?]}`（R9：缺省只出**已启用**技能工具——agent-loop 会话清单装配视图；`all:true` 附未启用项——host 配置视图。不在 list 契约内，技能工具对内置工具 tab 不可见）
-- **技能工具执行协议（语言无关）**：被 call 时起**子进程**执行 `exec.cmd`——stdin 收 `{"args":{...}}`，stdout 回 `{"ok":true,"result":...}` | `{"ok":false,"error":{...}}`（与 Wire 契约同形，任意语言 JSON 序列化即可实现工具）；cwd 缺省技能目录，受 `SKILL_TOOL_TIMEOUT_SECS`（缺省 60s）约束，输出不合契约 → `TOOL_EXEC_ERROR`，未启用调用 → `TOOL_DISABLED`。`configure` 合法值 = 内置/动态池 ∪ 技能工具池；`TOOLS_ENABLED` 中的技能工具名先于装载到达（重启场景）→ 延迟启用，install 同名工具时自动转入启用集
-- **§八 MCP 第三池**：`MCP_SERVERS` 声明的 stdio server 于 init 时握手入池——命名空间 `mcp__{server}__{tool}`，description / inputSchema 透传（list 中 `mcp_server` 字段标来源）；call → JSON-RPC `tools/call`，content text 拼接回契约形，`isError:true` → `MCP_TOOL_ERROR`；server 崩溃 fail-closed 跳过（其工具不入池，调用即 `UNKNOWN_TOOL`），重启带退避不拖垮其余工具；启用闸与内置/技能工具同走 `TOOLS_ENABLED`（装载≠启用）。`{"op":"mcp_tools"}` → `{"ok":true,"servers":[{"name","status","tools","error"?}],"tools":[{...,"enabled"}]}`（host 配置视图）。destroy 逆序回收无孤儿进程
-
-**assets**（`assets.registry`）
-- `{"op":"skills.list"}` → `{"ok":true,"skills":[{"name","description","origin","tools"?:true}],"root":str}`（每次调用重扫目录；root 供 agent-loop 自扩展可达性探测；`origin` = 来源标记：frontmatter 显式 `origin: preset` → 出厂件（删除保护），缺省/其他 → 用户件——出厂件必须显式声明，存量用户技能缺字段即正确归类；`tools:true` = frontmatter 声明了配套工具——R9，声明指向的文件是否存在不在此校验）
-- `{"op":"skills.load","name":str}` → `{"ok":true,"content":str,"tools_manifest"?:{"path":str,"missing"?:[str]}}` | `{"ok":false,"error":{...}}`（读取前重扫；`tools_manifest.path` = 声明文件绝对路径，供 tools.install 定点装载；声明存在但文件缺失时回传 missing）
-- `{"op":"prompts.list"}` → `{"ok":true,"prompts":[{"name","description"}]}`
-- `{"op":"prompts.get","name":str}` → `{"ok":true,"content":str}`
-
-**memory**（`memory.session`）
-- `{"op":"append","session_id":str,"messages":[Msg]}` → `{"ok":true,"count":int}`
-- `{"op":"get","session_id":str,"limit"?:int}` → `{"ok":true,"messages":[Msg]}`
-- `{"op":"clear","session_id":str}` → `{"ok":true}`
-- `{"op":"summarize","session_id":str,"summary":str,"keep_last"?:int=10}` → `{"ok":true,"count":int}`（上下文压缩：历史替换为压缩标记 + 最近 keep_last 条，孤儿 tool 消息防撕裂）
-
-**memory**（`session.trace`，只追加事件日志）
-- `{"op":"trace.append","session_id":str,"events":[Event...]}` → `{"ok":true,"count":int}`
-- `{"op":"trace.read","session_id":str,"after"?:int=0}` → `{"ok":true,"events":[Event],"next":int}`
-- Event 建议形状 `{type, ts, ...}`；存储 `<MEMORY_DATA_DIR>/traces/<session>.jsonl`
-
-**web 网关**（host 级，非插件）
-- `GET /` → 单页（Cursor 暖色系事件流式会话：米色纸感底 + 半透明炭黑 CTA，主题 token 见 crates/host/PLAN.md W1；左侧会话栏持久化、工具调用状态点卡片、富 markdown 代码块复制 + 头部 📁 文件树 / ⚙ 设置面板：LLM / 工具 / 技能 / Agent；文件变更 chip 已下沉至每轮答案下方）
-- `GET /vendor/{path}` → W11 静态资源树（monaco 编辑器本地化于 `web-dist/vendor/`）：路径段校验（无 `..`/反斜杠/空段）+ 扩展名白名单（js/css/json/ttf/woff/woff2）防穿越；产物文件卡预览走「本地 vendor → CDN → 纯文本」三级降级链
-- `GET /api/tree?limit=` → 工作区文件清单（W14 文件树数据源）：递归扫 WORKSPACE_ROOT（剪枝噪音/点目录，不跟 symlink），深度 6 / 条目 3000（≤20000）双上限 + `truncated` 标记；扁平 `[{path,size}]` 正斜杠输出，与 `/files` 同一 WORKSPACE_ROOT 口径
-- `GET /files/{path}[?download=1]` → 按扩展名 mime 服务工作区内任意文件（realpath ⊆ WORKSPACE_ROOT，64MB 上限）：产物卡与文件树预览/下载共用通道
-- `GET /api/fc-snapshot?id=&side=before|after` → W15 变更快照读取（write/edit 落在 `MEMORY_DATA_DIR/undo/<id>.{before,after}` 的原始字节）；id 严格格式校验（13 位毫秒时间戳 + 8 位小写 hex）防路径穿越；前端 diff 视图数据源
-- `GET /api/events?session=&after=` → SSE（从 0 全量重放 + 实时增量）
-- `POST /api/chat` body `{"session_id":str,"message":str,"attachments"?:[{"name","mime","data_b64"}]}` → 阻塞至收敛，回 agent.chat 响应（attachments 可选：图片走多模态映射、文本文件内嵌 content；上限 4 个、单个 ≤2MB，host 校验形状与体量，非法即 K400）
-- `POST /api/chat/cancel?session=` → 取消运行中的 chat：agent-loop `cancel`（工具波次间 + 轮次边界收敛 K499）+ llm-adapter `abort`（流式逐帧检查命中即关流，单轮长生成无需等轮次边界），立即返回
-- `POST /api/chat/rollback` body `{"session_id":str,"upto_user_index":int}` → R2 回滚：memory 消息与 trace 事件**同源物理截断**到第 N 条 user 消息之前（0 基）。**计数口径以 trace user 事件为准（UI 真相源）**；memory 经压缩只剩「标记 + 最近 K 条」，两侧按**尾部对齐**（压缩只裁头部）定消息切点：回滚点在保留区 → 保压缩标记、截到该轮前；落在摘要区 → 标记与消息全清（摘要与回滚区间重叠，保留即上下文残留）；无 trace 文件的纯 memory 会话按 memory 侧计数，标记随截断一并丢弃。越界整体失败不落盘。**W15 文件撤销**：截断前读 trace 收集区间内带 undo 引用的 `file_change` 事件，截断成功后**倒序恢复**——created（新建）删除文件、deleted（W16 bash 删除）在文件仍不存在时还原 before 快照字节（被重建则跳过）、覆盖/编辑还原 before 快照字节；冲突检测：当前文件与 after 快照逐字节不一致（agent 写完后又被人改过）→ 跳过并报告，绝不硬覆盖；bash 间接改文件经 W16 快照同样记事件（op=bash）并随回滚撤销（`BASH_WRITE_TRACE=off` 关闭）。body 可选 `undo_files:false` 显式关闭；响应新增 `undone[]`/`skipped[]`；技能目录与产物登记不受影响；前端 user 气泡 hover「⤺ 回滚」（确认框预列将被撤销的文件）、答案 hover「↻ 重新生成」（= 回滚该问题 + 自动重发原文与附件）
-- `GET /api/config` → 配置视图（llm：config.json > env 缺省，key 只回 key_set+尾 4 位；tools 三池聚合数组——每项 `{name,enabled,pool:"builtin"|"skill"|"mcp",description,parameters}` 附 `skill`/`mcp_server` 来源字段，前端按 pool 分组渲染：内置平铺，技能/MCP 池按来源折叠分组 + 组头总开关（三态），MCP 组 ready 在前 failed 垫底；`mcp:{servers, declared}`——servers 为运行状态，declared 为 config.json 声明视图（command/cwd + env 各键脱敏为 `key_set`/`key_tail`），key 配置内嵌于前端「MCP 外接」各服务折叠组内（填 Key → 保存仅落盘 → 重启 host 生效）；skills_count；agent 参数视图）
-- `PUT /api/config` → 分段合并落盘 + 热应用：`llm` 逐字段（null 不覆盖，key 热应用 env）；`tools.enabled` 白名单整体替换（configure 热生效）；`agent` 逐字段（null 不覆盖）；`mcp_servers` 按 server 名合并——command/cwd 未传保留原值，env 逐键合并（空串=不动），**仅落盘**（server 子进程生命周期归插件 init/destroy，改后需重启 host）
-- `GET /api/models` → 转发 llm-adapter `models.list`，返回当前 provider 可用模型 id（前端「拉取模型」按钮；配好 base_url/key 后自动填充
- model 下拉；ollama 额外透传 `models_meta` 原生窗口元数据——前端下拉展示 `模型名 · 256k`，Agent 页 `llm_context_tokens` 提示原生窗口并可一键填入）
-- `GET /api/presets` → 转发 llm-adapter `presets.list`，OpenAI 兼容站点预设清单（ModelScope / 硅基流动 / OpenRouter 等，数据源 plugins/llm_adapter/presets.py——前端「站点」下拉一键切换：选站自动填 base_url、per-site key 由 localStorage 记忆带出，保存走 configure 热应用零重启）
-- `GET /api/skills` → assets skills.list（实时目录；R9：合入 `tools_detail`——tools.skill_tools all=true 按 skill 分组的配套工具视图，含未启用项 + enabled 标记，前端技能 tab 就地启停数据源；tools 不可用 → 静默省略）
-- `GET /api/skills/{name}` → `{"ok":true,"name","content"}`（SKILL.md 原文，编辑用）
-- `PUT /api/skills/{name}` body `{"content":SKILL.md全文}` → 写入（frontmatter name 须与目录名一致；名字仅字母数字/_/-）；写入自动打标 `origin: user`
-- `DELETE /api/skills/{name}` → 删除技能目录；出厂件（frontmatter 显式 `origin: preset`，预置技能归 git 管理）拒删 K403，缺省视为用户件可删
+| capability | 提供者 | 职责摘要 | 契约详表 |
+|---|---|---|---|
+| `agent.chat` | agent-loop（InProcess） | ReAct 编排主入口：req `{session_id, user_text, attachments?}` → resp `{answer, rounds, steps}`；保留名 `load_skill`（→assets）/ `skill_install`（R9 编排）/ `task`（子代理）由其内部路由 | [agent-loop README](crates/agent-loop/README.md) |
+| `llm.chat` | llm-adapter | 三家 LLM 统一收口：`{messages, tools?, stream_path?, sid?, num_ctx?}`；扩展 `configure` / `abort` / `models.list` / `presets.list` | [llm_adapter README](plugins/llm_adapter/README.md) |
+| `tools.exec` | tools | 内置 9 件 + 技能工具 + MCP 第三池：`list` / `call` / `configure` / `reload` / `install` / `skill_tools` / `mcp_tools`（装载≠启用） | [tools README](plugins/tools/README.md) |
+| `assets.registry` | assets | skills / prompts 渐进披露注册表（每次重扫，`origin` 来源标记，`tools_manifest` 定点装载指引） | [assets README](plugins/assets/README.md) |
+| `memory.session` / `session.trace` | memory | 模型上下文（可压缩可回滚）+ 只追加事件日志（UI 唯一持久事件源） | [memory README](plugins/memory/README.md) |
+| `/api/*` + SSE | host（非插件） | Web 网关：会话 / 配置 / 技能 CRUD / 文件通道（含 W14 文件树、W15 变更快照）/ 取消 / 回滚 | [host README「/api/* 一览」](crates/host/README.md) |
 
 ## 配置中心与自扩展（08）
 
-- **配置中心**：Web 设置面板保存 → llm-adapter/tools configure op 热生效（env）→ merge 落 `config.json`；重启时 `apply_config_file_to_env` 还原。env 仍是一切配置之源（spawn 复用既有机制）
-- **L1 技能自扩展**：assets `skills.list` 回传 root，agent-loop 判定 root ⊆ WORKSPACE_ROOT 后在系统提示词注入授权段——模型用 `write_file` 写 `<skills-root>/<name>/SKILL.md` 即完成注册（list 每次重扫，下轮对话可见，无需 reload）。授权≠边界：真正的硬边界仍是文件工具 realpath 越界拦截
-- **L2 工具自扩展**：把符合 ToolSpec 三元组（name/description/parameters/run）的 `TOOLS` dict 放进 `plugins/tools/` 下的新 .py 文件，对话中说「重载工具」→ `tools.reload` 装载进池；再经配置中心勾选启用（装载≠启用，写与启用两步分离）
-- **R9 技能自造闭环**：模型调 `skill_install(name)` 完成技能包安装编排——assets `skills.load` 取 SKILL.md + frontmatter `tools:` 声明 → `tools.install` fail-closed 装载配套工具（语言无关：tools.json 声明 + 任意语言执行体，子进程 stdin/stdout JSON 协议）→ trace `skill_installed` 事件 → 前端过程框内联卡「技能已就绪 · N 件待启用」。**三层作用域**：装载（进池不可调用）≠ 启用（一键启用过配置闸，全局持久）≠ 可见（仅 `load_skill` 后该技能已启用工具进入本会话工具清单，会话技能集由 trace 重放推导）。工具归属技能界面（技能 tab 内启停），内置 9 件冻结不扩展
-- **过程框交互（W7-W9）**：「思考与工具」过程框固定宽度（820px）恒定高度（16vh）内滚，内容实时贴底滑动显示最新（用户上滚即暂停跟随，回底自动恢复），模型思考链带「💭 思考」标签按轮混排在工具卡之间；流式期间产物/来源卡先收纳在框内（与过程同框不散落），正式答案出现时过程框自动收起、卡片移出置底展示在答案下方（回合异常终止时留在框内仍可见）。`task` 委派在框内嵌套「子代理」实时框：子代理思考流与工具卡实时透传（trace 事件镜像 + 子旁路流式，`user` 事件不镜像以保回滚定位真相源；刷新重放显示工具卡与各轮答案，思考流仅实时可见）
+- **配置中心**：Web 设置面板保存 → llm-adapter/tools configure op 热生效（env）→ merge 落 `config.json`；重启时还原。env 仍是一切配置之源（spawn 复用既有机制）。
+- **L1 技能自扩展**：skills 根落在 `WORKSPACE_ROOT` 内时系统提示词注入授权段——模型用 `write_file` 写 SKILL.md 即完成注册（文件即注册表，下轮对话可见）；硬边界仍是文件工具 realpath 越界拦截。
+- **L2 工具自扩展**：符合 ToolSpec 的 `TOOLS` dict 放进 `plugins/tools/` 新 .py → `tools.reload` 装载进池 → 配置中心勾选启用（装载≠启用，两步分离）。
+- **R9 技能自造闭环**：模型调 `skill_install` 完成技能包安装编排（SKILL.md + tools.json + 任意语言执行体，子进程 stdin/stdout JSON 协议）；**三层作用域**：装载（进池不可调用）≠ 启用（过配置闸，全局持久）≠ 可见（`load_skill` 后进本会话工具清单）。内置 9 件冻结不扩展。
+- 细节见 [agent-loop README「技能自扩展」](crates/agent-loop/README.md) 与 [tools README](plugins/tools/README.md)。
 
 ## 架构要点（内核约束的落点）
 
@@ -241,26 +193,10 @@ e2e：tools(9 工具往返 + MCP echo 三模式)、memory(append/get/clear/summa
 
 ## 可靠性与执行可见性（现状摘要）
 
-- **运行中断（停止）**：已支持（P2/T1 + R1 补强）。`POST /api/chat/cancel?session=` 双通道置位：
-  agent-loop `cancel`（**工具波次间 + 轮次边界**以 K499 收敛，单轮多波工具不等全轮跑完）+ llm-adapter
-  `abort`（流式逐帧检查命中即关流返回 K499，**单轮长生成可即时中断**，无需等轮次边界）。前端停止 =
-  cancel 置位后随即 abort 阻塞中的 /api/chat（UI 即时解锁，服务端到最近检查点自然收敛，memory/trace 照常落盘）。
-  正在执行中的单个工具调用不可中断（bash 子进程等到命令结束/超时）。机制详见
-  `crates/agent-loop/README.md`「运行中断（停止）」与 `plugins/llm_adapter/README.md`「abort」。
-- **sid 跨对话唯一（已修复）**：sid 形如 `{session}-r{N}`，N 为 per session 单调序号
-  （unix 毫秒种子），相邻对话回合不再碰撞——此前 rounds 每回合重置，相同 sid 会被前端
-  doneSids 去重误吞流式动画。细节见 `crates/agent-loop/README.md`「流式编排」。
-- **执行可见性（V1+V2+W15+W16）**：工具卡内联 diff（edit 红绿行级 / write 新增 / bash 命令回显，
-  >500 行折叠）+ 每轮答案下方「📝 文件变更」chip（🔗 来源同款收纳；点击开抽屉列表，条目
-  「⇄ diff」开 Monaco DiffEditor 双栏对比**完整文件内容**的变更前后，并定位工具卡）。数据源：
-  tool_call args（V1）、`file_change` 事件（V2，write/edit 成功时由 agent-loop 落 trace）、
-  变更快照（W15 files.py + **W16 bash.py**：把变更前后原始字节落
-  `MEMORY_DATA_DIR/undo/<id>.{before,after}`，事件携带 `undo:{id,created,deleted,bytes_*}` 引用——
-  diff 数据源三级降级：快照 → args 重构 → 单侧当前内容；**W16 起 bash 也记事件**：
-  bash.py 对快照区执行前后自动比对，新增/修改/删除随结果 `changes[]` 转发为 op=bash 事件
-  （抽屉徽章「脚本」，删除型单侧显示删除前内容），与 write/edit 同一回滚撤销链路）。
-  回滚撤销见 `/api/chat/rollback`。子代理变更经镜像汇入同池。
-- SSE 增量续传、刷新恢复、断线不重绘不重复的完整数据流设计见 `crates/host/README.md`「数据流设计要点」。
+- **运行中断（停止）**：`POST /api/chat/cancel` 双通道——agent-loop `cancel`（工具波次间 + 轮次边界 K499 收敛）+ llm-adapter `abort`（流式逐帧命中即关流，单轮长生成即时中断）。正在执行中的单个工具调用不可中断。机制详见 [agent-loop README](crates/agent-loop/README.md) 与 [llm_adapter README](plugins/llm_adapter/README.md)。
+- **sid 唯一性**：sid 形如 `{session}-r{N}`（per session 单调序号，unix 毫秒种子），跨回合不碰撞；改 sid 格式前必查 llm-adapter `_SID_RE` 消费点。见 [agent-loop README「流式编排」](crates/agent-loop/README.md)。
+- **执行可见性（V1+V2+W15+W16）**：四层数据源——工具卡内联 diff（tool_call args）→ `file_change` 事件（write/edit/bash 落 trace）→ 变更快照（原始字节落 undo 目录，Monaco 双栏全文 diff）→ 回滚撤销（created 删除 / deleted 还原 / 冲突跳过报告）。bash 间接改文件经快照区比对同样入链（`BASH_WRITE_TRACE=off` 关闭）。机制详见 [agent-loop README「执行可见性」](crates/agent-loop/README.md)。
+- **SSE 数据流**：重放/实时分阶段、断线增量续传、doneSids 去重、心跳 5s——完整设计见 [host README「数据流设计要点」](crates/host/README.md)。
 
 ## Roadmap（后续方向）
 

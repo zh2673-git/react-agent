@@ -72,6 +72,8 @@
 | `TOOLS_ENABLED` | 工具白名单（逗号分隔） | tools |
 | `WORKSPACE_ROOT` | 文件工具越界拦截根 | tools / assets |
 | `BASH_SANDBOX` | bash 沙箱策略（缺省 on，fail-closed） | tools |
+| `BASH_WRITE_TRACE` | W16 bash 文件追溯（缺省 on；off=关闭快照区比对） | tools |
+| `ALLOW_CORE_WRITE` | v6 核心写保护逃生舱（缺省 0 拒绝报 CORE_PROTECTED） | tools |
 | `SEARCH_BACKEND` / `SEARCH_REGION` / `BOCHA_API_KEY` / `BAIDU_API_KEY` / `TAVILY_API_KEY` | 联网搜索 | tools |
 | `SKILLS_DIR` / `PROMPTS_DIR` | 资产目录 | assets |
 

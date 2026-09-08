@@ -56,6 +56,27 @@ react-agent 的大脑：把"用户一句话"变成"多轮感知 → 规划 → �
 - 最终 `assistant` 事件承载完整答案，并附 `reasoning` / `usage` / `elapsed_ms`（多轮累计；
   字段缺省即 provider 未提供，旧消费者无感知）。
 - `error` 事件含人类可读原因，前端据此以红条收尾。
+- `artifact`（产物登记）：write_file/edit_file 成功 → `{"type":"artifact","path","tool","bytes"?}`；
+  bash/最终答案文本经扩展名启发式扫描兜底（双闸：二进制成品任意位置放行；md/html/txt 等文本类
+  仅产物目录 `AGENT_OUTPUT_DIR` 内放行）。前端渲染可点击文件卡片。
+- `sources`（来源登记）：web_search 成功 → `{"type":"sources","tool","items":[{"title","url"}]}`
+  （web_read 单 URL 同款）；URL http/https 白名单 + 去重 + 上限 10 条。
+- `file_change`（执行可见性 V2 + W16，见下节）。
+- `skill_loaded`：`load_skill` 成功（会话技能集重放推导依据）；`skill_installed`（R9）：技能安装编排
+  完成，带 `skill` / `tools_loaded` / `tools_pending`——前端过程框内联卡「一键启用」数据源。
+
+## 执行可见性：file_change 事件与 undo 快照（V2 + W15 + W16）
+
+`tools_exec.rs::detect_file_changes` 在每个工具成功后从结果推导 `file_change` 事件落 trace
+（只追加、SSE 透传、重放可见），是前端「📝 文件变更」chip / Monaco 双栏 diff / 回滚撤销的统一数据源：
+
+- **write/edit**（V2）→ 单事件 `{"type":"file_change","path","op":"write"|"edit","round","undo"?}`。
+- **bash**（W16）→ 结果带 `changes[]`（bash.py 快照区执行前后比对）→ **逐条展开**为
+  `op:"bash"` 多事件（新增/修改/删除，抽屉徽章「脚本」），与 write/edit 同一 diff/回滚协议。
+- **undo 引用**：结果内带 `undo:{id,created,deleted,bytes_*}`（files.py / bash.py 变更快照，
+  原始字节落 `MEMORY_DATA_DIR/undo/<id>.{before,after}`）→ 原样透传。前端 diff 数据源三级降级：
+  快照 → tool_call args 重构 → 单侧当前内容；回滚撤销经 host `/api/chat/rollback` 倒序恢复。
+- 子代理变更经 trace 镜像汇入同池；纯观测不进模型上下文（事件不回喂 LLM）。
 
 ## 上下文体积管理（截断 + 压缩 + 窗口 + token 闸，四层）
 

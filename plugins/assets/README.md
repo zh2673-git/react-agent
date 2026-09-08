@@ -20,11 +20,19 @@ assets **从不执行** skill 代码——执行靠 tools 插件的基础工具�
 ## op 契约（线契约 03 §2.4）
 
 ```jsonc
-{"op":"skills.list"}        → {"ok":true,"skills":[{name,description}],"root":str}
-{"op":"skills.load","name"} → {"ok":true,"content":str}
+{"op":"skills.list"}        → {"ok":true,"skills":[{name,description,origin,"tools"?:true}],"root":str}
+{"op":"skills.load","name"} → {"ok":true,"content":str,"tools_manifest"?:{"path":str,"missing"?:[str]}}
 {"op":"prompts.list"}       → {"ok":true,"prompts":[{name,description}]}
 {"op":"prompts.get","name"} → {"ok":true,"content":str}
 ```
+
+- `origin`（来源标记）：frontmatter 显式 `origin: preset` → 出厂件（Web 技能 tab 显示「内置」
+  徽章 + 删除保护，host DELETE 拒删 K403）；缺省/其他 → 用户件。**出厂件必须显式声明**——
+  存量用户技能缺字段即正确归类为用户件。
+- `tools:true`：frontmatter 声明了配套工具（`tools:` 指向 tools.json）——R9 技能自造闭环；
+  声明指向的文件是否存在不在此校验。
+- `skills.load` 的 `tools_manifest`：frontmatter 有 `tools:` 声明时回传，`path` = 声明文件
+  绝对路径（供 tools `install` 定点装载），声明存在但文件缺失时 `missing` 列出缺失项。
 
 错误码：`ASSET_ERROR`（读取失败）、`UNKNOWN_SKILL` / `UNKNOWN_PROMPT`（未知名，错误信息里附可用列表）、
 `K400`（未知 op）。
