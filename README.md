@@ -1,6 +1,6 @@
 # react-agent
 
-基于 [agent-kernel](https://github.com/zh2673-git/agent-kernel)（v0.1.1，git 依赖）构建的下游 agent 项目：**Rust InProcess 编排 + Python/TS 跨语言插件（gRPC Process 域）** 的 ReAct 式 agent。
+基于 [agent-kernel](https://github.com/zh2673-git/agent-kernel)（v0.1.2，git 依赖 tag）构建的下游 agent 项目：**Rust InProcess 编排 + Python/TS 跨语言插件（gRPC Process 域）** 的 ReAct 式 agent。
 
 ```
 宿主(装配内核+前端) ──dispatch──> agent-loop(Rust, InProcess)
