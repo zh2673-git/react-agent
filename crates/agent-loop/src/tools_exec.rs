@@ -25,7 +25,12 @@ impl AgentLoopPlugin {
     /// 并行波次开始前由 chat_body 按**声明顺序**统一发出（trace 顺序稳定）。
     pub(super) async fn act_begin(&self, src: &Envelope, session_id: &str, round: u32, tc: &ToolCall) {
         tracing::info!(target: "react_progress", round, tool = %tc.name, "▶ round {round}: {}", tc.name);
-        self.trace(src, session_id, json!({"type": "tool_call", "round": round, "name": tc.name, "id": tc.id, "args": tc.arguments}))
+        // W18 安全边界：tool_call 事件的 args 也脱敏（read_file/bash 的 path 含密钥时；
+        // LLM 自身发的 args 理论上不含明文，但 bash 命令如 cat config.json 不经此闸
+        // 的话输出仍会泄露——args 脱敏是双重保险，且对前端内联 diff 一视同仁）。
+        let mut safe_args = tc.arguments.clone();
+        super::secrets::scrub_value(&mut safe_args);
+        self.trace(src, session_id, json!({"type": "tool_call", "round": round, "name": tc.name, "id": tc.id, "args": safe_args}))
             .await;
     }
 
@@ -101,6 +106,11 @@ impl AgentLoopPlugin {
                 Err(e) => json!({"ok": false, "error": {"code": e.code(), "message": e.to_string()}}),
             }
         };
+        // W18 安全边界：结果进入历史/事件/trace 前统一密钥脱敏——LLM 从未见过明文
+        // 就吐不出明文（read_file config.json / bash cat+printenv / grep 等所有路径
+        // 共用此咽喉，一处闸全覆盖）。
+        let mut result = result;
+        super::secrets::scrub_value(&mut result);
         (result, started.elapsed().as_millis() as u64)
     }
 

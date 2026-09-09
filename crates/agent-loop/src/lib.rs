@@ -31,6 +31,7 @@ mod chat;
 mod compaction;
 mod context;
 mod contract;
+mod secrets;
 mod skills;
 mod subagent;
 mod tools_exec;
