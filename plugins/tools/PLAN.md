@@ -428,6 +428,26 @@
 - 排障方法论教训：PowerShell 5.1 向 curl.exe 传 JSON 会被吞引号（bogus 模型与正确模型同报
   invalid prompt 即此症状），必须文件传 body 或直接 python+httpx 走真实代码路径测。
 
+### 补记二（2026-09-09 下午，站点默认参数 extra——个性化对齐出口）
+
+用户实测 Agnes Video 2.5 Flash（OpenAI Videos 兼容，`mode` 必填/`size` 固定 "720P"/查询
+推荐 `model_name`）暴露结构化缺口：URL 差异已配置化，但**请求体/查询参数的站点个性无配置
+出口**——video_submit 仅固定 prompt/model，其余全靠 agent 猜，必填的 mode 传不上。
+
+- `media.video.extra`（JSON 对象，如 `{"mode":"text","size":"720P","model_name":
+  "agnes-video-2.5-flash"}`）→ `MEDIA_VIDEO_EXTRA` env → **submit 请求体默认值 + poll 查询
+  参数**；merge 顺序 extra 默认 < prompt/model < agent 显式参数（显式可覆盖）。
+- 透传类型放开一层：标量 + 元素全为标量的 list（reference 模式 images/audios 数组）；
+  嵌套对象仍拒。
+- 设置面板生视频区加「站点默认参数(JSON)」字段（非法 JSON 拒提交；填 `{}` 清空）；
+  validate_media 校验 extra 须对象（仅 video 组——image 组无消费方，维持未知键忽略探针）。
+- 函数级实测（本地 HTTP server 抓真实请求）：extra 注入/显式覆盖/数组透传/嵌套拒绝/
+  poll 拼参（含 model_name）/非法 JSON 防御忽略，全过；host 单测 23 全绿。
+- 配置协助闭环（同日）：SYSTEM.md 增「配置协助（站点接入）」纪律（先调研官方文档再结论、
+  产出=可粘贴值、区分协议差异/参数个性）、设置面板三区 hint 引导用户直接问 agent、
+  SKILL.md 增「§5 已知站点配置参考」沉淀实测站点（ModelScope 异步生图无需 extra /
+  Agnes 生视频 extra 范例 / siliconflow 零个性）——新站点实测跑通后回填。
+
 ## 十、密钥脱敏闸（W18 安全边界）✅（2026-09-09 实施）
 
 ### 威胁模型
