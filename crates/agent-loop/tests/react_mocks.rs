@@ -1356,7 +1356,7 @@ async fn skill_install_full_chain_traces_and_reports() {
     let assets = MockPlugin::simple("assets", &["assets.registry"], move |env| {
         match env.payload.get("op").and_then(|v| v.as_str()) {
             Some("skills.load") => json!({
-                "ok": true, "content": "BODY",
+                "ok": true, "content": "BODY", "origin": "preset",
                 "tools_manifest": {"path": "C:/ws/skills/demo/tools.json"}
             }),
             _ => json!({"ok": false}),
@@ -1383,6 +1383,7 @@ async fn skill_install_full_chain_traces_and_reports() {
     assert_eq!(installs.len(), 1, "install 恰调用一次: {installs:?}");
     assert_eq!(installs[0]["path"], json!("C:/ws/skills/demo/tools.json"));
     assert_eq!(installs[0]["skill"], json!("demo"));
+    assert_eq!(installs[0]["origin"], json!("preset"), "origin 随 install 透传（tools 侧据此自动启用出厂工具）");
     drop(installs);
 
     // skill_installed 事件落 trace（前端内联卡与一键启用的依据）
@@ -1396,12 +1397,12 @@ async fn skill_install_full_chain_traces_and_reports() {
     );
     drop(evs);
 
-    // 观察回写：loaded/pending 明细 + 「装载≠启用」提示（部分成功不算整体失败）
+    // 观察回写：loaded/pending 明细 + preset「装载即自动启用」提示（部分成功不算整体失败）
     let mem = mem_state.lock().unwrap();
     assert!(
         mem.iter().any(|m| m.role == "tool"
-            && m.content.as_deref().map(|c| c.contains("t1") && c.contains("注册")).unwrap_or(false)),
-        "观察回写应含 loaded/pending 与注册提示: {mem:?}"
+            && m.content.as_deref().map(|c| c.contains("t1") && c.contains("自动启用")).unwrap_or(false)),
+        "观察回写应含 loaded/pending 与启用语义提示: {mem:?}"
     );
 }
 
@@ -1536,6 +1537,107 @@ async fn load_skill_merges_enabled_skill_tools_into_next_rounds() {
     assert!(
         caps[2]["messages"].as_array().unwrap().iter().any(|m| m["role"] == json!("tool")
             && m["content"].as_str().map(|c| c.contains("SKILL-ECHO-RESULT")).unwrap_or(false)),
+        "技能工具结果应回喂: {:?}",
+        caps[2]["messages"]
+    );
+}
+
+#[tokio::test]
+async fn load_skill_installs_companion_tools_for_preset() {
+    // R9b：load_skill 即完成「读正文 + 装配套工具」——装载编排原只挂 skill_install，
+    // 模型只调 load_skill 时工具永不进池（媒体生成不可见的根因）。修复后：
+    // install 被触发且 origin 透传（preset → 装载即启用）、skill_loaded + skill_installed
+    // 双事件落 trace、r2 清单并入已启用技能工具。
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let payload_caps = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let install_log = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let llm_script = vec![
+        tool_call_resp(json!([{"id": "c1", "name": "load_skill", "arguments": {"name": "media"}}])),
+        tool_call_resp(json!([{"id": "c2", "name": "image_gen", "arguments": {"prompt": "dog"}}])),
+        json!({"ok": true, "content": "final", "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+    ];
+    let script = Arc::new(Mutex::new(llm_script));
+    let cap2 = payload_caps.clone();
+    let llm = MockPlugin::simple("llm-adapter", &["llm.chat"], move |env| {
+        cap2.lock().unwrap().push(env.payload.clone());
+        let mut s = script.lock().unwrap();
+        if s.len() > 1 {
+            s.remove(0)
+        } else {
+            s.first().cloned().unwrap()
+        }
+    });
+    let ilog = install_log.clone();
+    let tools = MockPlugin::simple("tools", &["tools.exec"], move |env| {
+        let payload = env.payload.clone();
+        match payload.get("op").and_then(|v| v.as_str()) {
+            Some("install") => {
+                ilog.lock().unwrap().push(payload.clone());
+                json!({"ok": true, "loaded": ["image_gen"], "skipped": [], "pending": []})
+            }
+            Some("skill_tools") => {
+                json!({"ok": true, "tools": [{"name": "image_gen", "description": "d", "parameters": {}}]})
+            }
+            Some("call") => json!({"ok": true, "result": "IMG-OK"}),
+            _ => json!({"ok": false}),
+        }
+    });
+    let assets = MockPlugin::simple("assets", &["assets.registry"], move |env| {
+        match env.payload.get("op").and_then(|v| v.as_str()) {
+            Some("skills.load") => json!({
+                "ok": true, "content": "BODY", "origin": "preset",
+                "tools_manifest": {"path": "C:/ws/skills/media/tools.json"}
+            }),
+            _ => json!({"ok": false}),
+        }
+    });
+    let kernel = boot(vec![
+        mock_memory_traced(Arc::new(Mutex::new(vec![])), events.clone()),
+        llm,
+        tools,
+        assets,
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "load media skill").await;
+    assert_eq!(r["ok"], json!(true), "{r}");
+
+    // install 编排被 load_skill 触发且 origin 透传（preset → 装载即启用）
+    let installs = install_log.lock().unwrap();
+    assert_eq!(installs.len(), 1, "load_skill 应触发一次 tools.install: {installs:?}");
+    assert_eq!(installs[0]["skill"], json!("media"));
+    assert_eq!(installs[0]["origin"], json!("preset"));
+
+    // 双事件落 trace：skill_loaded（会话技能集重放依据）+ skill_installed（前端内联卡）
+    {
+        let evs = events.lock().unwrap();
+        assert!(
+            evs.iter().any(|e| e["type"] == json!("skill_loaded") && e["skill"] == json!("media")),
+            "skill_loaded 事件缺失: {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| e["type"] == json!("skill_installed")
+                && e["skill"] == json!("media")
+                && e["tools_loaded"] == json!(["image_gen"])),
+            "skill_installed 事件缺失或形状不对: {evs:?}"
+        );
+    }
+
+    // r1 清单不含技能工具；r2（load_skill 后）并入已启用技能工具并能正常调用回喂
+    let caps = payload_caps.lock().unwrap();
+    assert_eq!(caps.len(), 3, "llm 调用 = r1+r2+r3: {}", caps.len());
+    let has_img = |i: usize| {
+        caps[i]["tools"]
+            .as_array()
+            .map(|ts| ts.iter().any(|t| t["name"] == json!("image_gen")))
+            .unwrap_or(false)
+    };
+    assert!(!has_img(0), "r1 清单不得含技能工具: {:?}", caps[0]["tools"]);
+    assert!(has_img(1), "r2 清单应含装载即启用的技能工具: {:?}", caps[1]["tools"]);
+    assert!(
+        caps[2]["messages"].as_array().unwrap().iter().any(|m| m["role"] == json!("tool")
+            && m["content"].as_str().map(|c| c.contains("IMG-OK")).unwrap_or(false)),
         "技能工具结果应回喂: {:?}",
         caps[2]["messages"]
     );

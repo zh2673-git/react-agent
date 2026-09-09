@@ -8,13 +8,14 @@
 use super::*;
 use std::time::Instant;
 
-/// 单次 chat 总时长预算（T4）：`CHAT_BUDGET_SECS`（秒，支持小数便于测试；0=禁用，缺省 300）。
-/// 这是轮次边界的护栏——轮内超支由单步 deadline（5s/60s/120s）封顶，不追求精确。
+/// 单次 chat 总时长预算（T4）：`CHAT_BUDGET_SECS`（秒，支持小数便于测试；0=禁用，缺省 900）。
+/// 这是轮次边界的护栏——轮内超支由单步 deadline（5s/60s/600s）封顶，不追求精确。
+/// 缺省 900s 须 ≥ LLM_DEADLINE(600s)：否则一次长思考 + 工具轮会在轮边界被误掐。
 pub(super) fn budget_secs() -> Option<Duration> {
     let v: f64 = std::env::var("CHAT_BUDGET_SECS")
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(300.0);
+        .unwrap_or(900.0);
     if v <= 0.0 {
         return None;
     }

@@ -73,6 +73,97 @@ fn agent_config_view() -> Value {
     })
 }
 
+/// media 段单组回显（tools PLAN §九）：字段透传（config.json > env 缺省），key 掩码同
+/// llm.key 规则——只回 key_set + 尾 4 位，绝不回明文。
+fn media_section_view(sec: Option<&Value>, fields: &[(&str, &str)]) -> Value {
+    let mut out = serde_json::Map::new();
+    for (field, env) in fields {
+        let v = sec
+            .and_then(|s| s.get(*field))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var(*env).ok())
+            .unwrap_or_default();
+        if *field == "key" {
+            out.insert("key".into(), key_view(&v));
+        } else {
+            out.insert((*field).into(), json!(v));
+        }
+    }
+    Value::Object(out)
+}
+
+/// key 掩码视图（与 llm.key / mcp env 键同规则）。
+fn key_view(v: &str) -> Value {
+    if v.is_empty() {
+        json!({"key_set": false})
+    } else {
+        let tail: String = v.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        json!({"key_set": true, "key_tail": tail})
+    }
+}
+
+/// media 段校验（PLAN §九，宽松）：image 组 base_url/model/key；video 组 base_url/model/
+/// key/submit_url/query_url。规则：值须为字符串；base_url 非空须 http(s):// 开头；
+/// submit_url/query_url 非空须 http(s):// 或 / 开头（相对路径以 base_url 为基由脚本拼接）。
+/// 未知键忽略（前向兼容）。合法返回 Ok(())，否则 Err(可读信息)。
+fn validate_media(media: &Value) -> Result<(), String> {
+    let url_ok = |s: &str, allow_relative: bool| {
+        s.starts_with("http://") || s.starts_with("https://") || (allow_relative && s.starts_with('/'))
+    };
+    for (group, fields) in [
+        ("image", vec![("base_url", false), ("model", false), ("key", false)]),
+        ("video", vec![("base_url", false), ("model", false), ("key", false), ("submit_url", true), ("query_url", true)]),
+    ] {
+        let Some(sec) = media.get(group).filter(|v| v.is_object()) else {
+            continue; // 组不传 = 不修改该组
+        };
+        for (field, allow_relative) in fields {
+            if let Some(v) = sec.get(field) {
+                if v.is_null() {
+                    continue;
+                }
+                let Some(s) = v.as_str() else {
+                    return Err(format!("media.{group}.{field} 需为字符串"));
+                };
+                let s = s.trim();
+                if s.is_empty() {
+                    continue; // 空串 = 不修改（与 llm key 留空同规则）
+                }
+                if (field == "base_url" || field == "submit_url" || field == "query_url")
+                    && !url_ok(s, allow_relative)
+                {
+                    let shape = if allow_relative { "http(s):// 或 / 开头的路径" } else { "http(s):// 开头" };
+                    return Err(format!("media.{group}.{field} 形态非法（需{shape}）: {s}"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// media 段回显视图（GET /api/config）：image（生图）/ video（生视频）两组。
+fn media_config_view(cfg: &Value) -> Value {
+    let media = cfg.get("media");
+    json!({
+        "image": media_section_view(
+            media.and_then(|m| m.get("image")),
+            &[("base_url", "MEDIA_IMAGE_BASE_URL"), ("model", "MEDIA_IMAGE_MODEL"), ("key", "MEDIA_IMAGE_KEY")],
+        ),
+        "video": media_section_view(
+            media.and_then(|m| m.get("video")),
+            &[
+                ("base_url", "MEDIA_VIDEO_BASE_URL"),
+                ("model", "MEDIA_VIDEO_MODEL"),
+                ("key", "MEDIA_VIDEO_KEY"),
+                ("submit_url", "MEDIA_VIDEO_SUBMIT_URL"),
+                ("query_url", "MEDIA_VIDEO_QUERY_URL"),
+            ],
+        ),
+    })
+}
+
 /// GET /api/config：llm 视图（config.json > env 缺省；key 只回 key_set + 尾 4 位，绝不回明文）
 /// + tools 全集视图（list all=true，含未启用项，各项附 enabled）+ skills 计数。
 pub(crate) async fn get_config(stream: &mut TcpStream, kernel: &Kernel) -> anyhow::Result<()> {
@@ -232,6 +323,7 @@ pub(crate) async fn get_config(stream: &mut TcpStream, kernel: &Kernel) -> anyho
                 "mcp": {"servers": mcp_servers, "declared": mcp_decl_merge},
                 "skills_count": skills_count,
                 "agent": agent_config_view(),
+                "media": media_config_view(&cfg),
                 "instance_name": std::env::var("REACT_INSTANCE_NAME").unwrap_or_default(),
             },
         }),
@@ -240,7 +332,8 @@ pub(crate) async fn get_config(stream: &mut TcpStream, kernel: &Kernel) -> anyho
 }
 
 /// PUT /api/config：llm → llm-adapter configure（env 热应用）；tools → tools configure（白名单替换）；
-/// agent → env 热应用（agent-loop InProcess 自读，下轮对话生效）。全成后 merge 落 config.json
+/// agent → env 热应用（agent-loop InProcess 自读，下轮对话生效）；media → 校验 + 落盘
+/// （持久通道：guest spawn 时 env 固化，改后需重启 host）。全成后 merge 落 config.json
 /// （重启由持久通道还原）；任一失败 → 字段级 400 且不落盘（重启即回滚）。
 pub(crate) async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[u8]) -> anyhow::Result<()> {
     let Ok(req) = serde_json::from_slice::<Value>(body) else {
@@ -249,14 +342,15 @@ pub(crate) async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[
     let llm = req.get("llm").filter(|v| v.is_object());
     let tools = req.get("tools").filter(|v| v.is_object());
     let agent = req.get("agent").filter(|v| v.is_object());
+    let media = req.get("media").filter(|v| v.is_object());
     // §八 MCP：仅持久通道（server 子进程生命周期归 tools 插件 init/destroy，无热通道）。
     // PUT 落盘 config.json mcp_servers，改后需重启 host 生效。
     let mcp_servers = req.get("mcp_servers").filter(|v| v.is_object());
-    if llm.is_none() && tools.is_none() && agent.is_none() && mcp_servers.is_none() {
+    if llm.is_none() && tools.is_none() && agent.is_none() && mcp_servers.is_none() && media.is_none() {
         return json_resp(
             stream,
             400,
-            bad_request("body 需含 llm / tools / agent / mcp_servers 对象", None),
+            bad_request("body 需含 llm / tools / agent / mcp_servers / media 对象", None),
         )
         .await;
     }
@@ -318,6 +412,32 @@ pub(crate) async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[
             }
         }
         cfg["agent"] = cur;
+    }
+    // media 段 merge（PLAN §九）：先宽松校验（url 形态/字符串类型），再逐字段替换
+    // （null/空串不覆盖既有值——与 llm「留空不修改」同规则；清除配置请直接编辑 config.json）。
+    if let Some(media) = media.and_then(|m| m.as_object().cloned()) {
+        if let Err(msg) = validate_media(&json!(media)) {
+            return json_resp(
+                stream,
+                400,
+                json!({"ok": false, "error": {"code": "K400", "message": msg}}),
+            )
+            .await;
+        }
+        let mut cur = cfg.get("media").cloned().unwrap_or_else(|| json!({}));
+        for (group, spec) in media {
+            if let (Some(dst), Some(src)) = (cur.get_mut(&group).and_then(|v| v.as_object_mut()), spec.as_object()) {
+                for (k, v) in src {
+                    let empty = v.as_str().map(str::is_empty).unwrap_or(false);
+                    if !v.is_null() && !empty {
+                        dst.insert(k.clone(), v.clone());
+                    }
+                }
+            } else if spec.is_object() {
+                cur[group] = spec.clone();
+            }
+        }
+        cfg["media"] = cur;
     }
     // §八 MCP merge：按 server 名合并声明（command/cwd 未传则保留原值；env 逐键合并，
     // 前端提交空串环境变量值 = 保持已有 key 不动）。只落盘，重启由持久通道生效。
@@ -405,5 +525,30 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    #[test]
+    fn media_section_validates_urls_and_types() {
+        // PLAN §九：media 段轻校验——url 宽松形态 + 字符串类型；未知键忽略。
+        let ok = serde_json::json!({
+            "image": {"base_url": "https://img.example.com/v1", "model": "img-1", "key": "k", "extra": 1},
+            "video": {"base_url": "https://vid.example.com", "submit_url": "/v1/video/submit",
+                       "query_url": "https://vid.example.com/v1/video/status?id={task_id}"}
+        });
+        assert!(validate_media(&ok).is_ok());
+
+        // base_url 非 http(s) → 拒
+        let bad_base = serde_json::json!({"image": {"base_url": "img.example.com"}});
+        assert!(validate_media(&bad_base).is_err());
+        // submit_url 允许相对路径（/ 开头）；裸域名拒
+        assert!(validate_media(&serde_json::json!({"video": {"submit_url": "/v1/video/submit"}})).is_ok());
+        assert!(validate_media(&serde_json::json!({"video": {"submit_url": "v1/video/submit"}})).is_err());
+        // key 非字符串 → 拒
+        let bad_key = serde_json::json!({"image": {"key": 123}});
+        assert!(validate_media(&bad_key).is_err());
+        // 空串/null/组缺省 = 放行
+        assert!(validate_media(&serde_json::json!({"image": {"key": ""}})).is_ok());
+        assert!(validate_media(&serde_json::json!({"image": {"key": null}})).is_ok());
+        assert!(validate_media(&serde_json::json!({})).is_ok());
     }
 }

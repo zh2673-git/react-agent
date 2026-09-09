@@ -43,6 +43,23 @@ async function loadConfig() {
     $("llm-key").value = "";
     $("llm-key").placeholder = c.llm.key?.key_set ? `已设置（尾号 ${c.llm.key.key_tail}，留空不修改）` : "未设置";
     if (sitePresets.length && c.llm.provider === "openai") { $("llm-site").value = curSiteId(); updateSiteLink(curSiteId()); }
+    // 媒体模型回显（tools PLAN §九 M3）：media 段 → 面板字段；key 只回掩码，留空 = 不修改
+    const m = c.media ?? {};
+    const mi = m.image ?? {}, mv = m.video ?? {};
+    $("media-img-base").value = mi.base_url ?? "";
+    $("media-img-model").value = mi.model ?? "";
+    $("media-img-key").value = "";
+    $("media-img-key").placeholder = mi.key?.key_set ? `已设置（尾号 ${mi.key.key_tail}，留空不修改）` : "未设置";
+    $("media-vid-base").value = mv.base_url ?? "";
+    $("media-vid-model").value = mv.model ?? "";
+    $("media-vid-key").value = "";
+    $("media-vid-key").placeholder = mv.key?.key_set ? `已设置（尾号 ${mv.key.key_tail}，留空不修改）` : "未设置";
+    $("media-vid-submit").value = mv.submit_url ?? "";
+    $("media-vid-query").value = mv.query_url ?? "";
+    // 组头状态徽章（pcnt 位）：配置一眼可见
+    $("llm-cnt").textContent = c.llm.model || c.llm.provider || "未配置";
+    $("media-img-cnt").textContent = mi.base_url ? "已配置" : "未配置";
+    $("media-vid-cnt").textContent = (mv.base_url && (mv.submit_url || mv.query_url)) ? "已配置" : "未配置";
     cfgTools = c.tools ?? [];
     cfgMcp = c.mcp ?? { servers: [], tools: [] };
     if (!$("tab-tools").hidden) renderTools(); // 工具 tab 可见时回填（覆盖 fetch 完成晚于 tab 切换的时序）
@@ -69,8 +86,64 @@ $("btn-newwin").onclick = () => {
   $("win-modal").hidden = false;
   $("win-flash").textContent = "";
   $("win-ws").value = "";
+  renderInstList();
   $("win-browse").focus();
 };
+// ── W17 迭代十：按需复活——modal 内实例列表（在线打开 / 离线启动）──
+// offline 实例「启动」= POST /api/instances 同工作区（create_instance 复活路径：
+// 换新端口，memory/config/会话延续）；在线实例直接开 url 新标签。
+async function renderInstList() {
+  const box = $("inst-list");
+  box.textContent = "加载中…";
+  let list = [];
+  try {
+    const v = await api("GET", "/api/instances");
+    list = v.instances || [];
+  } catch (e) {
+    box.textContent = "";
+    return; // 清单不可用不阻断建窗主流程
+  }
+  box.textContent = "";
+  if (!list.length) {
+    box.innerHTML = '<span class="hint" style="margin:0">暂无注册实例（首次用下方创建）</span>';
+    return;
+  }
+  for (const it of list) {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex; align-items:center; gap:8px; padding:6px 10px; border:1px solid var(--border,#ddd); border-radius:8px";
+    const badge = it.online
+      ? '<span style="color:#2e7d32; font-weight:600">● 在线</span>'
+      : (it.stopped ? '<span style="color:#9e9e9e">○ 已手动停止</span>' : '<span style="color:#b26a45">○ 离线</span>');
+    row.innerHTML =
+      '<div style="flex:1; min-width:0"><div style="font-weight:600">' + esc(it.name) + "</div>" +
+      '<div class="hint" style="margin:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">' + esc(it.workspace || "") + "</div></div>" + badge;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn ghost";
+    btn.style.whiteSpace = "nowrap";
+    btn.textContent = it.online ? "打开" : "启动";
+    btn.onclick = async () => {
+      btn.disabled = true;
+      if (it.online) {
+        window.open(it.url, "_blank");
+        btn.disabled = false;
+        return;
+      }
+      flash("win-flash", true, "启动 " + it.name + " 中（等待就绪，最多 ~15s）…");
+      try {
+        const v = await api("POST", "/api/instances", { workspace: it.workspace });
+        flash("win-flash", true, "已启动 " + v.url + "（实例名 " + v.name + "）");
+        window.open(v.url, "_blank");
+        renderInstList();
+      } catch (e) {
+        flash("win-flash", false, e.message);
+        btn.disabled = false;
+      }
+    };
+    row.appendChild(btn);
+    box.appendChild(row);
+  }
+}
 $("win-browse").onclick = async () => {
   const btn = $("win-browse");
   btn.disabled = true;
@@ -276,6 +349,41 @@ $("llm-save").onclick = async () => {
     fetchModels();
   } catch (e) { flash("llm-flash", false, e.message); }
 };
+// ── 媒体模型独立保存（tools PLAN §九 M3）：生图/生视频各自 PUT media 段（逐字段 merge，
+// key 留空不提交 = 不修改；后端 merge 对 null/空串不覆盖，故想清空某字段须整段重填）──
+function mediaBody(kind) {
+  const sec = kind === "image"
+    ? { base_url: "media-img-base", model: "media-img-model" }
+    : { base_url: "media-vid-base", model: "media-vid-model", submit_url: "media-vid-submit", query_url: "media-vid-query" };
+  const out = {};
+  for (const [field, id] of Object.entries(sec)) {
+    const v = $(id).value.trim();
+    if (v) out[field] = v;
+  }
+  const key = $(kind === "image" ? "media-img-key" : "media-vid-key").value.trim();
+  if (key) out.key = key; // media 段字段名与 llm 段不同：是 key 不是 api_key
+  return out;
+}
+async function saveMedia(kind, flashId) {
+  const fields = mediaBody(kind);
+  if (!Object.keys(fields).length) { flash(flashId, false, "未填写任何字段"); return; }
+  try {
+    await api("PUT", "/api/config", { media: { [kind]: fields } });
+    flash(flashId, true, "已保存落盘（重启 host 后 env 生效）");
+    loadConfig();
+  } catch (e) { flash(flashId, false, e.message); }
+}
+$("media-img-save").onclick = () => saveMedia("image", "media-img-flash");
+$("media-vid-save").onclick = () => saveMedia("video", "media-vid-flash");
+// LLM tab 三区折叠（与工具池 poolhead 同款交互；静态 HTML，加载时绑定一次）
+document.querySelectorAll("#tab-llm .poolhead.collapsible").forEach((head) => {
+  const body = head.nextElementSibling;
+  head.onclick = () => {
+    body.hidden = !body.hidden;
+    head.querySelector(".chev").textContent = body.hidden ? "▸" : "▾";
+    head.classList.toggle("closed", body.hidden);
+  };
+});
 // 工具三池分组元数据（pool → 组标题/说明）；条目点击折叠展开配置详情
 const POOL_META = {
   builtin: { label: "内置工具", hint: "" },

@@ -347,10 +347,13 @@ class ToolsPlugin:
             rp = Path(path_raw).resolve(strict=True)
         except OSError as exc:
             return _err(f"tools.json 不可达: {exc}", code="K400", field="path")
-        # 越界校验：realpath ⊆ WORKSPACE_ROOT 且 ⊆ skills root（技能目录内，防挪用）
-        ws = Path(os.environ.get("WORKSPACE_ROOT") or os.getcwd()).resolve()
+        # 越界校验（唯一闸 = skills root，防挪用）：模型经 skill_install 传 path，
+        # 只允许装载 skills 根内的 tools.json。出厂技能的 skills 根在仓库（工作区外）、
+        # 自扩展技能的 skills 根在 WORKSPACE_ROOT 内——二者 rp ⊆ sk 均已覆盖；
+        # 附加「⊆ WORKSPACE_ROOT」反而误杀出厂技能（用户会话工作区≠仓库，生图不可见）
+        # 或与 sk 蕴含重复，故不设。
         sk = _skills_root()
-        if not _within(rp, ws) or not _within(rp, sk):
+        if not _within(rp, sk):
             return _err(
                 f"tools.json 路径越界（须位于 skills 根目录内）: {rp}（skills root: {sk}）",
                 code="K400",
@@ -365,6 +368,11 @@ class ToolsPlugin:
         # 技能归属：agent-loop 显式传注册名；缺省回退目录名（自扩展约定两者一致）
         skill = payload.get("skill")
         skill_name = skill.strip() if isinstance(skill, str) and skill.strip() else rp.parent.name
+        # 出厂技能（origin=preset）工具装载即启用：出厂件随系统分发、可信，端点未配置等
+        # 场景由工具自身守卫兜底（如 MEDIA_NOT_CONFIGURED）；用户技能（缺省）维持人工闸。
+        # 重启后 config.json tools.enabled 不含 preset 工具名不影响——下次 load_skill
+        # 重新 install 时再次自动启用。
+        preset = payload.get("origin") == "preset"
         loaded: list[str] = []
         skipped: list[dict] = []
         for i, item in enumerate(data):
@@ -373,6 +381,8 @@ class ToolsPlugin:
                 loaded.append(name)
             else:
                 skipped.append({"index": i, "tool": name, "error": error})
+        if preset and loaded:
+            _ENABLED.update(loaded)
         # pending = 该技能已装载未启用的工具（一键启用的目标清单，含历史装载）
         pending = sorted(n for n, e in _SKILL_TOOLS.items() if e["skill"] == skill_name and n not in _ENABLED)
         return {
@@ -381,7 +391,10 @@ class ToolsPlugin:
             "loaded": loaded,
             "skipped": skipped,
             "pending": pending,
-            "enabled_hint": "loaded 工具未启用（装载≠启用），需 configure 或设置面板启用后生效",
+            "enabled_hint": (
+                f"出厂技能工具已装载并自动启用: {loaded}" if preset and loaded
+                else "loaded 工具未启用（装载≠启用），需 configure 或设置面板启用后生效"
+            ),
         }
 
     def _install_one(self, item, skill_name: str, skill_dir: Path) -> tuple[str | None, str | None]:
@@ -465,8 +478,10 @@ class ToolsPlugin:
     def _call_skill_tool(self, name: str, payload: dict) -> dict:
         """技能工具执行：启用闸 → 受控子进程（语言无关命令协议）。"""
         if name not in _ENABLED:
+            owner = _SKILL_TOOLS.get(name, {}).get("skill", "?")
             return _err(
-                f"tool '{name}' 未启用（技能工具装载后需经设置面板/configure 启用；装载≠启用）",
+                f"tool '{name}' 未启用（用户技能工具需在设置面板 → 技能 → {owner} 条目内勾选启用；"
+                "出厂技能工具装载即自动启用，若此报错出现请重启 host 后重试；装载≠启用）",
                 code="TOOL_DISABLED",
             )
         args = payload.get("args") or {}

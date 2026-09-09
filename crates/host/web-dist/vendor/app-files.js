@@ -173,7 +173,7 @@ function renderArtifactCard(ev) {
   turnArtifactPaths.add(key);
   const name = ev.path.split(/[\\/]/).pop();
   const ext = (name.includes(".") ? name.split(".").pop() : "").toLowerCase();
-  const card = el(`<div class="artcard"><span class="ico">📄</span><span class="nm">${esc(name)}</span><span class="src" title="${esc(ev.path)}">${esc(ev.path)}${ev.tool ? " · " + esc(ev.tool) : ""}</span><span class="open">${PREVIEW_TEXT_EXTS.includes(ext) || PREVIEW_NATIVE_EXTS.includes(ext) ? "查看" : "下载"}</span></div>`);
+  const card = el(`<div class="artcard"><span class="ico">📄</span><span class="nm">${esc(name)}</span><span class="src" title="${esc(ev.path)}">${esc(ev.path)}${ev.tool ? " · " + esc(ev.tool) : ""}</span><span class="open">${PREVIEW_TEXT_EXTS.includes(ext) || PREVIEW_NATIVE_EXTS.includes(ext) || PREVIEW_VIDEO_EXTS.includes(ext) ? "查看" : "下载"}</span></div>`);
   card._artpath = key; // R12：最终答案「提及过滤」按此键匹配（文件名命中或全路径命中）
   card.querySelector(".open").onclick = () => openWsFile(ev.path); // W14：与文件树共用一条预览链
   ensureTurnTail().appendChild(card);
@@ -294,8 +294,10 @@ function ensurePreviewOverlay() {
   if (!overlay) {
     overlay = el(`<div id="file-preview" class="fp-overlay"><div class="fp-box"><div class="fp-head"><span class="fp-name"></span><button class="btn ghost fp-close">关闭</button></div><div class="fp-body"></div></div></div>`);
     document.body.appendChild(overlay);
-    overlay.onclick = (e) => { if (e.target === overlay) { disposePreviewEditor(); overlay.style.display = "none"; } };
-    overlay.querySelector(".fp-close").onclick = () => { disposePreviewEditor(); overlay.style.display = "none"; };
+    // 关闭即清空 body：视频预览时停止播放（音频不残留）；Monaco 已先 dispose，无副作用
+    const close = () => { disposePreviewEditor(); overlay.querySelector(".fp-body").innerHTML = ""; overlay.style.display = "none"; };
+    overlay.onclick = (e) => { if (e.target === overlay) close(); };
+    overlay.querySelector(".fp-close").onclick = close;
   }
   return overlay;
 }

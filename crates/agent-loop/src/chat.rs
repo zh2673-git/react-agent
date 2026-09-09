@@ -406,9 +406,11 @@ impl AgentLoopPlugin {
                 let done = futures::future::join_all(execs).await;
                 let mut newly: HashSet<String> = HashSet::new();
                 for (tc, (result, ms)) in group.iter().zip(done) {
-                    // R9：load_skill 成功 → 新技能的已启用工具并入后续轮次清单
+                    // R9/R9b：load_skill 或 skill_install 成功 → 已启用工具并入后续轮次清单
                     //（skill_loaded 事件已在 act_exec 内发出；HashSet 去重防重复并入）
-                    if tc.name == RESERVED_LOAD_SKILL && result.get("ok") == Some(&json!(true)) {
+                    if (tc.name == RESERVED_LOAD_SKILL || tc.name == RESERVED_SKILL_INSTALL)
+                        && result.get("ok") == Some(&json!(true))
+                    {
                         if let Some(name) =
                             tc.arguments.get("name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
                         {

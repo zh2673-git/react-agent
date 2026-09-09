@@ -49,23 +49,45 @@
   </div>
   <div class="body">
     <div id="tab-llm">
-      <div class="field"><label>provider</label>
-        <select id="llm-provider">
-          <option value="mock">mock（无外部依赖）</option>
-          <option value="openai">openai 兼容（DeepSeek / Kimi 等）</option>
-          <option value="anthropic">anthropic</option>
-          <option value="ollama">ollama（本地）</option>
-        </select>
+      <!-- 三区独立折叠：文本/生图/生视频各自填写、各自保存（样式与工具池分组同款 poolhead collapsible） -->
+      <div class="poolhead collapsible"><span class="chev">▾</span><span class="plabel">文本模型（对话）</span><span class="pcnt" id="llm-cnt"></span></div>
+      <div class="poolbody" id="sec-llm">
+        <div class="field"><label>provider</label>
+          <select id="llm-provider">
+            <option value="mock">mock（无外部依赖）</option>
+            <option value="openai">openai 兼容（DeepSeek / Kimi 等）</option>
+            <option value="anthropic">anthropic</option>
+            <option value="ollama">ollama（本地）</option>
+          </select>
+        </div>
+        <div class="field" id="llm-site-field"><label>站点（预设一键切换）</label>
+          <select id="llm-site" style="flex:1"></select>
+          <a id="llm-site-key-url" class="site-link" href="#" target="_blank" rel="noopener" hidden>申请 key ↗</a>
+        </div>
+        <div class="field"><label>model</label><select id="llm-model" style="flex:1"></select><input id="llm-model-custom" placeholder="自定义模型名" style="flex:1; display:none"><button type="button" class="btn ghost" id="llm-fetch-models">拉取模型</button></div>
+        <div class="field"><label>base_url</label><input id="llm-base" placeholder="https://api.deepseek.com/v1"></div>
+        <div class="field"><label>api_key</label><input id="llm-key" type="password" autocomplete="off"></div>
+        <div class="row"><button class="btn" id="llm-save">保存</button><button class="btn ghost" id="llm-reveal" title="在文件管理器中定位 config.json">📂 源文件</button><span class="flash" id="llm-flash"></span></div>
+        <p class="hint">保存即热生效（env 更新 + 落盘 config.json）。api_key 留空 = 不修改；回显只显示尾 4 位。</p>
       </div>
-      <div class="field" id="llm-site-field"><label>站点（预设一键切换）</label>
-        <select id="llm-site" style="flex:1"></select>
-        <a id="llm-site-key-url" class="site-link" href="#" target="_blank" rel="noopener" hidden>申请 key ↗</a>
+      <div class="poolhead collapsible"><span class="chev">▾</span><span class="plabel">生图模型</span><span class="pcnt" id="media-img-cnt"></span></div>
+      <div class="poolbody" id="sec-media-img">
+        <p class="hint">media-gen 技能的生图端点（OpenAI 兼容 /v1/images/generations）。保存落盘，重启 host 生效；api_key 留空 = 不修改。</p>
+        <div class="field"><label>base_url</label><input id="media-img-base" placeholder="https://api.siliconflow.cn/v1"></div>
+        <div class="field"><label>model</label><input id="media-img-model" placeholder="Kwai-Kolors/Kolors"></div>
+        <div class="field"><label>api_key</label><input id="media-img-key" type="password" autocomplete="off"></div>
+        <div class="row"><button class="btn" id="media-img-save">保存</button><span class="flash" id="media-img-flash"></span></div>
       </div>
-      <div class="field"><label>model</label><select id="llm-model" style="flex:1"></select><input id="llm-model-custom" placeholder="自定义模型名" style="flex:1; display:none"><button type="button" class="btn ghost" id="llm-fetch-models">拉取模型</button></div>
-      <div class="field"><label>base_url</label><input id="llm-base" placeholder="https://api.deepseek.com/v1"></div>
-      <div class="field"><label>api_key</label><input id="llm-key" type="password" autocomplete="off"></div>
-      <div class="row"><button class="btn" id="llm-save">保存</button><button class="btn ghost" id="llm-reveal" title="在文件管理器中定位 config.json">📂 源文件</button><span class="flash" id="llm-flash"></span></div>
-      <p class="hint">保存即热生效（env 更新 + 落盘 config.json，重启自动还原）。api_key 留空 = 不修改；回显只显示尾 4 位。</p>
+      <div class="poolhead collapsible"><span class="chev">▾</span><span class="plabel">生视频模型</span><span class="pcnt" id="media-vid-cnt"></span></div>
+      <div class="poolbody" id="sec-media-vid">
+        <p class="hint">media-gen 技能的生视频端点（submit 提交任务 + poll 轮询取片）。保存落盘，重启 host 生效；api_key 留空 = 不修改。</p>
+        <div class="field"><label>base_url</label><input id="media-vid-base" placeholder="https://vid.example.com"></div>
+        <div class="field"><label>model</label><input id="media-vid-model" placeholder="视频模型名"></div>
+        <div class="field"><label>api_key</label><input id="media-vid-key" type="password" autocomplete="off"></div>
+        <div class="field"><label>提交端点 submit_url</label><input id="media-vid-submit" placeholder="/v1/video/submit（相对路径以 base_url 为基）"></div>
+        <div class="field"><label>查询端点 query_url</label><input id="media-vid-query" placeholder="/v1/video/status?id={task_id}"></div>
+        <div class="row"><button class="btn" id="media-vid-save">保存</button><span class="flash" id="media-vid-flash"></span></div>
+      </div>
     </div>
     <div id="tab-tools" hidden>
       <p class="hint">勾选启用工具（整体替换白名单，保存即热生效）；点击条目展开配置详情，再点收起。三池组头可整体收起/展开；「MCP 外接」各服务组内含工具勾选与 API Key 配置。</p>
@@ -113,13 +135,16 @@
 <div class="modal-mask" id="win-modal" hidden>
   <div class="modal">
     <div class="mhead">▣ 新建窗口（独立实例）</div>
+    <div class="field"><label>已有实例（点「打开」直接进；离线点「启动」按需恢复，会话/配置延续）</label>
+      <div id="inst-list" style="display:flex; flex-direction:column; gap:6px; max-height:180px; overflow-y:auto"></div>
+    </div>
     <div class="field"><label>工作区文件夹（文件工具/文件树/产物均以此为根）</label>
       <div style="display:flex; gap:8px">
         <input id="win-ws" readonly placeholder="点击「浏览文件夹…」选择，无需手填路径">
         <button type="button" class="btn ghost" id="win-browse" style="white-space:nowrap">📂 浏览文件夹…</button>
       </div>
     </div>
-    <p class="hint">新窗口 = 独立 host 进程：独立会话/回滚/配置，端口自动分配（8711 起）；实例名自动取文件夹名（同名窗口已开着就直接复用）。首次建窗自动继承当前窗口的模型配置（api_key 免重配）。数据存于代码根 .instances/，不影响目标项目目录。重启本主窗口后，未手动停止的子窗口会自动复活（换新端口，会话保留）。</p>
+    <p class="hint">新窗口 = 独立 host 进程：独立会话/回滚/配置，端口自动分配（8711 起）；实例名自动取文件夹名（同名窗口已开着就直接复用）。首次建窗自动继承当前窗口的模型配置（api_key 免重配）。数据存于代码根 .instances/，不影响目标项目目录。子窗口按需恢复：主窗口重启后不自动拉起，在下表点「启动」即按原工作区复活（换新端口，会话保留）。</p>
     <div class="row"><button class="btn" id="win-create">创建并打开</button><button class="btn ghost" id="win-cancel">取消</button><span class="flash" id="win-flash"></span></div>
   </div>
 </div>

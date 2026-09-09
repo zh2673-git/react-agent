@@ -56,9 +56,15 @@ impl AgentLoopPlugin {
             let name = tc.arguments.get("name").and_then(Value::as_str).unwrap_or("");
             self.skill_install(src, session_id, name).await
         } else if tc.name == RESERVED_LOAD_SKILL {
-            // assets 路由；成功时发 skill_loaded 事件（会话技能集重放推导依据，R9）
+            // assets 路由；成功时发 skill_loaded 事件（会话技能集重放推导依据，R9）。
+            // R9b：load_skill 即完成「读正文 + 装配套工具」——装载编排原只挂 skill_install，
+            // 模型按习惯只调 load_skill 时工具永不进池（媒体生成不可见的根因），故在此合并；
+            // preset 装载即启用，下一轮起并入会话清单。
             let name = tc.arguments.get("name").and_then(Value::as_str).unwrap_or("");
-            let v = match self.call(src, ID_ASSETS, json!({"op": "skills.load", "name": name}), ASSETS_DEADLINE).await {
+            let mut v = match self
+                .call(src, ID_ASSETS, json!({"op": "skills.load", "name": name}), ASSETS_DEADLINE)
+                .await
+            {
                 Ok(v) => v,
                 Err(e) => json!({"ok": false, "error": {"code": e.code(), "message": e.to_string()}}),
             };
@@ -66,6 +72,23 @@ impl AgentLoopPlugin {
                 let trimmed = name.trim();
                 if !trimmed.is_empty() {
                     self.trace(src, session_id, json!({"type": "skill_loaded", "skill": trimmed})).await;
+                    let (tools_loaded, tools_pending, issues) =
+                        self.install_skill_tools(src, trimmed, &v).await;
+                    if v.get("tools_manifest").is_some() {
+                        // 有声明才发安装事件（前端内联卡依据；纯文档技能不刷卡）
+                        self.trace(
+                            src,
+                            session_id,
+                            json!({"type": "skill_installed", "skill": trimmed, "tools_loaded": tools_loaded, "tools_pending": tools_pending}),
+                        )
+                        .await;
+                    }
+                    // 装载结果并入回喂：模型可感知工具就绪（loaded）/待启用（pending）
+                    v["tools_loaded"] = json!(tools_loaded);
+                    v["tools_pending"] = json!(tools_pending);
+                    if !issues.is_empty() {
+                        v["tool_issues"] = json!(issues);
+                    }
                 }
             }
             v
@@ -357,5 +380,6 @@ impl AgentLoopPlugin {
     /// 前缀放行），避免把 rg/ls/git 输出里的整仓文档刷成产物卡。
     const SCAN_DOC_EXTS: &[&str] = &[
         "docx", "xlsx", "pptx", "pdf", "zip", "png", "jpg", "jpeg", "gif", "webp",
+        "mp4", "webm", "mov",
     ];
 }

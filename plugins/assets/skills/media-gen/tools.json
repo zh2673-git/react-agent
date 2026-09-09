@@ -1,0 +1,72 @@
+[
+  {
+    "name": "image_gen",
+    "description": "Generate images from a text prompt via an OpenAI-compatible images endpoint (config: media.image). Returns saved artifact path(s) under the workspace outputs dir. Requires MEDIA_IMAGE_* configuration (设置面板媒体模型区).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "description": "画面描述（必填）——写具体：主体/风格/构图/光线，中文英文均可"
+        },
+        "size": {
+          "type": "string",
+          "description": "图片尺寸（如 1024x1024），缺省用端点默认"
+        },
+        "n": {
+          "type": "integer",
+          "description": "生成张数 1-4，缺省 1"
+        },
+        "model": {
+          "type": "string",
+          "description": "模型名，缺省用 media.image.model 配置"
+        }
+      },
+      "required": ["prompt"]
+    },
+    "exec": {
+      "cmd": ["python", "tools/image_gen.py"],
+      "timeout_secs": 300
+    }
+  },
+  {
+    "name": "video_submit",
+    "description": "Submit an async text-to-video task (config: media.video, first of the two-step submit/poll flow). Returns a task_id immediately; query progress with video_poll. Requires MEDIA_VIDEO_* configuration (设置面板媒体模型区).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "description": "视频内容描述（必填）——主体/动作/镜头运动写具体"
+        },
+        "model": {
+          "type": "string",
+          "description": "模型名，缺省用 media.video.model 配置"
+        }
+      },
+      "required": ["prompt"]
+    },
+    "exec": {
+      "cmd": ["python", "tools/video_submit.py"],
+      "timeout_secs": 120
+    }
+  },
+  {
+    "name": "video_poll",
+    "description": "Poll a submitted video task by task_id (second of the two-step flow). status=succeeded returns the saved video artifact path; running means wait 20-60s and poll again; failed returns the reason. Requires MEDIA_VIDEO_* configuration (设置面板媒体模型区).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "video_submit 返回的任务 id（必填）"
+        }
+      },
+      "required": ["task_id"]
+    },
+    "exec": {
+      "cmd": ["python", "tools/video_poll.py"],
+      "timeout_secs": 300
+    }
+  }
+]

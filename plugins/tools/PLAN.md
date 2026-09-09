@@ -404,4 +404,11 @@
   路径报错可读；无 media 配置时工具返回「未配置」引导文案而非异常
 - **I**：既有测试全绿（改动面 = passthrough_env 增键 / PRODUCT_EXTS 增量 / put_config
   media 分支，均为增量不改既有语义）；`cargo test --workspace` + 技能工具协议单测
-- **状态**：M1/M2/M3 均未实施；实施顺序 M1 → M3（先让生图端到端可见）→ M2
+- **状态**：✅ M1/M3/M2 已实施（2026-09-08，同日立项当日落地）。
+
+### 实施记录（2026-09-08）
+
+- 交付：`plugins/assets/skills/media-gen/`（SKILL.md + tools.json + tools/{_common,image_gen,video_submit,video_poll}.py，出厂第 5 技能）；config.rs media→8 个 MEDIA_* env 映射 + passthrough；put_config media 分支（宽松校验 + 逐字段 merge，null/空串不覆盖）+ get_config media 回显（key 掩码）；PRODUCT_EXTS 全仓唯一副本加 mp4/webm/mov；前端设置面板「媒体模型」区 + 产物卡 `<video>` 内联预览；SYSTEM.md 媒体纪律节；.gitignore 出厂技能白名单补 media-gen（**漏白名单则技能不入库，克隆即失效——实施时曾漏，实测发现补上**）。
+- 偏离（合理）：工具输出走技能工具 Wire 契约 `{"ok":true,"result":{...}}`（非方案文字的裸 path）；media 段为持久通道（重启生效，与 MCP_SERVERS 同语义，guest spawn 时 env 固化）非热通道；未配置返回 MEDIA_NOT_CONFIGURED 引导而非异常。
+- 验证：agent-loop 49 测 + host --lib 21 测（含 2 新 media 测试）全绿；py_compile 4 脚本过；mock 冒烟 4 项（b64 生图落盘 / submit 宽容解析 / poll RUNNING→SUCCEEDED 下载 / 未配置引导）全过；实测 PUT→落盘→回显掩码→技能装载（skills_count 5→6）全链路通过。**实施中抓到并修复一处缺陷：media_config_view 已定义但未挂入 GET /api/config 响应（回显丢失），已修复并回归。**
+- 时限联动（同日另一改动）：LLM_DEADLINE 120→600s / PROVIDER_DEADLINE 110→590s / CHAT_BUDGET_SECS 缺省 300→900s（深度思考模型长推理常态，三值须满足 预算 ≥ 总闸 ≥ provider 闸 的配对关系）。

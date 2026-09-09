@@ -156,7 +156,8 @@ class AssetsPlugin:
                 content = entry["path"].read_text(encoding="utf-8")[:_MAX_LOAD_BYTES]
             except OSError as exc:
                 return _err(f"skill 读取失败: {exc}")
-            resp = {"ok": True, "content": content}
+            resp = {"ok": True, "content": content, "origin": entry["origin"]}
+            # origin 随 load 回传（tools.install 据此自动启用出厂技能工具；缺省消费方忽略即兼容）
             # R9：配套工具声明 → 回传 tools.json 绝对路径（供 tools.install 定点装载）；
             # 声明存在但文件缺失时附 missing（观察回写要让模型知道）。
             tools_decl = entry.get("tools")

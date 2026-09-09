@@ -82,8 +82,8 @@ react-agent 的运行时：拉起全部 guest 插件、暴露 Web UI 与 SSE、�
 
 ### 配置与模型
 
-- `GET /api/config` → 配置视图（llm：config.json > env 缺省，key 只回 key_set+尾 4 位；tools 三池聚合数组——每项 `{name,enabled,pool:"builtin"|"skill"|"mcp",description,parameters}` 附 `skill`/`mcp_server` 来源字段，前端按 pool 分组渲染：内置平铺，技能/MCP 池按来源折叠分组 + 组头总开关（三态），MCP 组 ready 在前 failed 垫底；`mcp:{servers, declared}`——servers 为运行状态，declared 为 config.json 声明视图（command/cwd + env 各键脱敏为 `key_set`/`key_tail`），key 配置内嵌于前端「MCP 外接」各服务折叠组内（填 Key → 保存仅落盘 → 重启 host 生效）；skills_count；agent 参数视图）
-- `PUT /api/config` → 分段合并落盘 + 热应用：`llm` 逐字段（null 不覆盖，key 热应用 env）；`tools.enabled` 白名单整体替换（configure 热生效）；`agent` 逐字段（null 不覆盖）；`mcp_servers` 按 server 名合并——command/cwd 未传保留原值，env 逐键合并（空串=不动），**仅落盘**（server 子进程生命周期归插件 init/destroy，改后需重启 host）
+- `GET /api/config` → 配置视图（llm：config.json > env 缺省，key 只回 key_set+尾 4 位；`media` 媒体模型视图（tools PLAN §九：image/video 两组字段回显，key 同规则掩码——设置面板「媒体模型」区数据源）；tools 三池聚合数组——每项 `{name,enabled,pool:"builtin"|"skill"|"mcp",description,parameters}` 附 `skill`/`mcp_server` 来源字段，前端按 pool 分组渲染：内置平铺，技能/MCP 池按来源折叠分组 + 组头总开关（三态），MCP 组 ready 在前 failed 垫底；`mcp:{servers, declared}`——servers 为运行状态，declared 为 config.json 声明视图（command/cwd + env 各键脱敏为 `key_set`/`key_tail`），key 配置内嵌于前端「MCP 外接」各服务折叠组内（填 Key → 保存仅落盘 → 重启 host 生效）；skills_count；agent 参数视图）
+- `PUT /api/config` → 分段合并落盘 + 热应用：`llm` 逐字段（null 不覆盖，key 热应用 env）；`tools.enabled` 白名单整体替换（configure 热生效）；`agent` 逐字段（null 不覆盖）；`media` 逐字段校验落盘（tools PLAN §九：image 组 base_url/model/key，video 组 base_url/model/key/submit_url/query_url——url 宽松形态校验，null/空串不覆盖，仅持久通道：guest spawn 时 env 固化，**改后需重启 host**）；`mcp_servers` 按 server 名合并——command/cwd 未传保留原值，env 逐键合并（空串=不动），**仅落盘**（server 子进程生命周期归插件 init/destroy，改后需重启 host）
 - `GET /api/models` → 转发 llm-adapter `models.list`，返回当前 provider 可用模型 id（前端「拉取模型」按钮；配好 base_url/key 后自动填充 model 下拉；ollama 额外透传 `models_meta` 原生窗口元数据——前端下拉展示 `模型名 · 256k`，Agent 页 `llm_context_tokens` 提示原生窗口并可一键填入）
 - `GET /api/presets` → 转发 llm-adapter `presets.list`，OpenAI 兼容站点预设清单（数据源 plugins/llm_adapter/presets.py——前端「站点」下拉一键切换：选站自动填 base_url、per-site key 由 localStorage 记忆带出，保存走 configure 热应用零重启）
 

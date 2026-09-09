@@ -52,20 +52,26 @@ pub const ID_LLM: &str = "llm-adapter";
 pub const ID_TOOLS: &str = "tools";
 pub const ID_ASSETS: &str = "assets";
 
-/// 保留工具名：路由 assets，不下发 tools（见 03 §3）。
+/// 保留工具名：路由 assets（读正文 + 装配套工具，R9b），不下发 tools（见 03 §3）。
 pub const RESERVED_LOAD_SKILL: &str = "load_skill";
 
 /// 保留工具名：子代理委派（Phase 3-3）——复用 agent.chat 全链路（新 session_id），不下发 tools。
 pub const RESERVED_TASK: &str = "task";
 
 /// 保留工具名：技能安装（R9）——assets skills.load 取声明 → tools.install 装载配套工具
-/// （进池不启用），trace `skill_installed` 事件供前端内联卡与一键启用。不下发 tools。
+/// （preset 装载即启用并视同已加载；用户技能进池待界面确认），trace `skill_installed`
+/// 事件供前端内联卡与一键启用。不下发 tools。
 pub const RESERVED_SKILL_INSTALL: &str = "skill_install";
 
 /// 各转发步的相对截止（A2：Envelope.deadline 为相对时长）。
+/// LLM_DEADLINE=600s：深度思考模型长推理是常态（110s 时代被误伤）——单步上限放宽到
+/// 10 分钟覆盖全部商用推理模型流式思考；必须与 llm_adapter PROVIDER_DEADLINE=590s
+/// 配对（provider 先收敛 10s 报可重试 timeout，避免 gRPC abort 不中断 guest 线程导致
+/// 的涓流占坑，见 base.py 头注）；整轮预算 CHAT_BUDGET_SECS 缺省 900s 需 ≥ 单步闸，
+/// 否则长思考 + 工具轮会在轮边界被 K508 掐断。
 const MEM_DEADLINE: Duration = Duration::from_secs(5);
 const TOOLS_DEADLINE: Duration = Duration::from_secs(60);
-const LLM_DEADLINE: Duration = Duration::from_secs(120);
+const LLM_DEADLINE: Duration = Duration::from_secs(600);
 const ASSETS_DEADLINE: Duration = Duration::from_secs(5);
 
 /// 工具结果回喂上限（字符数，PLAN R2）：防止单条大结果撑爆上下文与 memory。

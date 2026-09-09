@@ -41,9 +41,10 @@ react-agent 的大脑：把"用户一句话"变成"多轮感知 → 规划 → �
   （trace 落 `retry`，`reason=CONTEXT_OVERFLOW, degraded=true`）；再超 → 原错误收敛，不进重试风暴。
 - **轮次边界停车检查**：每轮开头 / 工具波次后 / 强制收敛轮前依次检查「用户取消（`cancel` op 置位，K499）→
   时长预算 → token 预算（K508）」，命中即收敛返回。
-- **总预算（PLAN T4）**：单次 chat 有墙钟（`CHAT_BUDGET_SECS`，缺省 300s，`0`=禁用）与 token
+- **总预算（PLAN T4）**：单次 chat 有墙钟（`CHAT_BUDGET_SECS`，缺省 900s，`0`=禁用）与 token
   （`CHAT_TOKEN_BUDGET`，input+output 累计，`0`=禁用）上限。子代理继承**衰减后**的剩余
-  （`ChatReq.budget_ms_left` / `tokens_left` 随链携带）；轮内超支由单步 deadline（5s/60s/120s）封顶。
+  （`ChatReq.budget_ms_left` / `tokens_left` 随链携带）；轮内超支由单步 deadline（5s/60s/600s）封顶。
+  LLM 步 600s 覆盖深度思考模型长推理（缺省预算 900s 须 ≥ 单步闸），须与 llm_adapter `PROVIDER_DEADLINE=590s` 配对（provider 先收敛 10s 报可重试 timeout）。
 
 ## 事件（发到 `memory.session.trace`，`type` 字段）
 

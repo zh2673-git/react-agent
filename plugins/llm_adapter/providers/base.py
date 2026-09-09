@@ -29,13 +29,15 @@ import re
 import threading
 import time
 
-# ── provider 总时限（K502 雪崩修复）──────────────────────────────────────
-# 内核 LLM_DEADLINE=120s（agent-loop）是唯一总闸：provider 超时若 >= 120s，内核
-# K502 抢先 abort——gRPC 取消不会中断 guest 线程，Python 侧继续占坑等 httpx 超时
+# ── provider 总时限（K502 雪崩修复；v0.1.10 放宽至 590s 配对 agent-loop 600s）──
+# agent-loop LLM_DEADLINE=600s 是唯一总闸：provider 超时若 >= 600s，agent-loop 抢先
+# abort——gRPC 取消不会中断 guest 线程，Python 侧继续占坑等 httpx 超时
 # （流式的 timeout 是 per-read 不是 total，涓流可无限续命）→ 线程池耗尽连环 K502。
-# 故 provider 侧必须在内核之前主动收敛：非流式 timeout 与流式总守卫都取
-# PROVIDER_DEADLINE（略小于 120s），干净业务错误（message 含 timeout）→ T3 正常重试。
-PROVIDER_DEADLINE = 110.0
+# 故 provider 侧必须在总闸之前主动收敛：非流式 timeout 与流式总守卫都取
+# PROVIDER_DEADLINE（= 总闸 - 10s 余量），干净业务错误（message 含 timeout）→ T3 正常重试。
+# 深度思考模型长推理是常态，110s 曾误伤（用户实测）——两侧常量必须配对修改，
+# 且整轮预算 CHAT_BUDGET_SECS 缺省 900s 需 ≥ 总闸。
+PROVIDER_DEADLINE = 590.0
 
 
 # ── 取消（R1 停止失效修复）──────────────────────────────────────────────

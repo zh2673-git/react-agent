@@ -298,6 +298,27 @@ pub fn apply_config_file_to_env() -> usize {
             }
         }
     }
+    // 媒体生成（tools PLAN §九）：media 段 → MEDIA_* env，技能工具子进程经
+    // passthrough_env 继承。与 MCP_SERVERS 同款持久通道语义（guest spawn 时 env 固化，
+    // 热改不可达已运行 guest）——改后需重启 host。
+    if let Some(media) = cfg.get("media").filter(|v| v.is_object()) {
+        for (section, prefix) in [("image", "MEDIA_IMAGE"), ("video", "MEDIA_VIDEO")] {
+            if let Some(sec) = media.get(section).filter(|v| v.is_object()) {
+                for (key, env) in [("base_url", "BASE_URL"), ("model", "MODEL"), ("key", "KEY")] {
+                    if let Some(v) = sec.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                        set(&format!("{prefix}_{env}"), v.into());
+                    }
+                }
+            }
+        }
+        if let Some(video) = media.get("video").filter(|v| v.is_object()) {
+            for (key, env) in [("submit_url", "MEDIA_VIDEO_SUBMIT_URL"), ("query_url", "MEDIA_VIDEO_QUERY_URL")] {
+                if let Some(v) = video.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    set(env, v.into());
+                }
+            }
+        }
+    }
     n
 }
 
@@ -364,6 +385,44 @@ mod tests {
         assert_eq!(std::env::var("AGENT_SYSTEM_PROMPT").unwrap(), "CUSTOM P5");
         assert_eq!(std::env::var("LLM_RETRY_ATTEMPTS").unwrap(), "3");
         assert_eq!(std::env::var("LLM_CONTEXT_TOKENS").unwrap(), "8192");
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn config_media_section_applies_to_env() {
+        // PLAN §九：media 段（image/video）→ MEDIA_* env 持久通道映射；空串不覆盖。
+        let tmp = std::env::temp_dir().join("ra-media-config-test.json");
+        std::fs::write(
+            &tmp,
+            r#"{"media":{"image":{"base_url":"https://img.example.com/v1","model":"img-1","key":"ik-123","model_override_ignored":true},"video":{"base_url":"https://vid.example.com","model":"vid-1","key":"","submit_url":"/v1/video/submit","query_url":"/v1/video/status?id={task_id}"}}}"#,
+        )
+        .unwrap();
+        let keys = [
+            "MEDIA_IMAGE_BASE_URL", "MEDIA_IMAGE_MODEL", "MEDIA_IMAGE_KEY",
+            "MEDIA_VIDEO_BASE_URL", "MEDIA_VIDEO_MODEL", "MEDIA_VIDEO_KEY",
+            "MEDIA_VIDEO_SUBMIT_URL", "MEDIA_VIDEO_QUERY_URL", "CONFIG_FILE",
+        ];
+        let saved: Vec<(String, Option<String>)> = keys.iter().map(|k| (k.to_string(), std::env::var(k).ok())).collect();
+        std::env::set_var("CONFIG_FILE", &tmp);
+
+        let n = apply_config_file_to_env();
+
+        assert_eq!(std::env::var("MEDIA_IMAGE_BASE_URL").unwrap(), "https://img.example.com/v1");
+        assert_eq!(std::env::var("MEDIA_IMAGE_MODEL").unwrap(), "img-1");
+        assert_eq!(std::env::var("MEDIA_IMAGE_KEY").unwrap(), "ik-123");
+        assert_eq!(std::env::var("MEDIA_VIDEO_BASE_URL").unwrap(), "https://vid.example.com");
+        assert_eq!(std::env::var("MEDIA_VIDEO_MODEL").unwrap(), "vid-1");
+        assert_eq!(std::env::var("MEDIA_VIDEO_SUBMIT_URL").unwrap(), "/v1/video/submit");
+        assert_eq!(std::env::var("MEDIA_VIDEO_QUERY_URL").unwrap(), "/v1/video/status?id={task_id}");
+        // 空 key 不落 env（存在才传语义）；未知键忽略
+        assert!(std::env::var("MEDIA_VIDEO_KEY").is_err());
 
         for (k, v) in saved {
             match v {
