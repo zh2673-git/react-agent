@@ -34,6 +34,9 @@ origin: preset
 ### 生视频（两段式，生成需 1-10 分钟）
 
 1. 调 `video_submit`：`prompt` 必填（主体/动作/镜头运动写具体），立即返回 `task_id`；
+   **站点必填参数（如 Agnes 的 `mode`）已由配置的「站点默认参数」注入请求体，无需猜测**；
+   创意参数可显式传（`seconds` / `aspect_ratio` / `seed` 等，标量与字符串数组均透传），
+   显式传参优先于站点默认；
 2. 调 `video_poll` 传 `task_id`：`succeeded` → 返回 `path`；`running` → **等 20-60 秒再查**
    （在回答中告知用户需要等待，勿连续高频轮询）；`failed` → 转述原因，可修正参数后重新提交；
 3. 超时上限内仍 running → 如实告知用户任务仍在生成，给出 task_id 与稍后查询方式。
@@ -47,9 +50,21 @@ origin: preset
 
 ## 4. 约束
 
-- 三件工具不接受任意 HTTP 端点——端点由 media 配置指定；站点差异（提交/查询 URL 形状）
-  以配置适配，不在参数里传 URL；
+- 三件工具不接受任意 HTTP 端点——端点由 media 配置指定；站点差异（提交/查询 URL 形状、
+  必填参数如 mode/size/model_name）以配置适配（URL 占位 + 「站点默认参数」extra），
+  不在参数里传 URL、不猜站点约定；
 - `image_gen` 超时 300s、`video_poll` 超时 300s（下载含在内）；视频生成中的等待靠「间隔轮询」
   而非单次长阻塞；
 - 未配置（`MEDIA_NOT_CONFIGURED`）→ 停止调用，引导用户配置；配置错误（HTTP 4xx/密钥无效）
   → 把可读错误转述给用户，不要盲改参数重试超过一次。
+
+## 5. 已知站点配置参考（实测沉淀，协助用户配置时参考）
+
+| 站点 / 模型 | 协议形态（差异归工具还是 extra） | extra 范例 |
+|---|---|---|
+| ModelScope 生图（如 krea/Krea-2-Turbo） | **协议差异，工具内消化**：`/v1/images/generations` 全面异步（提交须 `X-ModelScope-Async-Mode` 头，轮询 `/v1/tasks/{id}` 须 `X-ModelScope-Task-Type` 头）——image_gen 已内置适配，**无需 extra** | 不需要 |
+| Agnes Video 2.5 Flash（OpenAI Videos 兼容） | **参数个性，进 extra**：`mode` 必填（text/keyframe/reference）、`size` 固定 `"720P"`、`seconds` 为字符串 `"4"`–`"12"`、查询推荐/部分模式必带 `model_name` | `{"mode":"text","size":"720P","n":1,"model_name":"agnes-video-2.5-flash"}` |
+| siliconflow 等标准 OpenAI 兼容生图 | 同步 `data` 数组，零个性参数 | 不需要 |
+
+判断口径：先读官方文档分清「协议差异」（异步/响应形状——应由工具适配或明确告知用户暂不支持）
+与「参数个性」（必填/固定值/查询参数——整理进 extra）。新站点实测跑通后回填本表。

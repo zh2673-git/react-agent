@@ -12,6 +12,7 @@ media 配置适配，不做代码级 provider）。
 - MEDIA_VIDEO_KEY（可选）
 """
 
+import json
 import re
 import sys
 import os
@@ -52,6 +53,21 @@ def main() -> int:
         url = url.replace("{id}", task_id)
     else:
         url += ("&" if "?" in url else "?") + "task_id=" + task_id
+
+    # W19 站点默认参数：extra 标量键拼查询参数（如 Agnes 的 model_name——keyframe/
+    # reference 模式必须带；text 模式推荐）。url 已含该键（占位/用户手填）时不覆盖。
+    raw = os.environ.get("MEDIA_VIDEO_EXTRA", "").strip()
+    if raw:
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            from urllib.parse import quote
+            for k, v in obj.items():
+                if k.startswith("_") or k in url or not isinstance(v, (str, int, float, bool)):
+                    continue
+                url += ("&" if "?" in url else "?") + quote(str(k)) + "=" + quote(str(v))
 
     try:
         data = http_json("GET", url, key=os.environ.get("MEDIA_VIDEO_KEY", "").strip())

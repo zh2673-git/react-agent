@@ -13,6 +13,7 @@
 参数：prompt（必填）/ model（可覆盖）/ duration、size 等标量参数原样透传给端点。
 """
 
+import json
 import sys
 import os
 
@@ -21,8 +22,35 @@ from _common import (  # noqa: E402
     MediaToolError, emit, http_json, read_args, resolve_url, wire_err, wire_ok,
 )
 
-# 透传给端点的参数类型（str/int/float/bool）；容器/嵌套类型不透传防误用
+
+def _extra_defaults() -> dict:
+    """W19 站点默认参数（media.video.extra → MEDIA_VIDEO_EXTRA JSON env）。
+
+    merge 顺序：extra 默认 < prompt/model < agent 显式参数——站点个性（mode/size/
+    model_name 等）以配置对齐，agent 显式传参可覆盖；非法 JSON 防御性忽略
+    （put_config 已校验对象形态，此处兜底 env 直改）。
+    """
+    raw = os.environ.get("MEDIA_VIDEO_EXTRA", "").strip()
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    return {k: v for k, v in obj.items() if not k.startswith("_")}
+
+
+# 标量透传类型；容器仅放行元素全为标量的 list（防嵌套对象误用）
 _PASS_TYPES = (str, int, float, bool)
+
+
+def _passable(v) -> bool:
+    """可透传类型：标量，或元素全为标量的 list（reference 模式的 images/audios 数组）。"""
+    if isinstance(v, _PASS_TYPES):
+        return True
+    return isinstance(v, (list, tuple)) and all(isinstance(x, _PASS_TYPES) for x in v)
 
 
 def main() -> int:
@@ -45,11 +73,12 @@ def main() -> int:
         return 0
     model = str(args.get("model") or os.environ.get("MEDIA_VIDEO_MODEL", "") or "").strip()
 
-    body = {"prompt": prompt}
+    body = dict(_extra_defaults())
+    body["prompt"] = prompt
     if model:
         body["model"] = model
     for k, v in args.items():
-        if k not in ("prompt", "model") and isinstance(v, _PASS_TYPES):
+        if k not in ("prompt", "model") and _passable(v):
             body[k] = v
 
     try:

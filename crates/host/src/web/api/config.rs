@@ -91,6 +91,10 @@ fn media_section_view(sec: Option<&Value>, fields: &[(&str, &str)]) -> Value {
             out.insert((*field).into(), json!(v));
         }
     }
+    // W19 站点默认参数：extra 为对象，不走字符串字段透传——原样回显（无掩码需求）
+    if let Some(extra) = sec.and_then(|s| s.get("extra")).filter(|v| v.is_object()) {
+        out.insert("extra".into(), extra.clone());
+    }
     Value::Object(out)
 }
 
@@ -106,8 +110,9 @@ fn key_view(v: &str) -> Value {
 
 /// media 段校验（PLAN §九，宽松）：image 组 base_url/model/key；video 组 base_url/model/
 /// key/submit_url/query_url。规则：值须为字符串；base_url 非空须 http(s):// 开头；
-/// submit_url/query_url 非空须 http(s):// 或 / 开头（相对路径以 base_url 为基由脚本拼接）。
-/// 未知键忽略（前向兼容）。合法返回 Ok(())，否则 Err(可读信息)。
+/// submit_url/query_url 非空须 http(s):// 或 / 开头（相对路径以 base_url 为基由脚本拼接）；
+/// video.extra（W19 站点默认参数）须为对象。未知键忽略（前向兼容）。合法返回 Ok(())，
+/// 否则 Err(可读信息)。
 fn validate_media(media: &Value) -> Result<(), String> {
     let url_ok = |s: &str, allow_relative: bool| {
         s.starts_with("http://") || s.starts_with("https://") || (allow_relative && s.starts_with('/'))
@@ -136,6 +141,15 @@ fn validate_media(media: &Value) -> Result<(), String> {
                 {
                     let shape = if allow_relative { "http(s):// 或 / 开头的路径" } else { "http(s):// 开头" };
                     return Err(format!("media.{group}.{field} 形态非法（需{shape}）: {s}"));
+                }
+            }
+        }
+        // W19 站点默认参数（仅 video 组有消费方）：extra 须为对象；image 组暂无消费方，
+        // extra 作为未知键忽略（前向兼容，见 media_section_validates_urls_and_types 探针）
+        if group == "video" {
+            if let Some(extra) = sec.get("extra").filter(|v| !v.is_null()) {
+                if !extra.is_object() {
+                    return Err("media.video.extra 需为对象（站点默认参数 JSON，如 {\"mode\":\"text\",\"size\":\"720P\"}）".to_string());
                 }
             }
         }
@@ -550,5 +564,9 @@ mod tests {
         assert!(validate_media(&serde_json::json!({"image": {"key": ""}})).is_ok());
         assert!(validate_media(&serde_json::json!({"image": {"key": null}})).is_ok());
         assert!(validate_media(&serde_json::json!({})).is_ok());
+        // W19：extra 须为对象；null 视为不修改；字符串形态拒
+        assert!(validate_media(&serde_json::json!({"video": {"extra": {"mode": "text", "size": "720P"}}})).is_ok());
+        assert!(validate_media(&serde_json::json!({"video": {"extra": null}})).is_ok());
+        assert!(validate_media(&serde_json::json!({"video": {"extra": "{\"mode\":\"text\"}"}})).is_err());
     }
 }

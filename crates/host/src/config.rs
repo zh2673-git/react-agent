@@ -317,6 +317,17 @@ pub fn apply_config_file_to_env() -> usize {
                     set(env, v.into());
                 }
             }
+            // W19 站点默认参数：extra 对象整体序列化为 JSON env——submit 请求体默认值 +
+            // poll 查询参数的站点个性出口（如 Agnes：{"mode":"text","size":"720P",
+            // "model_name":"agnes-video-2.5-flash"}）。agent 显式参数优先覆盖；
+            // 站点差异继续以配置适配，不做代码级 provider。
+            if let Some(extra) = video.get("extra").filter(|v| v.is_object()) {
+                if let Ok(s) = serde_json::to_string(extra) {
+                    if s != "{}" {
+                        set("MEDIA_VIDEO_EXTRA", s.into());
+                    }
+                }
+            }
         }
     }
     n
@@ -401,13 +412,13 @@ mod tests {
         let tmp = std::env::temp_dir().join("ra-media-config-test.json");
         std::fs::write(
             &tmp,
-            r#"{"media":{"image":{"base_url":"https://img.example.com/v1","model":"img-1","key":"ik-123","model_override_ignored":true},"video":{"base_url":"https://vid.example.com","model":"vid-1","key":"","submit_url":"/v1/video/submit","query_url":"/v1/video/status?id={task_id}"}}}"#,
+            r#"{"media":{"image":{"base_url":"https://img.example.com/v1","model":"img-1","key":"ik-123","model_override_ignored":true},"video":{"base_url":"https://vid.example.com","model":"vid-1","key":"","submit_url":"/v1/video/submit","query_url":"/v1/video/status?id={task_id}","extra":{"mode":"text","size":"720P","n":1}}}}"#,
         )
         .unwrap();
         let keys = [
             "MEDIA_IMAGE_BASE_URL", "MEDIA_IMAGE_MODEL", "MEDIA_IMAGE_KEY",
             "MEDIA_VIDEO_BASE_URL", "MEDIA_VIDEO_MODEL", "MEDIA_VIDEO_KEY",
-            "MEDIA_VIDEO_SUBMIT_URL", "MEDIA_VIDEO_QUERY_URL", "CONFIG_FILE",
+            "MEDIA_VIDEO_SUBMIT_URL", "MEDIA_VIDEO_QUERY_URL", "MEDIA_VIDEO_EXTRA", "CONFIG_FILE",
         ];
         let saved: Vec<(String, Option<String>)> = keys.iter().map(|k| (k.to_string(), std::env::var(k).ok())).collect();
         std::env::set_var("CONFIG_FILE", &tmp);
@@ -421,6 +432,11 @@ mod tests {
         assert_eq!(std::env::var("MEDIA_VIDEO_MODEL").unwrap(), "vid-1");
         assert_eq!(std::env::var("MEDIA_VIDEO_SUBMIT_URL").unwrap(), "/v1/video/submit");
         assert_eq!(std::env::var("MEDIA_VIDEO_QUERY_URL").unwrap(), "/v1/video/status?id={task_id}");
+        // W19：extra 对象 → JSON env（键序按 config.json 原样，反序列化语义等价即可）
+        let extra: Value = serde_json::from_str(&std::env::var("MEDIA_VIDEO_EXTRA").unwrap()).unwrap();
+        assert_eq!(extra["mode"], "text");
+        assert_eq!(extra["size"], "720P");
+        assert_eq!(extra["n"], 1);
         // 空 key 不落 env（存在才传语义）；未知键忽略
         assert!(std::env::var("MEDIA_VIDEO_KEY").is_err());
 

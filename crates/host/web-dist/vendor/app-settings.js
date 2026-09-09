@@ -56,6 +56,8 @@ async function loadConfig() {
     $("media-vid-key").placeholder = mv.key?.key_set ? `已设置（尾号 ${mv.key.key_tail}，留空不修改）` : "未设置";
     $("media-vid-submit").value = mv.submit_url ?? "";
     $("media-vid-query").value = mv.query_url ?? "";
+    // W19 站点默认参数回显（对象 → JSON 串）
+    $("media-vid-extra").value = mv.extra && typeof mv.extra === "object" ? JSON.stringify(mv.extra) : "";
     // 组头状态徽章（pcnt 位）：配置一眼可见
     $("llm-cnt").textContent = c.llm.model || c.llm.provider || "未配置";
     $("media-img-cnt").textContent = mi.base_url ? "已配置" : "未配置";
@@ -362,10 +364,21 @@ function mediaBody(kind) {
   }
   const key = $(kind === "image" ? "media-img-key" : "media-vid-key").value.trim();
   if (key) out.key = key; // media 段字段名与 llm 段不同：是 key 不是 api_key
+  // W19 站点默认参数：JSON 输入（非法即报错不提交；填 {} = 清空全部默认参数）
+  if (kind === "video") {
+    const raw = $("media-vid-extra").value.trim();
+    if (raw) {
+      try { out.extra = JSON.parse(raw); }
+      catch { throw new Error("站点默认参数 extra 不是合法 JSON"); }
+    }
+  }
   return out;
 }
 async function saveMedia(kind, flashId) {
-  const fields = mediaBody(kind);
+  let fields;
+  try {
+    fields = mediaBody(kind);
+  } catch (e) { flash(flashId, false, e.message); return; }
   if (!Object.keys(fields).length) { flash(flashId, false, "未填写任何字段"); return; }
   try {
     await api("PUT", "/api/config", { media: { [kind]: fields } });

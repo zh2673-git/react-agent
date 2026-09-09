@@ -68,11 +68,11 @@
         <div class="field"><label>base_url</label><input id="llm-base" placeholder="https://api.deepseek.com/v1"></div>
         <div class="field"><label>api_key</label><input id="llm-key" type="password" autocomplete="off"></div>
         <div class="row"><button class="btn" id="llm-save">保存</button><button class="btn ghost" id="llm-reveal" title="在文件管理器中定位 config.json">📂 源文件</button><span class="flash" id="llm-flash"></span></div>
-        <p class="hint">保存即热生效（env 更新 + 落盘 config.json）。api_key 留空 = 不修改；回显只显示尾 4 位。</p>
+        <p class="hint">保存即热生效（env 更新 + 落盘 config.json）。api_key 留空 = 不修改；回显只显示尾 4 位。不清楚怎么填？直接在对话里问（如「XX 站怎么配」），我会调研该站点文档并给出可粘贴的配置。</p>
       </div>
       <div class="poolhead collapsible"><span class="chev">▾</span><span class="plabel">生图模型</span><span class="pcnt" id="media-img-cnt"></span></div>
       <div class="poolbody" id="sec-media-img">
-        <p class="hint">media-gen 技能的生图端点（OpenAI 兼容 /v1/images/generations）。保存落盘，重启 host 生效；api_key 留空 = 不修改。</p>
+        <p class="hint">media-gen 技能的生图端点（OpenAI 兼容 /v1/images/generations）。保存落盘，重启 host 生效；api_key 留空 = 不修改。不清楚怎么填？直接在对话里问（如「XX 站怎么配」），我会调研该站点文档并给出可粘贴的配置。</p>
         <div class="field"><label>base_url</label><input id="media-img-base" placeholder="https://api.siliconflow.cn/v1"></div>
         <div class="field"><label>model</label><input id="media-img-model" placeholder="Kwai-Kolors/Kolors"></div>
         <div class="field"><label>api_key</label><input id="media-img-key" type="password" autocomplete="off"></div>
@@ -86,6 +86,8 @@
         <div class="field"><label>api_key</label><input id="media-vid-key" type="password" autocomplete="off"></div>
         <div class="field"><label>提交端点 submit_url</label><input id="media-vid-submit" placeholder="/v1/video/submit（相对路径以 base_url 为基）"></div>
         <div class="field"><label>查询端点 query_url</label><input id="media-vid-query" placeholder="/v1/video/status?id={task_id}"></div>
+        <div class="field"><label>站点默认参数 extra（JSON，选填）</label><input id="media-vid-extra" placeholder='{"mode":"text","size":"720P","model_name":"agnes-video-2.5-flash"}'></div>
+        <p class="hint" id="media-vid-extra-hint" style="margin-top:-2px">站点个性化参数在此声明（submit 请求体默认值 + poll 查询参数），agent 显式传参优先覆盖——如 Agnes 的 mode 必填、size 固定 "720P"。不清楚某站怎么填？直接在对话里问，我会调研该站点文档并给出可粘贴的 extra JSON。</p>
         <div class="row"><button class="btn" id="media-vid-save">保存</button><span class="flash" id="media-vid-flash"></span></div>
       </div>
     </div>
