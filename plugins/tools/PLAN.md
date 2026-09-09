@@ -345,10 +345,10 @@
   cfgMcp.servers` 非空不 continue）。真实数据实测：amap key 空 → 组可见、
   failed 灯、占位文案含「填好 Key 保存后重启 host 重试」。
 
-## 九、媒体生成（生图/生视频）：媒体模型接入方案（2026-09-09 立项，待实施）
+## 九、媒体生成（生图/生视频）：媒体模型接入方案 ✅（2026-09-09 立项并实施）
 
-> 用户需求：支持生图、生视频的模型。本节为方案（未实施）；实施时按切片推进，
-> host/前端切片的迭代记录分别落各自模块 PLAN，本节维护总纲与状态。
+> 用户需求：支持生图、生视频的模型。本节维护总纲与状态，实施记录见文末；
+> host/前端切片的迭代记录分别落各自模块 PLAN。
 
 ### 审计结论（挂接点，全部已对码）
 
@@ -412,3 +412,50 @@
 - 偏离（合理）：工具输出走技能工具 Wire 契约 `{"ok":true,"result":{...}}`（非方案文字的裸 path）；media 段为持久通道（重启生效，与 MCP_SERVERS 同语义，guest spawn 时 env 固化）非热通道；未配置返回 MEDIA_NOT_CONFIGURED 引导而非异常。
 - 验证：agent-loop 49 测 + host --lib 21 测（含 2 新 media 测试）全绿；py_compile 4 脚本过；mock 冒烟 4 项（b64 生图落盘 / submit 宽容解析 / poll RUNNING→SUCCEEDED 下载 / 未配置引导）全过；实测 PUT→落盘→回显掩码→技能装载（skills_count 5→6）全链路通过。**实施中抓到并修复一处缺陷：media_config_view 已定义但未挂入 GET /api/config 响应（回显丢失），已修复并回归。**
 - 时限联动（同日另一改动）：LLM_DEADLINE 120→600s / PROVIDER_DEADLINE 110→590s / CHAT_BUDGET_SECS 缺省 300→900s（深度思考模型长推理常态，三值须满足 预算 ≥ 总闸 ≥ provider 闸 的配对关系）。
+
+### 补记（2026-09-09，实测驱动的三处修正）
+
+- **image_gen 适配 ModelScope 生图 API 全面异步化**（实测发现：同步调用 400「does not support
+  synchronous calls」，要求 `X-ModelScope-Async-Mode: true` 头；响应 200 = `{task_id,task_status}`
+  而非 OpenAI `data`；轮询 `GET /v1/tasks/{id}` 须带 `X-ModelScope-Task-Type: image_generation`
+  头——缺头报「task not found」，任务按类型分命名空间；SUCCEED 后取 `output_images`，Turbo 模型
+  ~15s 出图）。响应形状三分支兼容：`data`（OpenAI 同步）/ `images`（旧 ModelScope 同步）/
+  `task_id`（异步轮询）；提交头无条件携带（其他 OpenAI 兼容端点忽略未知头，零影响）。
+- **修不传 `n` 的 KeyError**：`items[: body["n"]]` → `body.get("n", 1)`（存量缺陷，此前在更早
+  环节就报错未暴露）。
+- **validate_media 接线修复**：校验函数存在且有测试但 put_config 生产路径从未调用（dead_code
+  警告暴露），非法 URL 会静默落盘——media merge 前补校验、K400 拒绝。
+- 排障方法论教训：PowerShell 5.1 向 curl.exe 传 JSON 会被吞引号（bogus 模型与正确模型同报
+  invalid prompt 即此症状），必须文件传 body 或直接 python+httpx 走真实代码路径测。
+
+## 十、密钥脱敏闸（W18 安全边界）✅（2026-09-09 实施）
+
+### 威胁模型
+
+用户报告：agent 对话能把全部 key 明文显示出来。泄露路径不止一条——工作区=代码根时
+`read_file config.json` 直读；任意工作区下 bash 可任意路径读文件、`printenv` 看 env
+（密钥都在环境变量里）；读到后 LLM 即可原样复述。设置面板掩码回显（尾 4 位）只防前端展示，
+防不了工具链路。
+
+### 方案：唯一咽喉脱敏，不逐工具堵
+
+- **闸位**：agent-loop `act_exec` 返回值（会话历史 + 事件 + trace 的共同源头）+ `act_begin`
+  的 tool_call args（前端内联 diff 数据源）——所有工具（read_file/bash/grep/printenv/子代理）
+  汇入同两个咽喉，一处闸全覆盖。LLM 从未见过明文就吐不出明文，最终答案自然无明文。
+- **密钥清单**（`secrets.rs` OnceLock 惰性收集）：CONFIG_FILE 的 config.json 通用规则——任意
+  层级键名含 key/token/secret/password（忽略大小写）的字符串值（覆盖 llm.api_key、media.*.key、
+  mcp_servers[].key 及未来新增段）；env 兜底 `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/
+  `MEDIA_IMAGE_KEY`/`MEDIA_VIDEO_KEY`；<6 字符不收集（防误杀普通词），去重。
+- **替换占位符**：`«KEY_MASKED»`（肉眼可辨、不像任何合法值）。
+- **纵深防御**：SYSTEM.md 新增「密钥纪律」节（不在回答复述、引导走设置面板、调试配置用
+  get_config 脱敏回显、不读 config.json 原文）；GET/PUT /api/config 本就掩码（既有）。
+
+### 诚实边界
+
+- 历史 trace（`.stream/traces/*.jsonl`）不追溯清洗——修复前已落盘的明文仍在；已暴露的 key 建议轮换。
+- bash 间接写/读不做路径级阻断（沙箱管写不管读）；值脱敏在输出侧兜底，与路径闸正交。
+
+### 验证
+
+- secrets 单测 4 项（嵌套替换/无密钥 no-op/收集去重与短值过滤/敏感键名发现）+ agent-loop
+  既有 37 集成全绿；`act_exec`/`act_begin` 咽喉接线由集成路径覆盖。

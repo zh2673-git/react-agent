@@ -104,7 +104,7 @@ LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-xxx cargo run -p react-agent-hos
 Web 前端是 `crates/host/web-dist/`（index.html + style.css，原生 JS 无框架、无构建步骤；脚本为 `vendor/` 下五模块 `app-{core,stream,files,settings,events}.js`，经 defer 按文档序加载共享全局作用域），由后端 `GET /` 运行时读取 serve。
 
 - **默认（推荐）**：`cargo run -p react-agent-host`（或 `start.cmd`）起 8710，浏览器开 `http://127.0.0.1:8710` 即同时拿到前端与 `/api`。改 `web-dist/` 任一文件后**刷新浏览器即生效**（无需重编 host；若页面不更新按 `Ctrl+Shift+R` 硬刷规避缓存）。
-- **多窗口**：Web 侧栏「▣ 新窗口」按钮（📂 弹原生文件夹选择框 → 创建并打开，实例名自动取文件夹名，无需手填路径/起名）；或命令行 `start-window.cmd <工作区路径>`。重启主实例后，未手工停止的子窗口**自动复活**（换新端口，会话/配置保留；探活按实例身份识别，端口被复用不误判）。API 直呼见 [host README「多实例」](crates/host/README.md)。
+- **多窗口**：Web 侧栏「▣ 新窗口」按钮（📂 弹原生文件夹选择框 → 创建并打开，实例名自动取文件夹名，无需手填路径/起名）；或命令行 `start-window.cmd <工作区路径>`。子实例**按需复活**（W17 迭代十：「打开哪个恢复哪个」）——主实例启动不再批量拉起注册实例，恢复入口 =「新窗口」modal 实例列表：在线点「打开」直达，离线点「启动」按原工作区复活（换新端口，会话/配置保留；身份探活识别实例，端口被复用不误判）。API 直呼见 [host README「多实例」](crates/host/README.md)。
 - **前后端分离（独立端口，HMR）**：后端 `cargo run -p react-agent-host`（8710 作 API 源），前端用 `vite` 起在 `crates/host/web-dist/`（已内置 `vite.config.js`，`/api` 自动反代回 8710）：
   ```bash
   cd crates/host/web-dist && npm install && npm run dev   # 默认 http://localhost:5173
@@ -121,7 +121,7 @@ Web 前端是 `crates/host/web-dist/`（index.html + style.css，原生 JS 无�
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | openai 兼容端点 |
 | `OLLAMA_HOST` | `localhost:11434` | ollama 地址（Web 设置面板「ollama 地址」栏可改，默认即此值；ollama 免 key，api_key 无效） |
 | `OLLAMA_ENDPOINT` | `native` | ollama 传输通道：native（原生 `/api/chat`，per-request `options.num_ctx` + NDJSON 流式）/ v1（回退 OpenAI 兼容层 `/v1`） |
-| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | 密钥（经子进程 env 传递，不落 manifest） |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | 密钥（经子进程 env 传递，不落 manifest）；W18 密钥脱敏：所有工具结果/事件进入会话前统一过闸，密钥出现处替换为 `«KEY_MASKED»`——LLM 与前端均拿不到明文 |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic 端点 |
 | `MOCK_SCRIPT` | — | mock provider 脚本（JSON 数组，逐次弹出） |
 | `MAX_ROUNDS` | `8` | ReAct 最大轮数 |
@@ -149,7 +149,7 @@ Web 前端是 `crates/host/web-dist/`（index.html + style.css，原生 JS 无�
 | `BASH_SANDBOX` | `on` | on=sandbox-run 受限令牌沙箱（探测失败 fail-closed 移除 bash）；off=显式豁免直跑 |
 | `REACT_FRONTEND` | `repl` | 前端选择：repl / web |
 | `WEB_ADDR` | `127.0.0.1:8710` | web 网关监听地址 |
-| `REACT_INSTANCE_NAME` | 空（主实例） | W17 多窗口：实例名（由 `/api/instances` 或 `start-window.cmd` 自动设置/派生，手工启动无需关心）；子实例头部显示徽章，数据存于代码根 `.instances/{name}/`；主实例启动自动恢复 `.instances/.last-workspace` 记忆的工作区，并自动复活未手工停止（无 `stopped` 标记）的已死注册实例（仅 web 交互模式触发） |
+| `REACT_INSTANCE_NAME` | 空（主实例） | W17 多窗口：实例名（由 `/api/instances` 或 `start-window.cmd` 自动设置/派生，手工启动无需关心）；子实例头部显示徽章，数据存于代码根 `.instances/{name}/`；主实例启动自动恢复 `.instances/.last-workspace` 记忆的工作区；子实例不自动复活（W17 迭代十按需复活：恢复入口 =「新窗口」modal 实例列表，仅 web 交互模式） |
 | `CONFIG_FILE` | `<workspace>/config.json` | 配置中心持久化文件（启动时应用为 env，Web 保存后落盘） |
 | `RUST_LOG` | `warn,react_agent_host=info` | 日志 |
 

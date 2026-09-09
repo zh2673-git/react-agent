@@ -9,6 +9,7 @@ react-agent 的大脑：把"用户一句话"变成"多轮感知 → 规划 → �
 |---|---|
 | `lib.rs` | 编排主循环、ReAct 状态机、事件发射、上下文压缩、取消 / 重试 / 预算、技能自扩展、流式 `sid` / 旁路编排 |
 | `contract.rs` | 跨边界数据形状：`MemoryMsg` / `ChatReq` / `LlmChatResp` / `ToolCall` / `ToolSpec` / `StepRecord` |
+| `secrets.rs` | W18 密钥脱敏闸：`act_exec` 返回值（历史+事件+trace 共同源头）与 `act_begin` 的 tool_call args 统一脱敏——密钥清单 OnceLock 惰性收集（CONFIG_FILE config.json 通用规则：键名含 key/token/secret/password 的字符串值 + `OPENAI/ANTHROPIC_API_KEY`、`MEDIA_IMAGE/VIDEO_KEY` env 兜底，<6 字符不收集）；命中处替换 `«KEY_MASKED»`。威胁模型：文件/bash 工具可读 config.json 或 `printenv` 把明文 key 带进对话；LLM 从未见过明文就吐不出明文。诚实边界：历史 trace 不追溯清洗 |
 
 ## 契约与依赖
 
