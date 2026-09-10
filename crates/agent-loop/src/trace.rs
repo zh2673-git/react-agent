@@ -48,7 +48,7 @@ impl AgentLoopPlugin {
         if let Err(e) = self
             .call(
                 src,
-                ID_MEMORY,
+                CAP_MEMORY,
                 json!({"op": "trace.append", "session_id": session_id, "events": [event]}),
                 MEM_DEADLINE,
             )
@@ -65,7 +65,7 @@ impl AgentLoopPlugin {
                 if let Err(e) = self
                     .call(
                         src,
-                        ID_MEMORY,
+                        CAP_MEMORY,
                         json!({"op": "trace.append", "session_id": parent, "events": [event]}),
                         MEM_DEADLINE,
                     )

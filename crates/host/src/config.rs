@@ -423,7 +423,7 @@ mod tests {
         let saved: Vec<(String, Option<String>)> = keys.iter().map(|k| (k.to_string(), std::env::var(k).ok())).collect();
         std::env::set_var("CONFIG_FILE", &tmp);
 
-        let n = apply_config_file_to_env();
+        let _ = apply_config_file_to_env();
 
         assert_eq!(std::env::var("MEDIA_IMAGE_BASE_URL").unwrap(), "https://img.example.com/v1");
         assert_eq!(std::env::var("MEDIA_IMAGE_MODEL").unwrap(), "img-1");

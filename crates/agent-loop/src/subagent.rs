@@ -53,13 +53,29 @@ impl AgentLoopPlugin {
                 payload["tokens_left"] = json!(toks);
             }
         }
-        let env = Envelope::new(PluginId::new(ID), payload);
+        // D2 对齐（内核 v0.1.4+）：子代理回归内核 dispatch——不再进程内直调 chat_body。
+        // 收益：① 嵌套编排进入调度账本（per-plugin max_inflight / 全局闸真实计数，
+        // 此前的调度盲区闭合）；② Draining 期间被 K403 正确拒收；③ panic 经 B2 隔离；
+        // ④ 整体 deadline 由内核 select 强制（取自随链衰减的剩余预算）。
+        // trace 连续性：显式拷贝父 trace_id（call_capability 每次生成新 trace，不满足
+        // 链路语义，故此处走 call_plugin；寻址按自身 PluginId，组合根装配的名字）。
+        let mut env = Envelope::new(PluginId::new(ID), payload);
+        env.trace_id = src.trace_id;
+        if let Some((Some(ms), _)) = budget_snap {
+            env.deadline = Some(Duration::from_millis(ms));
+        }
+        let Some(host) = self.host.get() else {
+            return json!({"ok": false, "error": {"code": "K500", "message": "agent-loop: host not initialized"}});
+        };
         // R11 事件镜像：委派期间子会话 trace 事件同步透传到父 trace（trace() 据 mirrors 表），
         // 前端「子代理」框据此实时呈现过程（思考流式帧另经旁路文件由网关 tail 透传）。
         self.mirrors.lock().unwrap().insert(sub_session.clone(), parent_session.to_string());
-        // 递归委派：Box::pin 打断未来大小的无限递归（嵌套上限由随链 depth 硬性收敛）
-        let resp = Box::pin(self.chat_body(&env)).await;
+        let dispatched = host.call_plugin(env).await;
         self.mirrors.lock().unwrap().remove(&sub_session);
+        let resp = match dispatched {
+            Ok(v) => v,
+            Err(e) => json!({"ok": false, "error": {"code": e.code(), "message": e.to_string()}}),
+        };
         if resp.get("ok") == Some(&json!(true)) {
             json!({
                 "ok": true,

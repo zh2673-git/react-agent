@@ -103,7 +103,7 @@ impl AgentLoopPlugin {
     /// 窗口与压缩的顺序见 `apply_history_limit`（PLAN R3：先压缩判断，后窗口裁剪）。
     pub(super) async fn perceive(&self, src: &Envelope, session_id: &str) -> Result<Vec<MemoryMsg>, KernelError> {
         let v = self
-            .call(src, ID_MEMORY, json!({"op": "get", "session_id": session_id}), MEM_DEADLINE)
+            .call(src, CAP_MEMORY, json!({"op": "get", "session_id": session_id}), MEM_DEADLINE)
             .await?;
         let msgs: Vec<MemoryMsg> =
             serde_json::from_value(v.get("messages").cloned().unwrap_or(Value::Null)).unwrap_or_default();
@@ -142,7 +142,7 @@ impl AgentLoopPlugin {
             payload["stream_path"] = json!(path);
             payload["sid"] = json!(sid);
         }
-        let v = self.call(src, ID_LLM, payload, LLM_DEADLINE).await?;
+        let v = self.call(src, CAP_LLM, payload, LLM_DEADLINE).await?;
         Ok(serde_json::from_value(v).unwrap_or(LlmChatResp {
             ok: false,
             content: None,
@@ -222,7 +222,7 @@ impl AgentLoopPlugin {
     /// 观察：写入记忆（尽力而为，失败不致命）。
     pub(super) async fn observe(&self, src: &Envelope, session_id: &str, msgs: &[MemoryMsg]) {
         if let Err(e) = self
-            .call(src, ID_MEMORY, json!({"op": "append", "session_id": session_id, "messages": msgs}), MEM_DEADLINE)
+            .call(src, CAP_MEMORY, json!({"op": "append", "session_id": session_id, "messages": msgs}), MEM_DEADLINE)
             .await
         {
             tracing::warn!(target: ID, "memory append failed: {e}");
@@ -239,6 +239,12 @@ impl AgentLoopPlugin {
         self.cancels.lock().unwrap().remove(&req.session_id);
         let out = self.chat_run(env, &req).await;
         self.cancels.lock().unwrap().remove(&req.session_id);
+        // 空间卫生（A4）：会话级瞬态表逐出，防长驻进程无界增长。
+        // turn_starts：fresh_artifact 仅回合内消费，chat 结束即失效可清；
+        // sid_seq：逐出后 next_sid 以全局 sid_floor 下限重新播种（严格大于历史已发值），
+        // 跨回合 sid 不碰撞语义不变。
+        self.turn_starts.lock().unwrap().remove(&req.session_id);
+        self.sid_seq.lock().unwrap().remove(&req.session_id);
         out
     }
 
@@ -282,7 +288,7 @@ impl AgentLoopPlugin {
         }
 
         // 工具清单（每请求一次；失败视为无工具可用，模型直接作答）+ 保留名 task 声明
-        let mut tools: Vec<ToolSpec> = match self.call(env, ID_TOOLS, json!({"op": "list"}), TOOLS_DEADLINE).await {
+        let mut tools: Vec<ToolSpec> = match self.call(env, CAP_TOOLS, json!({"op": "list"}), TOOLS_DEADLINE).await {
             Ok(v) => serde_json::from_value(v.get("tools").cloned().unwrap_or(Value::Null)).unwrap_or_default(),
             Err(e) => {
                 tracing::warn!(target: ID, "tools.list failed, proceeding without tools: {e}");

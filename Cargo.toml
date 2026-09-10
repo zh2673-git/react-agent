@@ -9,12 +9,12 @@ version = "0.1.13"
 edition = "2021"
 
 [workspace.dependencies]
-# 内核（发布版：git 依赖，锁定 v0.1.4 —— K2 capability 寻址（call_capability + K404）；P0 三项修复随行）
-agent-kernel-sdk = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.4" }
-agent-kernel-kernel = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.4", features = [
+# 内核（发布版：git 依赖，锁定 v0.1.6 —— P1 capability 寻址（K2）+ P0 债务闭合 + conformance 出生证明套件）
+agent-kernel-sdk = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.6" }
+agent-kernel-kernel = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.6", features = [
     "process",
 ] }
-agent-kernel-process = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.4" }
+agent-kernel-process = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.6" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

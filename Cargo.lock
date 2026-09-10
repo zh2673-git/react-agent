@@ -3,9 +3,22 @@
 version = 4
 
 [[package]]
+name = "agent-kernel-conformance"
+version = "0.1.0"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.6#895578983c455a8ae66b9a534bd6f716bef2f828"
+dependencies = [
+ "agent-kernel-core",
+ "agent-kernel-kernel",
+ "agent-kernel-sdk",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "agent-kernel-core"
 version = "0.1.4"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.4#719045e3d8ec9606e32b856346e8fc081ea0af3f"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.6#895578983c455a8ae66b9a534bd6f716bef2f828"
 dependencies = [
  "serde",
  "serde_json",
@@ -16,7 +29,7 @@ dependencies = [
 [[package]]
 name = "agent-kernel-kernel"
 version = "0.1.4"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.4#719045e3d8ec9606e32b856346e8fc081ea0af3f"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.6#895578983c455a8ae66b9a534bd6f716bef2f828"
 dependencies = [
  "agent-kernel-core",
  "agent-kernel-process",
@@ -39,7 +52,7 @@ dependencies = [
 [[package]]
 name = "agent-kernel-process"
 version = "0.1.4"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.4#719045e3d8ec9606e32b856346e8fc081ea0af3f"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.6#895578983c455a8ae66b9a534bd6f716bef2f828"
 dependencies = [
  "agent-kernel-core",
  "agent-kernel-sdk",
@@ -57,7 +70,7 @@ dependencies = [
 [[package]]
 name = "agent-kernel-sdk"
 version = "0.1.4"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.4#719045e3d8ec9606e32b856346e8fc081ea0af3f"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.6#895578983c455a8ae66b9a534bd6f716bef2f828"
 dependencies = [
  "agent-kernel-core",
  "anyhow",
@@ -789,6 +802,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "react-agent-agent-loop"
 version = "0.1.13"
 dependencies = [
+ "agent-kernel-conformance",
  "agent-kernel-kernel",
  "agent-kernel-sdk",
  "async-trait",

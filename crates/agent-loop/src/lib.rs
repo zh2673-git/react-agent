@@ -43,7 +43,7 @@ use agent_kernel_sdk::*;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -52,6 +52,15 @@ pub const ID_MEMORY: &str = "memory";
 pub const ID_LLM: &str = "llm-adapter";
 pub const ID_TOOLS: &str = "tools";
 pub const ID_ASSETS: &str = "assets";
+
+/// capability 寻址（K2，内核 v0.1.4）：跨插件调用按能力寻址，提供者可被同名/异名
+/// 实现替换而本 crate 零改动。memory 侧所有 session 域操作（get/append/summarize/
+/// trace.append/trace.read）统一寻址 `memory.session`——与本插件 manifest 硬依赖
+/// 声明一致（声明什么就寻址什么，消除"用了未声明的 capability"的旧不一致）。
+pub const CAP_MEMORY: &str = "memory.session";
+pub const CAP_LLM: &str = "llm.chat";
+pub const CAP_TOOLS: &str = "tools.exec";
+pub const CAP_ASSETS: &str = "assets.registry";
 
 /// 保留工具名：路由 assets（读正文 + 装配套工具，R9b），不下发 tools（见 03 §3）。
 pub const RESERVED_LOAD_SKILL: &str = "load_skill";
@@ -111,6 +120,10 @@ pub struct AgentLoopPlugin {
     /// 过程框内的「子代理」框据此实时/重放渲染——否则子代理只有一个静态图标，
     /// 过程不可见（用户感知为卡住）。
     mirrors: Mutex<std::collections::HashMap<String, String>>,
+    /// 已发 sid 的全局下限（A4 卫生）：sid_seq 会话表项在 chat 结束时逐出后，
+    /// 新 seed 取 `max(当前毫秒, floor+1)`——严格大于历史上任何已发 sid，跨回合
+    /// 不碰撞语义在逐出后依然成立。
+    sid_floor: AtomicU64,
 }
 
 /// 构造插件实例（`Arc<dyn Plugin>`）。
@@ -147,6 +160,7 @@ pub fn new(max_rounds: usize) -> PluginInstance {
         turn_starts: Mutex::new(std::collections::HashMap::new()),
         sid_seq: Mutex::new(std::collections::HashMap::new()),
         mirrors: Mutex::new(std::collections::HashMap::new()),
+        sid_floor: AtomicU64::new(0),
     })
 }
 
@@ -177,23 +191,36 @@ impl AgentLoopPlugin {
     /// 递增序号，首个 sid 以 unix 毫秒为种子。跨对话回合不再碰撞（旧 bug：每回合
     /// rounds 从 1 重新计数，前端 doneSids 去重把后一回合的流式动画误判为已定稿帧）。
     pub(crate) fn next_sid(&self, session_id: &str) -> String {
-        let mut m = self.sid_seq.lock().unwrap();
-        let n = match m.get(session_id) {
-            Some(v) => v + 1,
-            None => std::time::SystemTime::now()
+        let n = {
+            let mut m = self.sid_seq.lock().unwrap();
+            let seed = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
-                .unwrap_or(1),
+                .unwrap_or(1);
+            let n = match m.get(session_id) {
+                Some(v) => v + 1,
+                // 表项被逐出（A4）后：seed 取 max(当前毫秒, 全局下限+1)——
+                // 严格大于历史上任何已发 sid，跨回合不碰撞语义不变。
+                None => seed.max(self.sid_floor.load(Ordering::SeqCst) + 1),
+            };
+            m.insert(session_id.to_string(), n);
+            n
         };
-        m.insert(session_id.to_string(), n);
+        self.sid_floor.fetch_max(n, Ordering::SeqCst);
         format!("{session_id}-r{n}")
     }
 
-    /// 跨插件调用便捷封装：复制 trace_id/priority，附 deadline。
+    /// 跨插件调用便捷封装（K2 寻址契约）：按 capability 寻址，复用内核 dispatch
+    /// 全链（B5 快照 / B2 panic 隔离 / B4 背压 / deadline 竞争全部继承）。
+    ///
+    /// trace 语义（诚实记录）：`call_capability` 由内核侧生成新 TraceId，不延续调用
+    /// 链——当前内核 trace_id 零消费者（观测走 memory trace 事件流），无实际回归；
+    /// 待观测需求出现，随内核 0.2.0 演进签名。子代理链（run_subagent）因需要 trace
+    /// 连续性与整体 deadline，仍走 `call_plugin` 并显式拷贝 trace_id。
     async fn call(
         &self,
-        src: &Envelope,
-        target: &str,
+        _src: &Envelope,
+        capability: &str,
         payload: Value,
         deadline: Duration,
     ) -> Result<Value, KernelError> {
@@ -201,11 +228,7 @@ impl AgentLoopPlugin {
             .host
             .get()
             .ok_or_else(|| KernelError::Internal("agent-loop: host not initialized".into()))?;
-        let mut fwd = Envelope::new(PluginId::new(target), payload);
-        fwd.trace_id = src.trace_id;
-        fwd.priority = src.priority;
-        fwd.deadline = Some(deadline);
-        host.call_plugin(fwd).await
+        host.call_capability(capability, payload, deadline).await
     }
 }
 
@@ -333,6 +356,7 @@ mod tests {
             turn_starts: Mutex::new(std::collections::HashMap::new()),
             sid_seq: Mutex::new(std::collections::HashMap::new()),
             mirrors: Mutex::new(std::collections::HashMap::new()),
+            sid_floor: AtomicU64::new(0),
         };
         let s1 = p.next_sid("s-x");
         let s2 = p.next_sid("s-x");

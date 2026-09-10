@@ -27,7 +27,7 @@ impl AgentLoopPlugin {
         if let Ok(name) = std::env::var("PROMPT") {
             if !name.trim().is_empty() {
                 if let Ok(v) = self
-                    .call(src, ID_ASSETS, json!({"op": "prompts.get", "name": name}), ASSETS_DEADLINE)
+                    .call(src, CAP_ASSETS, json!({"op": "prompts.get", "name": name}), ASSETS_DEADLINE)
                     .await
                 {
                     if let Some(c) = v.get("content").and_then(Value::as_str) {
@@ -45,7 +45,7 @@ impl AgentLoopPlugin {
     /// skills.list 附带 root（08 §L1）：root ⊆ WORKSPACE_ROOT 时追加「技能自扩展」授权段——
     /// 模型可用 write_file 创建新技能（文件即注册表，list 每次重扫，下轮对话自动可见）。
     pub(super) async fn skills_appendix(&self, src: &Envelope) -> String {
-        let Ok(v) = self.call(src, ID_ASSETS, json!({"op": "skills.list"}), ASSETS_DEADLINE).await else {
+        let Ok(v) = self.call(src, CAP_ASSETS, json!({"op": "skills.list"}), ASSETS_DEADLINE).await else {
             return String::new();
         };
         let Some(skills) = v.get("skills").and_then(Value::as_array) else {
@@ -124,7 +124,7 @@ impl AgentLoopPlugin {
     pub(super) async fn trace_loaded_skills(&self, env: &Envelope, session_id: &str) -> HashSet<String> {
         let mut out = HashSet::new();
         if let Ok(v) = self
-            .call(env, ID_MEMORY, json!({"op": "trace.read", "session_id": session_id, "after": 0}), MEM_DEADLINE)
+            .call(env, CAP_MEMORY, json!({"op": "trace.read", "session_id": session_id, "after": 0}), MEM_DEADLINE)
             .await
         {
             if let Some(events) = v.get("events").and_then(Value::as_array) {
@@ -150,7 +150,7 @@ impl AgentLoopPlugin {
             return vec![];
         }
         let payload = json!({"op": "skill_tools", "skills": skills});
-        match self.call(env, ID_TOOLS, payload, TOOLS_DEADLINE).await {
+        match self.call(env, CAP_TOOLS, payload, TOOLS_DEADLINE).await {
             Ok(v) => serde_json::from_value(v.get("tools").cloned().unwrap_or(Value::Null)).unwrap_or_default(),
             Err(e) => {
                 tracing::warn!(target: ID, "tools.skill_tools failed, proceeding without skill tools: {e}");
@@ -172,7 +172,7 @@ impl AgentLoopPlugin {
         }
         // ① 注册表取声明（unknown skill → 错误 payload 原样回喂）
         let loaded = match self
-            .call(env, ID_ASSETS, json!({"op": "skills.load", "name": name}), ASSETS_DEADLINE)
+            .call(env, CAP_ASSETS, json!({"op": "skills.load", "name": name}), ASSETS_DEADLINE)
             .await
         {
             Ok(v) if v.get("ok") == Some(&json!(true)) => v,
@@ -234,7 +234,7 @@ impl AgentLoopPlugin {
                 // fail-closed 装载（origin=preset 由 tools 侧装载即启用）
                 let origin = loaded.get("origin").and_then(Value::as_str).unwrap_or("user");
                 match self
-                    .call(env, ID_TOOLS, json!({"op": "install", "path": path, "skill": name, "origin": origin}), TOOLS_DEADLINE)
+                    .call(env, CAP_TOOLS, json!({"op": "install", "path": path, "skill": name, "origin": origin}), TOOLS_DEADLINE)
                     .await
                 {
                     Ok(v) if v.get("ok") == Some(&json!(true)) => {

@@ -91,7 +91,7 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
         match self
             .call(
                 src,
-                ID_MEMORY,
+                CAP_MEMORY,
                 json!({"op": "summarize", "session_id": session_id, "summary": summary, "keep_last": keep}),
                 MEM_DEADLINE,
             )

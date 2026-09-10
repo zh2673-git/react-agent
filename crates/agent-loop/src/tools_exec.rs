@@ -67,7 +67,7 @@ impl AgentLoopPlugin {
             // preset 装载即启用，下一轮起并入会话清单。
             let name = tc.arguments.get("name").and_then(Value::as_str).unwrap_or("");
             let mut v = match self
-                .call(src, ID_ASSETS, json!({"op": "skills.load", "name": name}), ASSETS_DEADLINE)
+                .call(src, CAP_ASSETS, json!({"op": "skills.load", "name": name}), ASSETS_DEADLINE)
                 .await
             {
                 Ok(v) => v,
@@ -99,7 +99,7 @@ impl AgentLoopPlugin {
             v
         } else {
             match self
-                .call(src, ID_TOOLS, json!({"op": "call", "name": tc.name, "args": tc.arguments}), TOOLS_DEADLINE)
+                .call(src, CAP_TOOLS, json!({"op": "call", "name": tc.name, "args": tc.arguments}), TOOLS_DEADLINE)
                 .await
             {
                 Ok(v) => v,
