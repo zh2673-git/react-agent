@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>三方对比 · react-agent × pi × DeepSeek Harness</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --bg:#06070c;
+    --bg2:#0b0d15;
+    --card:rgba(255,255,255,.038);
+    --card2:rgba(255,255,255,.06);
+    --brd:rgba(255,255,255,.09);
+    --brd2:rgba(255,255,255,.16);
+    --txt:#e9ebf3;
+    --txt2:#a4a9bb;
+    --txt3:#6d7288;
+    --ra:#a78bfa; --ra-rgb:167,139,250;
+    --pi:#fbbf24; --pi-rgb:251,191,36;
+    --dsh:#5b7cff; --dsh-rgb:91,124,255;
+    --ok:#34d399; --warn:#fbbf24; --no:#f87171;
+    --radius:18px; --radius-s:12px;
+    --maxw:1180px;
+  }
+  html{scroll-behavior:smooth;scroll-padding-top:80px}
+  body{
+    font-family:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+    background:var(--bg); color:var(--txt); line-height:1.75;
+    -webkit-font-smoothing:antialiased; overflow-x:hidden;
+  }
+  body::before{
+    content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;
+    background:
+      radial-gradient(900px 600px at 12% -5%, rgba(var(--ra-rgb),.16), transparent 60%),
+      radial-gradient(820px 560px at 88% 2%, rgba(var(--dsh-rgb),.14), transparent 62%),
+      radial-gradient(900px 700px at 50% 108%, rgba(var(--pi-rgb),.07), transparent 60%),
+      var(--bg);
+  }
+  body::after{
+    content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
+    background-image:linear-gradient(rgba(255,255,255,.022) 1px,transparent 1px),
+                     linear-gradient(90deg,rgba(255,255,255,.022) 1px,transparent 1px);
+    background-size:56px 56px;
+    -webkit-mask-image:radial-gradient(ellipse 80% 60% at 50% 0%,#000,transparent 75%);
+            mask-image:radial-gradient(ellipse 80% 60% at 50% 0%,#000,transparent 75%);
+  }
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+
+  /* ---------- Nav ---------- */
+  nav{
+    position:sticky;top:0;z-index:50;
+    backdrop-filter:blur(14px) saturate(1.4);-webkit-backdrop-filter:blur(14px) saturate(1.4);
+    background:rgba(6,7,12,.72);border-bottom:1px solid var(--brd);
+  }
+  nav .inner{max-width:var(--maxw);margin:0 auto;padding:12px 24px;display:flex;align-items:center;gap:22px}
+  nav .brand{font-weight:700;font-size:15px;letter-spacing:.2px;display:flex;align-items:center;gap:9px;white-space:nowrap}
+  nav .brand .dot{width:9px;height:9px;border-radius:50%;background:linear-gradient(135deg,var(--ra),var(--dsh));box-shadow:0 0 12px rgba(var(--ra-rgb),.8)}
+  nav .links{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap;justify-content:flex-end}
+  nav .links a{font-size:13px;color:var(--txt2);padding:6px 11px;border-radius:9px;transition:.22s;white-space:nowrap}
+  nav .links a:hover{color:var(--txt);background:var(--card2)}
+  nav .links a.active{color:#fff;background:linear-gradient(135deg,rgba(var(--ra-rgb),.28),rgba(var(--dsh-rgb),.28));border:1px solid var(--brd2)}
+
+  /* ---------- Hero ---------- */
+  header.hero{padding:88px 0 56px;position:relative}
+  .chip{
+    display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--txt2);
+    padding:7px 14px;border:1px solid var(--brd);border-radius:999px;background:var(--card);
+    backdrop-filter:blur(8px);margin-bottom:22px
+  }
+  .chip b{color:var(--txt);font-weight:600}
+  h1.title{
+    font-size:clamp(32px,5.2vw,58px);line-height:1.15;font-weight:800;letter-spacing:-.5px;
+    background:linear-gradient(100deg,#fff 8%,var(--ra) 42%,var(--dsh) 72%,#fff 100%);
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+    margin-bottom:20px
+  }
+  .subtitle{font-size:clamp(15px,1.7vw,18.5px);color:var(--txt2);max-width:780px;line-height:1.85}
+  .subtitle b{color:var(--txt);font-weight:600}
+
+  .hero-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:44px}
+  .hcard{
+    position:relative;border:1px solid var(--brd);border-radius:var(--radius);padding:24px 22px;
+    background:var(--card);overflow:hidden;transition:.3s;
+  }
+  .hcard::before{content:"";position:absolute;inset:0 0 auto 0;height:3px;opacity:.9}
+  .hcard.ra::before{background:linear-gradient(90deg,transparent,var(--ra),transparent)}
+  .hcard.pi::before{background:linear-gradient(90deg,transparent,var(--pi),transparent)}
+  .hcard.dsh::before{background:linear-gradient(90deg,transparent,var(--dsh),transparent)}
+  .hcard:hover{transform:translateY(-5px);border-color:var(--brd2);background:var(--card2)}
+  .hcard .tag{font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;opacity:.9}
+  .hcard.ra .tag{color:var(--ra)} .hcard.pi .tag{color:var(--pi)} .hcard.dsh .tag{color:var(--dsh)}
+  .hcard h3{font-size:20px;margin:10px 0 6px;font-weight:700}
+  .hcard .role{font-size:12.5px;color:var(--txt3);margin-bottom:14px}
+  .hcard .ess{font-size:13.5px;color:var(--txt2);line-height:1.7;min-height:64px}
+  .hcard .stats{display:flex;gap:16px;margin-top:16px;padding-top:15px;border-top:1px solid var(--brd)}
+  .hcard .stat b{display:block;font-size:19px;font-weight:750;letter-spacing:-.3px}
+  .hcard .stat span{font-size:11px;color:var(--txt3)}
+
+  /* ---------- Sections ---------- */
+  section{padding:58px 0}
+  .sec-head{margin-bottom:34px}
+  .sec-head .kicker{font-size:12.5px;letter-spacing:2px;text-transform:uppercase;font-weight:700;color:var(--ra);opacity:.85}
+  .sec-head h2{font-size:clamp(23px,3vw,33px);font-weight:780;letter-spacing:-.3px;margin:8px 0 10px}
+  .sec-head p{color:var(--txt2);font-size:15px;max-width:820px}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+  .panel{border:1px solid var(--brd);border-radius:var(--radius);background:var(--card);padding:24px}
+  .panel h4{font-size:16px;margin-bottom:8px;font-weight:700}
+  .panel p{font-size:13.5px;color:var(--txt2)}
+
+  /* ---------- Radar ---------- */
+  .radar-card{display:grid;grid-template-columns:1.05fr .95fr;gap:26px;align-items:center}
+  .radar-holder{position:relative;width:100%;aspect-ratio:1/1;max-width:460px;margin:0 auto}
+  canvas{width:100%;height:100%;display:block}
+  .legend{display:flex;flex-direction:column;gap:12px;margin-bottom:20px}
+  .legend .item{display:flex;align-items:center;gap:11px;font-size:14px}
+  .legend .swatch{width:14px;height:14px;border-radius:4px;flex:0 0 auto}
+  .legend .item .sc{margin-left:auto;font-weight:700;font-variant-numeric:tabular-nums}
+  .legend .item small{color:var(--txt3);font-size:11.5px}
+  .axis-list{display:flex;flex-direction:column;gap:6px;font-size:12.5px;color:var(--txt3)}
+  .axis-list b{color:var(--txt2)}
+
+  /* ---------- Tables ---------- */
+  .table-wrap{overflow-x:auto;border:1px solid var(--brd);border-radius:var(--radius);background:var(--card)}
+  table{border-collapse:collapse;width:100%;min-width:820px;font-size:13.5px}
+  thead th{
+    position:sticky;top:0;z-index:3;text-align:left;padding:15px 18px;font-weight:700;font-size:13px;
+    background:#0d1019;border-bottom:1px solid var(--brd2);white-space:nowrap;color:var(--txt)
+  }
+  thead th.c-ra{color:var(--ra)} thead th.c-pi{color:var(--pi)} thead th.c-dsh{color:var(--dsh)}
+  tbody td{padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.055);vertical-align:top;color:var(--txt2);line-height:1.65}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover td{background:rgba(255,255,255,.02)}
+  tbody td.dim{color:var(--txt);font-weight:650;white-space:nowrap}
+  td.c-ra{background:rgba(var(--ra-rgb),.045)}
+  tbody tr:hover td.c-ra{background:rgba(var(--ra-rgb),.075)}
+  colgroup col.dimcol{width:16%}
+  .tbl-note{font-size:12px;color:var(--txt3);margin-top:10px}
+  .tbl-title{display:flex;align-items:center;gap:10px;margin:0 0 14px}
+  .tbl-title .n{font-size:12px;font-weight:800;width:26px;height:26px;border-radius:8px;display:grid;place-items:center;background:rgba(var(--ra-rgb),.16);color:var(--ra);border:1px solid rgba(var(--ra-rgb),.3)}
+  .tbl-title h3{font-size:17px;font-weight:720}
+  .stack>*+*{margin-top:34px}
+
+  /* ---------- Matrix pills ---------- */
+  .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:4px 10px;border-radius:999px;white-space:nowrap;border:1px solid transparent}
+  .pill.yes{color:var(--ok);background:rgba(52,211,153,.12);border-color:rgba(52,211,153,.3)}
+  .pill.mid{color:var(--warn);background:rgba(251,191,36,.12);border-color:rgba(251,191,36,.3)}
+  .pill.no{color:var(--no);background:rgba(248,113,113,.12);border-color:rgba(248,113,113,.3)}
+  .feature-name{color:var(--txt);font-weight:600}
+
+  /* ---------- Tradeoff cards ---------- */
+  .trade{border:1px solid var(--brd);border-radius:var(--radius);padding:22px;background:var(--card);position:relative;overflow:hidden}
+  .trade h4{font-size:15.5px;margin-bottom:14px;display:flex;align-items:center;gap:9px}
+  .trade h4 .dot{width:10px;height:10px;border-radius:50%}
+  .trade .row{margin-bottom:13px}
+  .trade .row .lab{font-size:11.5px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:5px}
+  .trade .gain .lab{color:var(--ok)} .trade .cost .lab{color:var(--no)}
+  .trade .row p{font-size:13px;color:var(--txt2)}
+
+  /* ---------- Bar metrics ---------- */
+  .bars{display:flex;flex-direction:column;gap:20px}
+  .bar-row .top{display:flex;justify-content:space-between;font-size:13px;margin-bottom:7px}
+  .bar-row .top b{color:var(--txt);font-weight:600}
+  .bar-track{height:9px;border-radius:999px;background:rgba(255,255,255,.06);overflow:hidden;display:flex;gap:3px;padding:0}
+  .bar-fill{height:100%;border-radius:999px;width:0;transition:width 1.2s cubic-bezier(.2,.8,.2,1)}
+  .bar-ra{background:linear-gradient(90deg,rgba(var(--ra-rgb),.55),var(--ra))}
+  .bar-pi{background:linear-gradient(90deg,rgba(var(--pi-rgb),.55),var(--pi))}
+  .bar-dsh{background:linear-gradient(90deg,rgba(var(--dsh-rgb),.55),var(--dsh))}
+
+  /* ---------- Verdict ---------- */
+  .verdict{border:1px solid var(--brd2);border-radius:22px;padding:34px;background:
+    linear-gradient(135deg,rgba(var(--ra-rgb),.09),rgba(var(--dsh-rgb),.07)),var(--card);position:relative;overflow:hidden}
+  .verdict h3{font-size:22px;font-weight:780;margin-bottom:14px}
+  .verdict p{color:var(--txt2);font-size:15px;line-height:1.9}
+  .verdict p b{color:var(--txt)}
+  .suggest{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:26px}
+  .suggest .s{border:1px solid var(--brd);border-radius:var(--radius-s);padding:18px;background:rgba(0,0,0,.22)}
+  .suggest .s .num{font-size:12px;font-weight:800;color:var(--ra);letter-spacing:1px}
+  .suggest .s h5{font-size:14.5px;margin:7px 0 6px;font-weight:700}
+  .suggest .s p{font-size:12.8px;color:var(--txt2);line-height:1.7}
+
+  /* ---------- Footer ---------- */
+  footer{border-top:1px solid var(--brd);padding:34px 0 54px;margin-top:40px;color:var(--txt3);font-size:12.5px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:14px;justify-content:space-between;align-items:center}
+  footer a{color:var(--txt2);border-bottom:1px dotted var(--txt3)}
+  footer a:hover{color:var(--ra)}
+
+  /* ---------- Reveal ---------- */
+  .reveal{opacity:0;transform:translateY(26px);transition:opacity .7s ease,transform .7s cubic-bezier(.2,.8,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+
+  .toTop{position:fixed;right:22px;bottom:22px;width:44px;height:44px;border-radius:50%;display:grid;place-items:center;
+    border:1px solid var(--brd2);background:rgba(12,14,22,.85);backdrop-filter:blur(8px);cursor:pointer;z-index:40;
+    opacity:0;pointer-events:none;transition:.3s;color:var(--txt2);font-size:18px}
+  .toTop.show{opacity:1;pointer-events:auto}
+  .toTop:hover{color:#fff;border-color:var(--ra)}
+
+  @media(max-width:900px){
+    .hero-cards,.grid3,.suggest{grid-template-columns:1fr}
+    .radar-card,.grid2{grid-template-columns:1fr}
+    nav .links{display:none}
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="inner">
+    <div class="brand"><span class="dot"></span>Agent Harness 三方对比</div>
+    <div class="links">
+      <a href="#essence">本质</a>
+      <a href="#axiom">时空契约</a>
+      <a href="#fundamental">基本面</a>
+      <a href="#matrix">能力矩阵</a>
+      <a href="#tradeoff">取舍</a>
+      <a href="#verdict">结论</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="chip">📌 数据源：<b>react-agent / agent-kernel</b> 为一手源码 · <b>pi / DeepSeek Harness</b> 为公开资料</div>
+    <h1 class="title">三方对比：<br/>react-agent × pi × DeepSeek Harness</h1>
+    <p class="subtitle">
+      三者都主张"最小内核 + 插件化"，都拒绝做"整车"。差异不在理念，而在——
+      <b>插件的空间边界在哪</b>、<b>规则由谁强制</b>、<b>生态做多大</b>。
+      本页用"时空 + 规则"三维公理，把三家一次讲透。
+    </p>
+
+    <div class="hero-cards">
+      <div class="hcard ra reveal">
+        <div class="tag">react-agent</div>
+        <h3>内核外置的编排体</h3>
+        <div class="role">Rust 内核 + 多语言插件（个人作品）</div>
+        <p class="ess">agent-kernel 做时空管家，本仓只做装配器 + ReAct 编排 + 能力 guest。地基是一个独立的、可跨语言复用的运行时内核。</p>
+        <div class="stats">
+          <div class="stat"><b>3</b><span>隔离强度档位</span></div>
+          <div class="stat"><b>9</b><span>内置工具</span></div>
+          <div class="stat"><b>3</b><span>语言混布</span></div>
+        </div>
+      </div>
+      <div class="hcard pi reveal">
+        <div class="tag">pi · earendil-works</div>
+        <h3>极简 TS agent 运行时</h3>
+        <div class="role">TypeScript Monorepo · ~49k ★</div>
+        <p class="ess">5 个正交 npm 包，把模型调用 / 工具 / 上下文 / 会话 / UI 拆成可扩展模块。哲学是"用最少抽象做最多的事"。</p>
+        <div class="stats">
+          <div class="stat"><b>4</b><span>内置工具</span></div>
+          <div class="stat"><b>7+</b><span>Provider</span></div>
+          <div class="stat"><b>5</b><span>核心包</span></div>
+        </div>
+      </div>
+      <div class="hcard dsh reveal">
+        <div class="tag">DeepSeek Harness</div>
+        <h3>一切皆插件的容器</h3>
+        <div class="role">Node + 浏览器 · DeepSeek 官方</div>
+        <p class="ess">基于 Cordis 插件容器，把模型到 UI 全部做成可替换插槽（60+ 官方插件包）。底座 + 积木，配置驱动。</p>
+        <div class="stats">
+          <div class="stat"><b>9</b><span>插件插槽类</span></div>
+          <div class="stat"><b>60+</b><span>官方插件包</span></div>
+          <div class="stat"><b>rc.6</b><span>版本状态</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main>
+
+  <!-- ===== 本质 ===== -->
+  <section id="essence">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="kicker">01 · 本质定义</div>
+        <h2>一句话说清三家是什么</h2>
+        <p>抛开名词看实质：一家在做"地基"，一家在做"可嵌入的框架"，一家在做"官方底座"。定位不同，取舍自然不同。</p>
+      </div>
+
+      <div class="grid3">
+        <div class="panel reveal">
+          <h4 style="color:var(--ra)">🦀 react-agent</h4>
+          <p><b style="color:var(--txt)">"地基之上盖楼"。</b>内核（agent-kernel）是独立产品：只做三件事——开辟/隔离插件的空间、编排执行时间流、强制校验契约与权限。所有能力（LLM/工具/记忆/编排）全是插件，支持不停机热替换。</p>
+        </div>
+        <div class="panel reveal">
+          <h4 style="color:var(--pi)">🥧 pi</h4>
+          <p><b style="color:var(--txt)">"可二次开发的终端 harness"。</b>不是产品，而是 runtime 框架：主程序刻意做薄，把 agent runtime 中最易变、最复杂的部分拆开；用 extensions / skills / provider 注册表让用户不 fork 也能改造行为。</p>
+        </div>
+        <div class="panel reveal">
+          <h4 style="color:var(--dsh)">🐋 DeepSeek Harness</h4>
+          <p><b style="color:var(--txt)">"底座 + 积木"。</b>Model × Environment：模型是灵魂，Harness 给 agent 理解环境、使用工具、持续工作的能力。模型/工具/技能/会话/沙箱/存储/循环/调度/UI 全部可替换。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 时空契约 ===== -->
+  <section id="axiom">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="kicker">02 · 时空 + 规则三维</div>
+        <h2>核心差异：隔离强度、执行流、契约强制</h2>
+        <p>这是本页最硬的一节。三家在"空间怎么隔离、时间怎么推进、规则谁来强制"上的选择，决定了它们在别处的所有取舍。</p>
+      </div>
+
+      <div class="radar-card">
+        <div class="panel reveal" style="padding:18px">
+          <div class="radar-holder"><canvas id="radar"></canvas></div>
+        </div>
+        <div class="reveal">
+          <div class="legend" id="legend"></div>
+          <div class="axis-list" style="margin-bottom:18px">
+            <div><b>评分口径：</b>1–5 分，基于公开资料与本页分析的<b>主观综合评估</b>，非官方数据。</div>
+          </div>
+          <div class="panel" style="margin-top:4px">
+            <h4>🔑 一句话读图</h4>
+            <p><b style="color:var(--ra)">react-agent</b> 的"隔离强度 / 契约强制"拉满，但"生态规模 / 易用上手"最短——典型的<b>内核型项目</b>。</p>
+            <p style="margin-top:8px"><b style="color:var(--pi)">pi</b> 的"生态 / 易用 / 会话上下文"最高，隔离最低——典型的<b>生态型框架</b>。</p>
+            <p style="margin-top:8px"><b style="color:var(--dsh)">dsh</b> 最均衡，可扩展性最突出——典型的<b>官方平台型底座</b>。</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid3" style="margin-top:26px">
+        <div class="panel reveal">
+          <h4>🪐 空间契约（隔离）</h4>
+          <p><b style="color:var(--ra)">react-agent</b>：内核级三档——InProcess / Wasm（线性内存 + 无网络）/ Process（独立进程自愈）。插件独享 PluginContext，跨插件零共享内存。</p>
+          <p style="margin-top:9px"><b style="color:var(--pi)">pi</b>：单进程 TS，工具只 spawn 子进程执行 bash；<b>明确不做沙箱</b>，推荐 Docker/VM 兜底。</p>
+          <p style="margin-top:9px"><b style="color:var(--dsh)">dsh</b>：Node host + 浏览器 client 两半；插件是同进程 npm 包；沙箱是<b>一个插件插槽</b>（isolated）。</p>
+        </div>
+        <div class="panel reveal">
+          <h4>⏱ 时间契约（执行流）</h4>
+          <p><b style="color:var(--ra)">react-agent</b>：内核调度器 = 事件循环 Loop（4 条优先级泳道 + 背压）；agent 主循环本身是<b>编排插件</b>驱动，可替换。</p>
+          <p style="margin-top:9px"><b style="color:var(--pi)">pi</b>：agent-core 的<b>双层嵌套循环</b>（outer turn / inner tool-call），事件驱动 + steering / follow-up 双队列。</p>
+          <p style="margin-top:9px"><b style="color:var(--dsh)">dsh</b>：Cordis 事件循环；Agent Loop 是插件插槽，改行为优先挂钩子而非 fork。</p>
+        </div>
+        <div class="panel reveal">
+          <h4>⚖️ 规则契约（强制力）</h4>
+          <p><b style="color:var(--ra)">react-agent</b>：<b>三层契约 + 编译期硬约束</b>——trait Plugin + ApiVersion（编译期）、kernel.wit/proto（唯一真源）、CapabilityGate <b>deny-by-default</b>（运行时门控）。</p>
+          <p style="margin-top:9px"><b style="color:var(--pi)">pi</b>：TS 类型 + TypeBox schema 校验 + Hook（可 block）；<b>无内核级权限门控</b>。</p>
+          <p style="margin-top:9px"><b style="color:var(--dsh)">dsh</b>：插件契约（npm 包 + patch.yml）+ 配置驱动；强制力在框架/文档层。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 基本面 ===== -->
+  <section id="fundamental">
+    <div class="wrap stack">
+      <div class="sec-head reveal">
+        <div class="kicker">03 · 全景对比</div>
+        <h2>从基本面到工程细节，逐项摊开</h2>
+        <p>四张表覆盖：项目基本面 → 架构与插件模型 → 能力矩阵 → 生态与工程。</p>
+      </div>
+
+      <div class="reveal">
+        <div class="tbl-title"><span class="n">1</span><h3>项目基本面</h3></div>
+        <div class="table-wrap">
+          <table>
+            <colgroup><col class="dimcol"/><col/><col/><col/></colgroup>
+            <thead><tr>
+              <th>维度</th><th class="c-ra">react-agent</th><th class="c-pi">pi</th><th class="c-dsh">DeepSeek Harness</th>
+            </tr></thead>
+            <tbody>
+              <tr><td class="dim">定位</td><td class="c-ra">内核外置的多语言 agent 编排体</td><td>单进程 TS agent 运行时框架</td><td>一切皆插件的官方运行时底座</td></tr>
+              <tr><td class="dim">维护方</td><td class="c-ra">独立开发者（本人同时维护内核 agent-kernel）</td><td>独立开发者 badlogic（libgdx 作者）</td><td>DeepSeek 官方</td></tr>
+              <tr><td class="dim">许可</td><td class="c-ra">MIT OR Apache-2.0</td><td>MIT</td><td>MIT</td></tr>
+              <tr><td class="dim">语言 / 栈</td><td class="c-ra"><b>Rust（内核 + host + loop）+ Python + TypeScript</b></td><td>TypeScript（5 包 monorepo，~675 TS 文件）</td><td>Node.js + 浏览器（Cordis 插件容器）</td></tr>
+              <tr><td class="dim">规模</td><td class="c-ra">~13k 行自研（含 2 个居民：react-agent / mini-agent）</td><td>~96k 行（含 16.4k 行自动生成模型数据）</td><td>60+ 官方插件包 + 128 页白皮书</td></tr>
+              <tr><td class="dim">成熟度</td><td class="c-ra">个人精品 · 2 个居民项目</td><td>~49k ★ · 极度活跃</td><td>官方发布 · rc.6（明示破坏性变更）</td></tr>
+              <tr><td class="dim">形态</td><td class="c-ra">宿主进程 + 4 guest 子进程 + Web/REPL 双前端</td><td>终端 TUI + print / json / rpc + SDK</td><td>Web UI + headless（CI）</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="reveal">
+        <div class="tbl-title"><span class="n">2</span><h3>架构与插件模型</h3></div>
+        <div class="table-wrap">
+          <table>
+            <colgroup><col class="dimcol"/><col/><col/><col/></colgroup>
+            <thead><tr>
+              <th>维度</th><th class="c-ra">react-agent</th><th class="c-pi">pi</th><th class="c-dsh">DeepSeek Harness</th>
+            </tr></thead>
+            <tbody>
+              <tr><td class="dim">内核</td><td class="c-ra"><b>独立产品 agent-kernel</b>：Registry / 调度器 / 生命周期 / 能力门控 / 热替换</td><td>无独立内核，就是 monorepo 分层包</td><td>Cordis 插件容器（JS/TS，热重载 + 依赖注入）</td></tr>
+              <tr><td class="dim">插件粒度</td><td class="c-ra"><b>进程 / 执行域</b>（一 guest = 一进程，可 Rust/Py/TS）</td><td>npm 包 / 目录约定（in-process TS 模块）</td><td>npm 包（host 半 + client 半，一包两态）</td></tr>
+              <tr><td class="dim">装载方式</td><td class="c-ra">4 种：进程内注册 / 子进程 / WASM 组件 / dylib</td><td>扩展目录 + npm 包（jiti / 虚拟模块加载）</td><td>profile 目录 + package.json + patch.yml 合成</td></tr>
+              <tr><td class="dim">扩展点</td><td class="c-ra">新增 guest / InProcess / WASM / dylib 插件</td><td>addTool / addCommand / addContext / Hook</td><td>9 类插槽：Model / Tool / Skills / Session / Sandbox / Storage / Loop / Scheduling / UI</td></tr>
+              <tr><td class="dim">热替换</td><td class="c-ra"><span class="pill yes">✅ 事务性</span> 代际机制，在途请求不撕裂</td><td><span class="pill no">✗ 重启进程</span></td><td><span class="pill yes">✅ 改配置不重启</span></td></tr>
+              <tr><td class="dim">技能机制</td><td class="c-ra">SKILL.md + 保留名路由 load_skill + 配套工具 tools.json</td><td>SKILL.md → 注入 &lt;skill&gt; XML 标签到 prompt，无需代码注册</td><td>SKILL.md 封装团队规范 / SOP</td></tr>
+              <tr><td class="dim">外部工具</td><td class="c-ra">内置 9 件 + MCP 池 + 技能工具池（三层，装载≠启用）</td><td><span class="pill mid">⚠ 故意不做 MCP</span>，靠 extension</td><td>MCP 官方插件包</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 能力矩阵 ===== -->
+  <section id="matrix">
+    <div class="wrap stack">
+      <div class="reveal">
+        <div class="tbl-title"><span class="n">3</span><h3>关键能力矩阵</h3></div>
+        <div class="table-wrap">
+          <table>
+            <colgroup><col class="dimcol"/><col/><col/><col/></colgroup>
+            <thead><tr>
+              <th>能力</th><th class="c-ra">react-agent</th><th class="c-pi">pi</th><th class="c-dsh">DeepSeek Harness</th>
+            </tr></thead>
+            <tbody>
+              <tr><td class="dim feature-name">Provider 覆盖</td><td class="c-ra">4 pack（OpenAI 兼容 / Anthropic / Ollama / Mock）</td><td><b style="color:var(--txt)">7+</b>（Anthropic/OpenAI/Google/Azure/Mistral/Bedrock/Copilot）+ 模型数据驱动 compat</td><td>模型无关抽象，官方适配 DeepSeek V4 系</td></tr>
+              <tr><td class="dim feature-name">内置工具</td><td class="c-ra">9 件（含 grep / symbols_search / MCP）</td><td>4 件（read/write/edit/bash）+ 可选 grep/find/ls</td><td>工具注册表插件（终端 / 文件 / 浏览器 / 企业工具）</td></tr>
+              <tr><td class="dim feature-name">沙箱安全</td><td class="c-ra"><span class="pill yes">✅ fail-closed</span> Windows SAFER 受限令牌，探测失败即移除 bash</td><td><span class="pill no">✗ 不做</span> 推荐 Docker / VM 系统级隔离</td><td><span class="pill mid">插件插槽</span> sandbox: isolated</td></tr>
+              <tr><td class="dim feature-name">会话存储</td><td class="c-ra">JSON（消息整写）+ JSONL（事件只追加）双通道</td><td><b style="color:var(--txt)">树形会话</b>（JSONL，id+parentId，branch/fork/clone/tree）</td><td>Session 插件</td></tr>
+              <tr><td class="dim feature-name">上下文管理</td><td class="c-ra">条数闸 + token 闸 → LLM 摘要 → summarize op；发送前逐级收紧</td><td><b style="color:var(--txt)">/compact /tree /fork /clone</b> + Branch Summary，长上下文一等公民</td><td>Memory 插件 + 前缀瘦身（缓存命中率优化）</td></tr>
+              <tr><td class="dim feature-name">事件日志 / 可观测</td><td class="c-ra">JSONL 只追加 + 内核 ULID trace_id 串联 + Web SSE 重放</td><td>全阶段事件流 + JSONL 会话</td><td>Trace Viewer 插件 + 内核级 trace</td></tr>
+              <tr><td class="dim feature-name">前端</td><td class="c-ra">手写 HTTP/SSE（零框架）+ REPL + Monaco 本地 diff/回滚</td><td>TUI 差分渲染（对齐 60fps）+ Web 组件库</td><td>Web UI（client 半插件，<b style="color:var(--txt)">UI 本身可定制</b>）</td></tr>
+              <tr><td class="dim feature-name">多实例</td><td class="c-ra"><span class="pill yes">✅ 多窗口多实例</span> host spawn 自身，独立端口/会话/回滚</td><td>单会话 CLI</td><td>Web + headless CI</td></tr>
+              <tr><td class="dim feature-name">子代理 / 工作流</td><td class="c-ra">保留工具 task（深度防嵌套 + 事件镜像透传）</td><td>无内置 sub-agent（故意）</td><td>子代理插件 + 工作流插件</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="tbl-note">说明：<span class="pill yes">✅</span> 原生支持　<span class="pill mid">⚠</span> 有限 / 需插件　<span class="pill no">✗</span> 不做。dsh 部分细节源自公开导读资料，以官方仓库为准。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 评分条 ===== -->
+  <section id="scores">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="kicker">04 · 维度评分</div>
+        <h2>七维评分横向对比</h2>
+        <p>同一组数据换一种看法：条形越满，该维度越强。可与上方雷达图对照阅读。</p>
+      </div>
+      <div class="panel reveal">
+        <div class="bars" id="bars"></div>
+        <div class="axis-list" style="margin-top:20px">
+          <div><b>评分口径：</b>1–5 分主观综合评估（依据本页公开资料 + 源码分析），仅用于直观对比，不代表绝对优劣。</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 取舍 ===== -->
+  <section id="tradeoff">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="kicker">05 · 取舍</div>
+        <h2>没有免费的午餐：各自换来了什么、付出了什么</h2>
+        <p>三家都是深思后的取舍，不存在"全都要"。</p>
+      </div>
+
+      <div class="grid3">
+        <div class="trade reveal">
+          <h4><span class="dot" style="background:var(--ra)"></span>react-agent</h4>
+          <div class="row gain"><div class="lab">换来</div><p>最强隔离（进程 / WASM）+ 编译期契约 + 跨语言混布 + 事务性热替换 + 可复用独立内核。</p></div>
+          <div class="row cost"><div class="lab">付出</div><p>① 运行时全在内核，本仓不可直接改；② 插件 = 进程，启动/通信开销大，生态起步慢；③ 单维护者，~13k 行自研。</p></div>
+        </div>
+        <div class="trade reveal">
+          <h4><span class="dot" style="background:var(--pi)"></span>pi</h4>
+          <div class="row gain"><div class="lab">换来</div><p>极简哲学 + 生态易扩展 + 会话树 / 压缩成熟 + 上手极快（一行 createAgentSession）。</p></div>
+          <div class="row cost"><div class="lab">付出</div><p>① 单进程无隔离（作者自陈"不是沙箱"）；② 无 MCP / sub-agent（故意）；③ 改 Loop 需 fork。</p></div>
+        </div>
+        <div class="trade reveal">
+          <h4><span class="dot" style="background:var(--dsh)"></span>DeepSeek Harness</h4>
+          <div class="row gain"><div class="lab">换来</div><p>官方背书 + 插槽最全（含 UI）+ 配置热更新 + 60+ 插件生态 + 成本工程（缓存命中率）。</p></div>
+          <div class="row cost"><div class="lab">付出</div><p>① Node 同进程，隔离靠插件自觉；② rc.6 破坏性变更；③ 插件模型重，学习成本高。</p></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 结论 ===== -->
+  <section id="verdict">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="kicker">06 · 结论</div>
+        <h2>react-agent 的真实位置</h2>
+      </div>
+
+      <div class="verdict reveal">
+        <h3>唯一把"时空 + 规则"做成了独立可复用内核的项目</h3>
+        <p>
+          <b style="color:var(--pi)">pi</b> 赢在<b>生态与易用</b>——把 agent runtime 拆得干净，让二次开发"不 fork 也能改"；
+          <b style="color:var(--dsh)">dsh</b> 赢在<b>官方背书与插槽广度</b>——从模型到 UI 九类插槽，配置驱动；
+          而 <b style="color:var(--ra)">react-agent</b> 是三者中<b>唯一把"空间隔离 + 时间调度 + 规则校验"下沉为独立内核</b>的项目：
+          编译期契约（只依赖 sdk）、运行期能力门控（deny-by-default）、三档隔离（InProcess/Wasm/Process）、事务性热替换——
+          这套能力 pi 没有内核可放，dsh 放在 JS 容器里做不了多语言强隔离。它的天花板最高，但当前<b>最短的板是生态与高层 agent 能力</b>（会话树 / 上下文）。
+        </p>
+
+        <div class="suggest">
+          <div class="s">
+            <div class="num">建议 01</div>
+            <h5>把"内核 + 居民"讲成体系</h5>
+            <p>pi/dsh 是"产品"，react-agent 是"运行时 + 居民"。把 agent-kernel（地基）与 react-agent（旗舰居民）的关系摆到 README 最前面——这是对外最清晰的差异化。</p>
+          </div>
+          <div class="s">
+            <div class="num">建议 02</div>
+            <h5>补会话树（对齐 pi 高价值项）</h5>
+            <p>memory 插件加 parentId / branch，是当前与 pi 差距最大、也最影响真实编码体验的一块，比继续加工具更值。</p>
+          </div>
+          <div class="s">
+            <div class="num">建议 03</div>
+            <h5>落实居民升级纪律</h5>
+            <p>内核可控的优势依赖版本纪律：把 RESIDENTS.md 的升级确认做进发版流水线，否则"地基优势"会退化为"版本漂移风险"。</p>
+          </div>
+        </div>
+      </div>
+
+      <p class="tbl-note" style="margin-top:22px">
+        免责：pi 与 DeepSeek Harness 的信息来自公开资料（GitHub 描述、白皮书导读、源码拆解文章），
+        可能与最新版本存在出入；react-agent / agent-kernel 数据来自本机源码（v0.1.20 / 内核 v0.1.7）。
+        评分与结论为基于上述口径的主观分析，欢迎指正。
+      </p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>Agent Harness 三方对比 · 时空 + 规则视角</div>
+    <div>
+      参考：<a href="https://github.com/zh2673-git/agent-kernel" target="_blank" rel="noopener">agent-kernel</a> ·
+      <a href="https://github.com/zh2673-git/react-agent" target="_blank" rel="noopener">react-agent</a> ·
+      <a href="https://github.com/earendil-works/pi" target="_blank" rel="noopener">pi</a> ·
+      <a href="https://github.com/deepseek-ai/deepseek-harness" target="_blank" rel="noopener">deepseek-harness</a>
+    </div>
+  </div>
+</footer>
+
+<button class="toTop" id="toTop" aria-label="回到顶部">↑</button>
+
+<script>
+(function(){
+  "use strict";
+
+  /* ---------- 评分数据 ---------- */
+  var AXES = ["隔离强度","契约强制","可扩展性","生态规模","易用上手","会话/上下文","可观测"];
+  var SERIES = [
+    { key:"ra",  name:"react-agent",        color:"#a78bfa", rgb:"167,139,250", note:"内核型：隔离与契约拉满", vals:[5,5,4,1.5,2.5,3,4] },
+    { key:"pi",  name:"pi",                 color:"#fbbf24", rgb:"251,191,36",  note:"生态型：易用与上下文最强", vals:[1.5,3,4.5,5,5,5,4.5] },
+    { key:"dsh", name:"DeepSeek Harness",   color:"#5b7cff", rgb:"91,124,255",  note:"平台型：最均衡，扩展最广", vals:[2.5,3.5,5,4.5,3.5,4,4.5] }
+  ];
+
+  /* ---------- 雷达图 ---------- */
+  function drawRadar(progress){
+    var cv = document.getElementById("radar");
+    if(!cv) return;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var W = cv.clientWidth, H = cv.clientHeight;
+    if(W === 0) return;
+    cv.width = W*dpr; cv.height = H*dpr;
+    var ctx = cv.getContext("2d");
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var cx = W/2, cy = H/2 + 2;
+    var R = Math.min(W,H)/2 - Math.max(54, W*0.14);
+    var N = AXES.length;
+    var maxV = 5;
+    var angle = function(i){ return -Math.PI/2 + i*2*Math.PI/N; };
+    var pt = function(i, r){ return [cx + Math.cos(angle(i))*r, cy + Math.sin(angle(i))*r]; };
+
+    // 网格
+    for(var level=1; level<=maxV; level++){
+      ctx.beginPath();
+      for(var i=0;i<N;i++){
+        var p = pt(i, R*level/maxV);
+        if(i===0) ctx.moveTo(p[0],p[1]); else ctx.lineTo(p[0],p[1]);
+      }
+      ctx.closePath();
+      ctx.strokeStyle = level===maxV ? "rgba(255,255,255,.20)" : "rgba(255,255,255,.075)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    // 轴线
+    for(var i2=0;i2<N;i2++){
+      var pe = pt(i2, R);
+      ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(pe[0],pe[1]);
+      ctx.strokeStyle="rgba(255,255,255,.075)"; ctx.stroke();
+    }
+    // 轴标签
+    ctx.font = "600 11.5px 'PingFang SC','Microsoft YaHei',system-ui,sans-serif";
+    ctx.fillStyle = "rgba(164,169,187,.95)";
+    ctx.textBaseline = "middle";
+    for(var i3=0;i3<N;i3++){
+      var lp = pt(i3, R + 22);
+      var cosv = Math.cos(angle(i3)), sinv = Math.sin(angle(i3));
+      if(Math.abs(cosv) < 0.25){ ctx.textAlign="center"; }
+      else if(cosv > 0){ ctx.textAlign="left"; }
+      else { ctx.textAlign="right"; }
+      ctx.fillText(AXES[i3], lp[0], lp[1] + (sinv<-0.5?-4:(sinv>0.5?4:0)));
+    }
+    // 数据多边形
+    SERIES.forEach(function(s){
+      ctx.beginPath();
+      for(var i4=0;i4<N;i4++){
+        var v = s.vals[i4]*progress;
+        var p2 = pt(i4, R*v/maxV);
+        if(i4===0) ctx.moveTo(p2[0],p2[1]); else ctx.lineTo(p2[0],p2[1]);
+      }
+      ctx.closePath();
+      ctx.fillStyle = "rgba("+s.rgb+",.14)";
+      ctx.fill();
+      ctx.strokeStyle = "rgba("+s.rgb+",.95)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // 顶点
+      for(var i5=0;i5<N;i5++){
+        var p3 = pt(i5, R*s.vals[i5]*progress/maxV);
+        ctx.beginPath();
+        ctx.arc(p3[0], p3[1], 2.8, 0, Math.PI*2);
+        ctx.fillStyle = s.color;
+        ctx.fill();
+      }
+    });
+  }
+
+  /* ---------- 图例 ---------- */
+  function buildLegend(){
+    var el = document.getElementById("legend");
+    if(!el) return;
+    SERIES.forEach(function(s){
+      var avg = (s.vals.reduce(function(a,b){return a+b;},0)/s.vals.length).toFixed(1);
+      var d = document.createElement("div");
+      d.className = "item";
+      d.innerHTML =
+        '<span class="swatch" style="background:'+s.color+';box-shadow:0 0 10px rgba('+s.rgb+',.7)"></span>'+
+        '<span>'+s.name+'<br><small>'+s.note+'</small></span>'+
+        '<span class="sc" style="color:'+s.color+'">'+avg+'</span>';
+      el.appendChild(d);
+    });
+  }
+
+  /* ---------- 评分条 ---------- */
+  function buildBars(){
+    var el = document.getElementById("bars");
+    if(!el) return;
+    AXES.forEach(function(axis, idx){
+      var row = document.createElement("div");
+      row.className = "bar-row";
+      var bars = SERIES.map(function(s){
+        var pct = (s.vals[idx]/5*100).toFixed(1);
+        return '<div style="flex:1;display:flex;flex-direction:column;gap:5px">'+
+                 '<div class="bar-track"><div class="bar-fill bar-'+s.key+'" data-w="'+pct+'"></div></div>'+
+                 '<div style="font-size:11px;color:var(--txt3)">'+s.vals[idx]+' / 5 · '+s.name.split(" ")[0]+'</div>'+
+               '</div>';
+      }).join("");
+      row.innerHTML = '<div class="top"><b>'+axis+'</b></div>'+
+                      '<div style="display:flex;gap:14px">'+bars+'</div>';
+      el.appendChild(row);
+    });
+  }
+
+  /* ---------- 动画触发 ---------- */
+  var radarDone = false;
+  function animateRadar(){
+    if(radarDone) return; radarDone = true;
+    var start = null, dur = 1100;
+    function tick(ts){
+      if(!start) start = ts;
+      var t = Math.min((ts-start)/dur, 1);
+      var e = 1 - Math.pow(1-t, 3);
+      drawRadar(e);
+      if(t < 1) requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }
+  function animateBars(){
+    document.querySelectorAll(".bar-fill").forEach(function(b){
+      b.style.width = b.getAttribute("data-w") + "%";
+    });
+  }
+
+  /* ---------- 滚动显现 ---------- */
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(en){
+      if(en.isIntersecting){
+        en.target.classList.add("in");
+        io.unobserve(en.target);
+      }
+    });
+  }, { threshold: .12, rootMargin: "0px 0px -60px 0px" });
+  document.querySelectorAll(".reveal").forEach(function(el){ io.observe(el); });
+
+  /* ---------- 观察雷达 & 条形 ---------- */
+  var secAxiom = document.getElementById("axiom");
+  if(secAxiom){
+    var io2 = new IntersectionObserver(function(es){
+      es.forEach(function(en){ if(en.isIntersecting){ animateRadar(); io2.disconnect(); } });
+    }, { threshold:.25 });
+    io2.observe(secAxiom);
+  }
+  var secScores = document.getElementById("scores");
+  if(secScores){
+    var io3 = new IntersectionObserver(function(es){
+      es.forEach(function(en){ if(en.isIntersecting){ animateBars(); io3.disconnect(); } });
+    }, { threshold:.25 });
+    io3.observe(secScores);
+  }
+
+  /* ---------- 重绘 ---------- */
+  var rt;
+  window.addEventListener("resize", function(){
+    clearTimeout(rt);
+    rt = setTimeout(function(){ drawRadar(radarDone ? 1 : 0); }, 160);
+  });
+
+  /* ---------- 导航高亮 ---------- */
+  var links = Array.prototype.slice.call(document.querySelectorAll("nav .links a"));
+  var sections = links.map(function(a){ return document.querySelector(a.getAttribute("href")); });
+  function spy(){
+    var y = window.scrollY + 120, cur = -1;
+    sections.forEach(function(s, i){ if(s && s.offsetTop <= y) cur = i; });
+    links.forEach(function(a, i){ a.classList.toggle("active", i === cur); });
+  }
+  window.addEventListener("scroll", spy, { passive:true });
+
+  /* ---------- 回到顶部 ---------- */
+  var toTop = document.getElementById("toTop");
+  window.addEventListener("scroll", function(){
+    toTop.classList.toggle("show", window.scrollY > 600);
+  }, { passive:true });
+  toTop.addEventListener("click", function(){ window.scrollTo({ top:0, behavior:"smooth" }); });
+
+  /* ---------- 初始化 ---------- */
+  buildLegend();
+  buildBars();
+  drawRadar(0);
+  spy();
+  window.addEventListener("load", function(){ drawRadar(0); });
+})();
+</script>
+</body>
+</html>
