@@ -180,14 +180,77 @@ async fn assemble(kernel: &Kernel, cfg: &HostConfig) -> anyhow::Result<()> {
         // 硬依赖判定收窄：guest 进程存活 = 依赖就位；云端联通性降级 warn（chat 时自然报错）
         tracing::warn!("llm-adapter 云端 ping 未通过（启动继续，chat 时会报错，可在 web 设置重配）: {e}");
     }
+    let assets_ok = r_assets.is_ok();
     if let Err(e) = r_assets {
         tracing::warn!("assets 探测失败（软依赖，降级为无技能模式）: {e}");
+    }
+
+    // R18（技能工具池预热）：池是 tools 进程内存态（装载≠启用），重启即空——技能 tab
+    // 的配套工具视图（tools.skill_tools）与对话清单都会空手而归。此处按注册表逐技能
+    // 静默重装（幂等：preset 装载即启用、用户技能经 TOOLS_ENABLED 延迟启用还原；与
+    // agent-loop 开局重装同款语义）。失败仅 warn 不阻断启动（chat 侧另有开局重装兜底）。
+    if assets_ok {
+        match warm_skill_tools(kernel).await {
+            Ok(n) if n > 0 => tracing::info!("技能工具池预热完成（{n} 个技能装载）"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("技能工具池预热失败（不阻断启动，chat 侧开局会重试）: {e}"),
+        }
     }
 
     // 5. agent-loop（InProcess，硬依赖已全部就位）
     kernel.register(react_agent_agent_loop::new(cfg.max_rounds)).await;
     tracing::info!("agent-loop registered (max_rounds={})", cfg.max_rounds);
     Ok(())
+}
+
+/// R18：技能工具池启动预热——逐技能 assets.load → tools.install（幂等，同 agent-loop
+/// 开局重装语义）。返回成功装载的技能数。
+async fn warm_skill_tools(kernel: &Kernel) -> anyhow::Result<usize> {
+    let list = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        kernel.dispatch(Envelope::new(PluginId::new("assets"), json!({"op": "skills.list"}))),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("skills.list 探测超时"))??;
+    let names: Vec<String> = list
+        .get("skills")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let mut warmed = 0usize;
+    for name in names {
+        let loaded = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            kernel.dispatch(Envelope::new(PluginId::new("assets"), json!({"op": "skills.load", "name": name}))),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("skills.load({name}) 超时"))??;
+        if loaded.get("ok") != Some(&json!(true)) {
+            continue;
+        }
+        let Some(path) = loaded
+            .get("tools_manifest")
+            .and_then(|m| m.get("path"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue; // 纯文档技能无配套工具
+        };
+        let origin = loaded.get("origin").and_then(Value::as_str).unwrap_or("user");
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            kernel.dispatch(Envelope::new(PluginId::new("tools"), json!({"op": "install", "path": path, "skill": name, "origin": origin}))),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("tools.install({name}) 超时"))??;
+        match r.get("ok") {
+            Some(&json!(true)) => warmed += 1,
+            other => tracing::warn!("技能工具预热装载失败（skill={name}）: {other:?}"),
+        }
+    }
+    Ok(warmed)
 }
 
 /// bash 沙箱装配（05 §2.1 宿主层 fail-closed）：
