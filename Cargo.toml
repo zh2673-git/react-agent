@@ -4,8 +4,9 @@ members = ["crates/agent-loop", "crates/host"]
 
 [workspace.package]
 # 版本号 = react-agent 发布序号（随功能发布 +1，与 git tag v<version> 同步）。
-# 内核兼容性由下方 dependency 的 tag 表达（升级内核时单独提交说明），不再与本版本号对齐。
-version = "0.1.13"
+# 版本线独立于内核（内核 v0.1.x/v0.2.x 演进不影响本序号）；内核兼容性由下方
+# dependency 的 tag 表达（升级内核时单独提交说明）。
+version = "0.1.14"
 edition = "2021"
 
 [workspace.dependencies]
