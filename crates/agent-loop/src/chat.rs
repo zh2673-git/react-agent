@@ -153,6 +153,7 @@ impl AgentLoopPlugin {
         tools: Option<&[ToolSpec]>,
         stream: Option<(&str, &str)>,
         cfg: &AgentLoopConfig,
+        retries: &mut u32,
     ) -> Result<LlmChatResp, KernelError> {
         let attempts = cfg.retry_attempts;
         let base = cfg.retry_base_ms;
@@ -190,6 +191,7 @@ impl AgentLoopPlugin {
                 Ok(r) => r.error.as_ref().map(|e| e.to_string()).unwrap_or_default(),
             };
             tracing::warn!(target: ID, session = %session_id, attempt, delay, "llm transient failure, retrying: {reason}");
+            *retries += 1;
             self.trace(
                 src,
                 session_id,
@@ -297,6 +299,11 @@ impl AgentLoopPlugin {
         let stream_path = stream_file_for(cfg.stream_dir.as_deref(), &req.session_id);
         let mut usage = UsageAcc::default();
         let mut llm_ms: u64 = 0;
+        // E4-minimal：指标随 assistant 事件外抛（复用既有 trace 通道，不建新系统）——
+        // llm_calls = 实际 LLM 轮数；retries = 瞬态重试次数；tool_failures = 失败工具数。
+        let mut llm_calls: u32 = 0;
+        let mut retries: u32 = 0;
+        let mut tool_failures: u32 = 0;
         // 总预算（T4）：顶层取配置缺省；子代理继承父链衰减后的剩余（req.*_left）。
         let budget = ChatBudget {
             deadline: req
@@ -325,13 +332,17 @@ impl AgentLoopPlugin {
                     return v;
                 }
             };
-            let resp = match self.plan_with_retry(env, &req.session_id, &mut messages, Some(&tools), stream, &cfg).await {
+            let resp = match self
+                .plan_with_retry(env, &req.session_id, &mut messages, Some(&tools), stream, &cfg, &mut retries)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     self.trace(env, &req.session_id, json!({"type": "error", "where": "llm.chat", "message": e.to_string()})).await;
                     return json!({"ok": false, "error": {"code": e.code(), "message": format!("llm chat failed: {e}")}});
                 }
             };
+            llm_calls += 1;
             usage.add(resp.usage.as_ref());
             llm_ms += resp.elapsed_ms.unwrap_or(0);
             if !resp.ok {
@@ -346,7 +357,10 @@ impl AgentLoopPlugin {
             }
             if resp.tool_calls.is_empty() {
                 return self
-                    .finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms, std::mem::take(&mut round_reasonings), &cfg)
+                    .finish(
+                        env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms,
+                        std::mem::take(&mut round_reasonings), &cfg, llm_calls, retries, tool_failures,
+                    )
                     .await;
             }
             // 中间轮（带工具调用的轮次）思考留痕：最终轮由 finish 自行追加
@@ -410,6 +424,9 @@ impl AgentLoopPlugin {
                         }
                     }
                     steps.push(StepRecord { round: rounds, tool: tc.name.clone(), ms });
+                    if result.get("ok") != Some(&json!(true)) {
+                        tool_failures += 1;
+                    }
                     self.act_end(env, &req.session_id, rounds, tc, &result, ms, &cfg).await;
                     round_msgs.push(MemoryMsg {
                         role: "tool".into(),
@@ -447,7 +464,10 @@ impl AgentLoopPlugin {
                 return v;
             }
         };
-        let resp = match self.plan_with_retry(env, &req.session_id, &mut messages, None, stream, &cfg).await {
+        let resp = match self
+            .plan_with_retry(env, &req.session_id, &mut messages, None, stream, &cfg, &mut retries)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 self.trace(env, &req.session_id, json!({"type": "error", "where": "llm.chat", "message": e.to_string()})).await;
@@ -456,9 +476,13 @@ impl AgentLoopPlugin {
         };
         usage.add(resp.usage.as_ref());
         llm_ms += resp.elapsed_ms.unwrap_or(0);
+        llm_calls += 1;
         if resp.ok && resp.tool_calls.is_empty() {
             return self
-                .finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms, std::mem::take(&mut round_reasonings), &cfg)
+                .finish(
+                    env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms,
+                    std::mem::take(&mut round_reasonings), &cfg, llm_calls, retries, tool_failures,
+                )
                 .await;
         }
         self.trace(env, &req.session_id, json!({"type": "error", "where": "max_rounds", "message": format!("agent loop exhausted max_rounds={max_rounds}")})).await;
@@ -485,6 +509,9 @@ impl AgentLoopPlugin {
         llm_ms: u64,
         mut round_reasonings: Vec<(u32, String)>,
         cfg: &AgentLoopConfig,
+        llm_calls: u32,
+        retries: u32,
+        tool_failures: u32,
     ) -> Value {
         let answer = resp.content.clone().unwrap_or_default();
         if answer.trim().is_empty() {
@@ -536,6 +563,7 @@ impl AgentLoopPlugin {
                 "reasonings": reasonings_json,
                 "usage": usage.to_value(),
                 "elapsed_ms": llm_ms,
+                "metrics": {"llm_calls": llm_calls, "retries": retries, "tool_failures": tool_failures},
             }),
         )
         .await;

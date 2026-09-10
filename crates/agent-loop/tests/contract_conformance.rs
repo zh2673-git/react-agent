@@ -255,9 +255,14 @@ async fn scripted_chat_fulfills_all_wire_contracts() {
     }
     // ② sid 形状（llm-adapter _SID_RE / 前端 doneSids 依赖）
     let assistant = &types_of("assistant")[0];
-    for k in ["answer", "rounds", "sid", "reasonings", "usage", "elapsed_ms"] {
+    for k in ["answer", "rounds", "sid", "reasonings", "usage", "elapsed_ms", "metrics"] {
         assert!(assistant.get(k).is_some(), "assistant 缺 {k}: {assistant}");
     }
+    // E4-minimal：指标随 assistant 事件外抛（脚本场景：2 轮 LLM、0 重试、0 工具失败）
+    let metrics = &assistant["metrics"];
+    assert_eq!(metrics["llm_calls"], json!(2), "{assistant:?}");
+    assert_eq!(metrics["retries"], json!(0));
+    assert_eq!(metrics["tool_failures"], json!(0));
     let sid = assistant["sid"].as_str().expect("sid");
     let digits = sid.strip_prefix("s1-r").expect("sid 前缀");
     assert!(!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()), "sid 形状 {sid}");

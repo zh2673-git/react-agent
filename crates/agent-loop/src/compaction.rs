@@ -75,7 +75,12 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             attachments: None,
         });
         // 压缩摘要不是用户可见输出 → 不走流式旁路；瞬态失败同样重试（T3）
-        let summary = match self.plan_with_retry(src, session_id, &mut sum_msgs, None, None, cfg).await {
+        // （压缩的重试不进主链 metrics——口径为用户可见回合的 LLM 调用）
+        let mut compaction_retries = 0u32;
+        let summary = match self
+            .plan_with_retry(src, session_id, &mut sum_msgs, None, None, cfg, &mut compaction_retries)
+            .await
+        {
             Ok(r) if r.ok => r.content.unwrap_or_default(),
             Ok(r) => {
                 tracing::warn!(target: ID, "compaction llm failed, keeping full history: {:?}", r.error);
