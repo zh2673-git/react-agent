@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "agent-kernel-conformance"
 version = "0.1.0"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.6#895578983c455a8ae66b9a534bd6f716bef2f828"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.7#b5fdb7fc22a2d5b17a0c8756c603ef5dea21d116"
 dependencies = [
  "agent-kernel-core",
  "agent-kernel-kernel",
@@ -17,8 +17,8 @@ dependencies = [
 
 [[package]]
 name = "agent-kernel-core"
-version = "0.1.4"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.6#895578983c455a8ae66b9a534bd6f716bef2f828"
+version = "0.1.7"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.7#b5fdb7fc22a2d5b17a0c8756c603ef5dea21d116"
 dependencies = [
  "serde",
  "serde_json",
@@ -28,8 +28,8 @@ dependencies = [
 
 [[package]]
 name = "agent-kernel-kernel"
-version = "0.1.4"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.6#895578983c455a8ae66b9a534bd6f716bef2f828"
+version = "0.1.7"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.7#b5fdb7fc22a2d5b17a0c8756c603ef5dea21d116"
 dependencies = [
  "agent-kernel-core",
  "agent-kernel-process",
@@ -51,8 +51,8 @@ dependencies = [
 
 [[package]]
 name = "agent-kernel-process"
-version = "0.1.4"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.6#895578983c455a8ae66b9a534bd6f716bef2f828"
+version = "0.1.7"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.7#b5fdb7fc22a2d5b17a0c8756c603ef5dea21d116"
 dependencies = [
  "agent-kernel-core",
  "agent-kernel-sdk",
@@ -69,8 +69,8 @@ dependencies = [
 
 [[package]]
 name = "agent-kernel-sdk"
-version = "0.1.4"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.6#895578983c455a8ae66b9a534bd6f716bef2f828"
+version = "0.1.7"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.7#b5fdb7fc22a2d5b17a0c8756c603ef5dea21d116"
 dependencies = [
  "agent-kernel-core",
  "anyhow",
@@ -800,7 +800,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "react-agent-agent-loop"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "agent-kernel-conformance",
  "agent-kernel-kernel",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "react-agent-host"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "agent-kernel-kernel",
  "agent-kernel-process",

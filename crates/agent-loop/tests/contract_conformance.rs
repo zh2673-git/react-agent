@@ -94,6 +94,7 @@ async fn scripted_chat_fulfills_all_wire_contracts() {
     let trace_events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
     let llm_payloads: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
     let tool_calls_in: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
+    let llm_traces: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
 
     // memory：记录 op 面 + 捕获 trace 事件 + 维护消息存储
     let memory = {
@@ -133,9 +134,10 @@ async fn scripted_chat_fulfills_all_wire_contracts() {
         )
     };
 
-    // llm：两轮脚本（① 要两个工具 ② 最终答案），捕获完整 payload
+    // llm：两轮脚本（① 要两个工具 ② 最终答案），捕获完整 payload + 调用链 trace
     let llm = {
         let payloads = llm_payloads.clone();
+        let traces = llm_traces.clone();
         let seq = Arc::new(Mutex::new(vec![
             json!({"ok": true, "content": null, "tool_calls": [
                 {"id": "c1", "name": "write_file", "arguments": {"path": "outputs/report.md", "content": "hi"}},
@@ -149,9 +151,12 @@ async fn scripted_chat_fulfills_all_wire_contracts() {
             &["llm.chat"],
             Arc::new(move |env: &Envelope| {
                 let payloads = payloads.clone();
+                let traces = traces.clone();
                 let seq = seq.clone();
                 let payload = env.payload.clone();
+                let tid = env.trace_id.to_string();
                 Box::pin(async move {
+                    traces.lock().unwrap().push(tid);
                     payloads.lock().unwrap().push(payload);
                     let mut s = seq.lock().unwrap();
                     if s.len() > 1 {
@@ -269,6 +274,11 @@ async fn scripted_chat_fulfills_all_wire_contracts() {
 
     // ③/⑧ llm.chat payload 面：messages + tools + stream_path + sid；旁路路径规则
     assert_eq!(payloads.len(), 2, "两轮各一次 llm.chat");
+    // S1（v0.1.7 消费）：两轮调用链 trace 贯穿且同源
+    let traces = llm_traces.lock().unwrap().clone();
+    assert_eq!(traces.len(), 2);
+    assert!(!traces[0].is_empty());
+    assert_eq!(traces[0], traces[1], "两轮 llm.chat 必须同属一条调用链 trace");
     for p in &payloads {
         assert!(p.get("messages").and_then(Value::as_array).map_or(false, |a| !a.is_empty()), "缺 messages");
         assert!(p.get("tools").and_then(Value::as_array).is_some(), "缺 tools");

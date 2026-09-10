@@ -16,5 +16,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 agent-kernel-kernel.workspace = true
-# A3：出生证明套件（第三个数据点，内核 1.0 收敛条件 #2）
-agent-kernel-conformance = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.6" }
+# A3：出生证明套件（第三个数据点，内核 0.2.0 收敛条件 #3）
+agent-kernel-conformance = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.7" }

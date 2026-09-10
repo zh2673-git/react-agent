@@ -203,16 +203,15 @@ impl AgentLoopPlugin {
         format!("{session_id}-r{n}")
     }
 
-    /// 跨插件调用便捷封装（K2 寻址契约）：按 capability 寻址，复用内核 dispatch
-    /// 全链（B5 快照 / B2 panic 隔离 / B4 背压 / deadline 竞争全部继承）。
+    /// 跨插件调用便捷封装（K2 寻址契约 + S1 贯穿，v0.1.7 消费）：按 capability 寻址，
+    /// 复用内核 dispatch 全链（B5 快照 / B2 panic 隔离 / B4 背压 / deadline 竞争全部继承）。
     ///
-    /// trace 语义（诚实记录）：`call_capability` 由内核侧生成新 TraceId，不延续调用
-    /// 链——当前内核 trace_id 零消费者（观测走 memory trace 事件流），无实际回归；
-    /// 待观测需求出现，随内核 0.2.0 演进签名。子代理链（run_subagent）因需要 trace
-    /// 连续性与整体 deadline，仍走 `call_plugin` 并显式拷贝 trace_id。
+    /// trace/priority：显式延续调用链的 trace_id 与 priority——内核 `call_capability_as`
+    /// 使寻址路径与 call_plugin 同权；此前的"每次新 trace"缺口随内核 v0.1.7 闭合。
+    /// 子代理链（run_subagent）仍走 `call_plugin`（trace 连续 + 整体 deadline 语义不变）。
     async fn call(
         &self,
-        _src: &Envelope,
+        src: &Envelope,
         capability: &str,
         payload: Value,
         deadline: Duration,
@@ -221,7 +220,8 @@ impl AgentLoopPlugin {
             .host
             .get()
             .ok_or_else(|| KernelError::Internal("agent-loop: host not initialized".into()))?;
-        host.call_capability(capability, payload, deadline).await
+        host.call_capability_as(capability, src.trace_id, src.priority, payload, deadline)
+            .await
     }
 }
 
@@ -249,15 +249,23 @@ impl Plugin for AgentLoopPlugin {
                 } else {
                     self.cancels.lock().unwrap().insert(sid.to_string());
                     tracing::info!(target: ID, session = %sid, "cancel requested");
-                    // T7（工具级取消）：联动 tools `abort` op——终止该会话运行中的工具子进程
-                    //（技能工具等），使"点停止"对工具执行段也生效（此前需等 deadline）。
-                    // 即发即忘 + 2s 上限；失败仅记录——轮次边界取消仍兜底。
+                    // T7/T8（v0.1.7 消费）：联动 tools `abort` op——终止该会话运行中的
+                    // 工具子进程，使"点停止"对工具执行段也生效。System 优先级走专用
+                    // 泳道（T8），满载 chat 下不再排队；即发即忘 + 2s 上限；失败仅
+                    // 记录——轮次边界取消仍兜底。
                     if let Some(host) = self.host.get() {
                         let host = host.clone();
                         let payload = json!({"op": "abort", "session_id": sid});
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                host.call_capability(CAP_TOOLS, payload, std::time::Duration::from_secs(2)).await
+                            if let Err(e) = host
+                                .call_capability_as(
+                                    CAP_TOOLS,
+                                    TraceId::new(),
+                                    Priority::System,
+                                    payload,
+                                    std::time::Duration::from_secs(2),
+                                )
+                                .await
                             {
                                 tracing::debug!(target: ID, "tools abort dispatch failed: {e}");
                             }
