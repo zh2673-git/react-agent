@@ -9,12 +9,12 @@ version = "0.1.13"
 edition = "2021"
 
 [workspace.dependencies]
-# 内核（发布版：git 依赖，锁定 v0.1.3 —— K1 hot_swap 补 drain（B4 闭合）/ K3 事件总线收口（K505 fail-fast）/ K4 step/trace_id 弃用标注）
-agent-kernel-sdk = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.3" }
-agent-kernel-kernel = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.3", features = [
+# 内核（发布版：git 依赖，锁定 v0.1.4 —— K2 capability 寻址（call_capability + K404）；P0 三项修复随行）
+agent-kernel-sdk = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.4" }
+agent-kernel-kernel = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.4", features = [
     "process",
 ] }
-agent-kernel-process = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.3" }
+agent-kernel-process = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.4" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
