@@ -1647,25 +1647,63 @@ async fn load_skill_installs_companion_tools_for_preset() {
 async fn session_skill_tools_replayed_from_trace_at_chat_start() {
     // 会话技能集从 trace 重放推导：预置 skill_loaded 事件 → 新对话开局清单即含已启用技能工具
     //（同会话技能作用域经重放恢复；子代理新会话不继承）。
+    // R18 重启恢复：技能工具池是 tools 进程内存态（重启即空）——开局必须先静默重装
+    //（assets.load → tools.install）再装配清单，且不重发 skill_* 事件。
     let _env_guard = ENV_LOCK.lock().unwrap();
     let events = Arc::new(Mutex::new(vec![json!({"type": "skill_loaded", "skill": "demo", "ts": 1})]));
     let payload_caps = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let install_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
     let ok = json!({"ok": true, "content": "hi", "tool_calls": [], "model": "mock", "finish_reason": "stop"});
     let cap2 = payload_caps.clone();
     let llm = MockPlugin::simple("llm-adapter", &["llm.chat"], move |env| {
         cap2.lock().unwrap().push(env.payload.clone());
         ok.clone()
     });
+    // assets mock：skills.load 带 tools_manifest（触发 R18 重装链）——不用共享 mock_assets
+    //（其无声明，重装为空操作，无法断言本行为）
+    let assets = MockPlugin::simple("assets", &["assets.registry"], |env| {
+        match env.payload.get("op").and_then(|v| v.as_str()) {
+            Some("skills.load") => json!({"ok": true, "content": "BODY", "origin": "preset",
+                "tools_manifest": {"path": "D:/skills/demo/tools.json"}}),
+            Some("skills.list") => json!({"ok": true, "skills": [{"name": "demo"}]}),
+            Some("prompts.get") => json!({"ok": true, "content": "PROMPT_TEMPLATE"}),
+            _ => json!({"ok": false, "error": {"code": "K400", "message": "bad op"}}),
+        }
+    });
     let kernel = boot(vec![
-        mock_memory_traced(Arc::new(Mutex::new(vec![])), events),
+        mock_memory_traced(Arc::new(Mutex::new(vec![])), events.clone()),
         llm,
-        mock_tools_r9(Arc::new(Mutex::new(vec![])), json!({"name": "skill_echo", "description": "d", "parameters": {}})),
-        mock_assets("BODY"),
+        mock_tools_r9(install_log.clone(), json!({"name": "skill_echo", "description": "d", "parameters": {}})),
+        assets,
         agent_loop(8),
     ])
     .await;
     let r = chat(&kernel, "fresh turn").await;
     assert_eq!(r["ok"], json!(true), "{r}");
+
+    // R18：开局静默重装被触发（池恢复），且不重发 skill_installed/skill_loaded 事件
+    let installs = install_log.lock().unwrap();
+    assert_eq!(installs.len(), 1, "重放恢复的技能必须开局重装: {installs:?}");
+    assert_eq!(installs[0]["op"], json!("install"));
+    assert_eq!(installs[0]["skill"], json!("demo"));
+    assert_eq!(installs[0]["path"], json!("D:/skills/demo/tools.json"));
+    let evs: Vec<String> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.get("type").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    // 预置重放事件本身含 1 条 skill_loaded——断言「不新增」：skill_loaded 仍恰好 1 条，
+    // skill_installed（装编排事件）一条都不该有
+    assert_eq!(
+        evs.iter().filter(|t| *t == "skill_loaded").count(),
+        1,
+        "重装不得重发 skill_loaded（仅保留重放预置那条）: {evs:?}"
+    );
+    assert!(
+        !evs.iter().any(|t| t == "skill_installed"),
+        "重装不得发 skill_installed（防 trace/前端刷屏）: {evs:?}"
+    );
 
     let caps = payload_caps.lock().unwrap();
     let tools = caps[0]["tools"].as_array().expect("tools present");

@@ -287,6 +287,23 @@ impl AgentLoopPlugin {
         // 会话技能集从 trace 重放推导（skill_loaded 事件）；失败降级为空不阻断主流程。
         let mut loaded_skills = self.trace_loaded_skills(env, &req.session_id).await;
         if !loaded_skills.is_empty() {
+            // R18（重启恢复）：技能工具池是 tools 侧进程内存态（装载≠启用，重启即空）——
+            // 重放恢复的作用域若不重装，skill_tools 空手而归、模型看不到已加载技能的工具。
+            // 此处按注册声明静默重装（assets.load → tools.install，幂等：同技能覆写入池、
+            // preset 装载即启用、用户技能经 TOOLS_ENABLED 延迟启用还原）；不重发
+            // skill_loaded/skill_installed 事件（作用域已由重放恢复，避免 trace/前端刷屏）。
+            // 技能已不可用（被删/改名）→ 装载自然失败，清单装配为空，不报错打断主流程。
+            for name in &loaded_skills {
+                match self
+                    .call(env, CAP_ASSETS, json!({"op": "skills.load", "name": name}), ASSETS_DEADLINE)
+                    .await
+                {
+                    Ok(v) if v.get("ok") == Some(&json!(true)) => {
+                        let _ = self.install_skill_tools(env, name, &v).await;
+                    }
+                    _ => {}
+                }
+            }
             tools.extend(self.session_skill_tools(env, &loaded_skills).await);
         }
 
