@@ -9,6 +9,92 @@ use super::config::AgentLoopConfig;
 use super::*;
 use std::time::Instant;
 
+// ── R16：观测计划（胸牌驱动） ────────────────────────────────────────────────
+
+/// 从工具胸牌（`ToolSpec.obs`）解析出的观测策略。编排层据此分派产物/变更/来源
+/// 登记，对工具名**零知识**——换工具集、改工具名不再弄瞎前端卡片。
+#[derive(Debug, Default, Clone)]
+pub(super) struct ObsPlan {
+    artifacts: Option<ObsArtifacts>,
+    changes: Option<ObsChanges>,
+    sources: Option<ObsSources>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ObsArtifacts {
+    /// result.path/bytes 结构化承载（write_file 形态）
+    Structured,
+    /// result.output 自由文本启发式扫描（bash 形态）
+    OutputText,
+}
+
+#[derive(Debug, Clone)]
+struct ObsChanges {
+    /// file_change 事件的 op 值（前端变更 chip 标签）
+    op: String,
+    /// true = result.changes[] 逐条展开（每条自带 path/undo）；false = 结果即一次变更
+    list: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ObsSources {
+    /// result.results[]{title,url}（web_search 形态）
+    ResultList,
+    /// result.url 单链接（web_read 形态）
+    SingleUrl,
+}
+
+impl ObsPlan {
+    /// 解析观测计划：胸牌优先，沉默才查遗留注册表。未知取值按未声明处理
+    /// （胸牌新增枚举值对旧编排层透明降级，不 panic 不误登记）。
+    pub(super) fn resolve(name: &str, obs: Option<&ToolObs>) -> Self {
+        let Some(o) = obs else {
+            return Self::legacy(name);
+        };
+        Self {
+            artifacts: match o.artifacts.as_deref() {
+                Some("structured") => Some(ObsArtifacts::Structured),
+                Some("output_text") => Some(ObsArtifacts::OutputText),
+                _ => None,
+            },
+            changes: o.changes.as_ref().map(|c| ObsChanges {
+                op: c.op.clone(),
+                list: c.from.as_deref() == Some("change_list"),
+            }),
+            sources: match o.sources.as_deref() {
+                Some("result_list") => Some(ObsSources::ResultList),
+                Some("single_url") => Some(ObsSources::SingleUrl),
+                _ => None,
+            },
+        }
+    }
+
+    /// 遗留注册表（obs 未声明时的回落，仅覆盖五个内置名）。**只减不增**——
+    /// 新工具/改名工具必须经 ToolSpec.obs 声明（胸牌），否则不产生卡片事件。
+    fn legacy(name: &str) -> Self {
+        match name {
+            "write_file" => Self {
+                artifacts: Some(ObsArtifacts::Structured),
+                changes: Some(ObsChanges { op: "write".into(), list: false }),
+                sources: None,
+            },
+            "edit_file" => Self {
+                artifacts: Some(ObsArtifacts::Structured),
+                changes: Some(ObsChanges { op: "edit".into(), list: false }),
+                sources: None,
+            },
+            "bash" => Self {
+                artifacts: Some(ObsArtifacts::OutputText),
+                changes: Some(ObsChanges { op: "bash".into(), list: true }),
+                sources: None,
+            },
+            "web_search" => Self { sources: Some(ObsSources::ResultList), ..Default::default() },
+            "web_read" => Self { sources: Some(ObsSources::SingleUrl), ..Default::default() },
+            _ => Self::default(),
+        }
+    }
+}
+
 /// 按字符截断（UTF-8 安全）。超限时追加省略标记——模型必须能感知结果被裁剪，
 /// 而非把残缺内容当作完整事实。
 pub(super) fn truncate_chars(s: &str, max: usize) -> String {
@@ -122,6 +208,7 @@ impl AgentLoopPlugin {
 
     /// 行动收尾：tool_result 观测。`ms` 为该工具自身耗时（并行下与墙钟无关）；
     /// `memory_truncated` 表明回喂进 memory 的内容是否被截断（PLAN R2 后全文不再入库）。
+    /// `obs` 为该工具的胸牌（ToolSpec.obs，R16）——观测分派按胸牌走，未声明回落遗留注册表。
     pub(super) async fn act_end(
         &self,
         src: &Envelope,
@@ -131,7 +218,9 @@ impl AgentLoopPlugin {
         result: &Value,
         ms: u64,
         cfg: &AgentLoopConfig,
+        obs: Option<&ToolObs>,
     ) {
+        let plan = ObsPlan::resolve(&tc.name, obs);
         tracing::info!(target: "react_progress", round, tool = %tc.name, ms, "✓ round {round}: {} ({}ms)", tc.name, ms);
         // 事件日志：结果截断（防大输出撑爆审计文件），memory 侧另有 8000 字符预算
         let result_str = result.to_string();
@@ -150,17 +239,17 @@ impl AgentLoopPlugin {
         )
         .await;
         // 产物登记：给用户的成品文件在事件流里结构化落账，前端渲染可点击文件卡片
-        self.detect_artifacts(src, session_id, tc, result, cfg).await;
+        self.detect_artifacts(src, session_id, tc, result, cfg, &plan).await;
         // 来源登记：web 检索/阅读的引用链接结构化落账，前端渲染溯源卡（信息溯源）
-        self.detect_sources(src, session_id, tc, result).await;
-        // 变更登记（V2 执行可见性）：write/edit 成功 → file_change 事件结构化落账，
+        self.detect_sources(src, session_id, tc, result, &plan).await;
+        // 变更登记（V2 执行可见性）：写/编辑成功 → file_change 事件结构化落账，
         // 前端聚合为头部「📝 文件变更」chip + 抽屉（随时可答「agent 动了哪些文件」）
-        self.detect_file_changes(src, session_id, round, tc, result).await;
+        self.detect_file_changes(src, session_id, round, result, &plan).await;
     }
 
-    /// 产物检测：write_file/edit_file 是结构化结果直接取 path/bytes；bash 从输出文本
-    /// 扩展名启发式扫描（python-docx 等子进程产物）。误报无害——前端点击由 /files
-    /// 服务兜底 404；漏报仅少一张卡片。
+    /// 产物检测（R16 元数据驱动）：按胸牌 `artifacts` 分派——structured 直接取
+    /// result.path/bytes；output_text 从输出文本扩展名启发式扫描（python-docx 等
+    /// 子进程产物）。误报无害——前端点击由 /files 服务兜底 404；漏报仅少一张卡片。
     pub(super) async fn detect_artifacts(
         &self,
         src: &Envelope,
@@ -168,13 +257,14 @@ impl AgentLoopPlugin {
         tc: &ToolCall,
         result: &Value,
         cfg: &AgentLoopConfig,
+        plan: &ObsPlan,
     ) {
         if result.get("ok") != Some(&json!(true)) {
             return;
         }
         let inner = result.get("result").cloned().unwrap_or(json!({}));
-        match tc.name.as_str() {
-            "write_file" | "edit_file" => {
+        match plan.artifacts {
+            Some(ObsArtifacts::Structured) => {
                 if let Some(p) = inner.get("path").and_then(Value::as_str) {
                     // 路径归一为正斜杠：Windows 下 _display 产出反斜杠，卡片展示/URL/跨平台一致性统一
                     let p = p.replace('\\', "/");
@@ -196,7 +286,7 @@ impl AgentLoopPlugin {
                     }
                 }
             }
-            "bash" => {
+            Some(ObsArtifacts::OutputText) => {
                 let out = inner.get("output").and_then(Value::as_str).unwrap_or("");
                 for p in Self::scan_artifact_paths(out, &cfg.output_dir) {
                     if !self.fresh_artifact(session_id, &p) {
@@ -206,68 +296,67 @@ impl AgentLoopPlugin {
                         .await;
                 }
             }
-            _ => {}
+            None => {}
         }
     }
 
-    /// 变更登记（执行可见性 V2 + W16）：write/edit 成功 → `file_change` 事件 {path, op,
-    /// round}；bash（W16 追溯半）结果带 `changes[]`（bash.py 快照区前后比对）→ 逐条转发
-    /// 为 op=bash 事件（新增/修改/删除 + undo 引用）。事件进既有 trace（只追加）、SSE 透传、
-    /// schema 只增不改。区外改动（噪音/流/产物/工作区外）不产生事件。子代理变更经 trace
-    /// 镜像自动汇入父会话（打 sub 标签）。
+    /// 变更登记（执行可见性 V2 + W16，R16 元数据驱动）：按胸牌 `changes` 分派——
+    /// single_path 单事件（path/undo 透传）；change_list 从 `result.changes[]` 展开多事件
+    /// （新增/修改/删除 + undo 引用）。事件进既有 trace（只追加）、SSE 透传、schema 只增
+    /// 不改。区外改动（噪音/流/产物/工作区外）不产生事件。子代理变更经 trace 镜像自动
+    /// 汇入父会话（打 sub 标签）。
     pub(super) async fn detect_file_changes(
         &self,
         src: &Envelope,
         session_id: &str,
         round: u32,
-        tc: &ToolCall,
         result: &Value,
+        plan: &ObsPlan,
     ) {
-        for mut ev in Self::file_change_events_for(tc, result) {
+        for mut ev in Self::file_change_events_for(result, plan) {
             ev["round"] = json!(round);
             self.trace(src, session_id, ev).await;
         }
     }
 
-    /// 多事件版（W16）：write/edit 单事件；bash 从 `result.changes[]` 展开多事件（op=bash，
-    /// 带 undo 引用——回滚撤销与 diff 视图与 write/edit 同协议）。
-    /// 失败的写/编辑不登记；path 归一为正斜杠（与产物登记同款）；
-    /// 结果内带 undo 引用（files.py 变更快照，R15 回滚撤销 + 双侧 diff 数据源）→ 原样透传。
-    pub(super) fn file_change_events_for(tc: &ToolCall, result: &Value) -> Vec<Value> {
+    /// 多事件版（W16 + R16）：single_path 单事件（path 归一正斜杠，undo 原样透传——
+    /// 回滚撤销与 diff 视图协议）；change_list 从 `result.changes[]` 展开逐条转发。
+    /// op 取自胸牌声明；失败的执行不登记。
+    pub(super) fn file_change_events_for(result: &Value, plan: &ObsPlan) -> Vec<Value> {
         if result.get("ok") != Some(&json!(true)) {
             return Vec::new();
         }
-        match tc.name.as_str() {
-            "write_file" | "edit_file" => {
-                let op = if tc.name == "write_file" { "write" } else { "edit" };
-                let inner = result.get("result").cloned().unwrap_or(json!({}));
-                let Some(path) = inner.get("path").and_then(Value::as_str) else {
-                    return Vec::new();
-                };
-                let mut ev = json!({"type": "file_change", "path": path.replace('\\', "/"), "op": op});
-                if let Some(u) = inner.get("undo") {
-                    ev["undo"] = u.clone();
-                }
-                vec![ev]
+        let Some(c) = &plan.changes else {
+            return Vec::new();
+        };
+        if !c.list {
+            let inner = result.get("result").cloned().unwrap_or(json!({}));
+            let Some(path) = inner.get("path").and_then(Value::as_str) else {
+                return Vec::new();
+            };
+            let mut ev = json!({"type": "file_change", "path": path.replace('\\', "/"), "op": c.op});
+            if let Some(u) = inner.get("undo") {
+                ev["undo"] = u.clone();
             }
-            "bash" => result
+            vec![ev]
+        } else {
+            result
                 .get("result")
                 .and_then(|r| r.get("changes"))
                 .and_then(Value::as_array)
                 .map(|list| {
                     list.iter()
-                        .filter_map(|c| {
-                            let path = c.get("path").and_then(Value::as_str)?.replace('\\', "/");
-                            let mut ev = json!({"type": "file_change", "path": path, "op": "bash"});
-                            if let Some(u) = c.get("undo") {
+                        .filter_map(|ch| {
+                            let path = ch.get("path").and_then(Value::as_str)?.replace('\\', "/");
+                            let mut ev = json!({"type": "file_change", "path": path, "op": c.op});
+                            if let Some(u) = ch.get("undo") {
                                 ev["undo"] = u.clone();
                             }
                             Some(ev)
                         })
                         .collect()
                 })
-                .unwrap_or_default(),
-            _ => Vec::new(),
+                .unwrap_or_default()
         }
     }
 
@@ -293,15 +382,15 @@ impl AgentLoopPlugin {
         }
     }
 
-    /// 来源登记（信息溯源）：web_search/web_read 的引用链接以 `sources` 事件结构化
-    /// 落账，前端在最终答案之后渲染「来源」卡。与产物登记同款纪律：误报无害（仅多
-    /// 一条链接），漏报仅少一卡。
-    pub(super) async fn detect_sources(&self, src: &Envelope, session_id: &str, tc: &ToolCall, result: &Value) {
+    /// 来源登记（信息溯源，R16 元数据驱动）：按胸牌 `sources` 分派提取形状，引用链接
+    /// 以 `sources` 事件结构化落账，前端在最终答案之后渲染「来源」卡。与产物登记同款
+    /// 纪律：误报无害（仅多一条链接），漏报仅少一卡。
+    pub(super) async fn detect_sources(&self, src: &Envelope, session_id: &str, tc: &ToolCall, result: &Value, plan: &ObsPlan) {
         if result.get("ok") != Some(&json!(true)) {
             return;
         }
         let inner = result.get("result").cloned().unwrap_or(json!({}));
-        let items = Self::extract_sources(&tc.name, &inner);
+        let items = Self::extract_sources(&inner, plan);
         if items.is_empty() {
             return;
         }
@@ -313,9 +402,9 @@ impl AgentLoopPlugin {
             .await;
     }
 
-    /// 从 web 工具结果提取 (title, url) 列表：http/https 白名单、URL 去重、上限 10 条
+    /// 按胸牌 `sources` 形状提取 (title, url) 列表：http/https 白名单、URL 去重、上限 10 条
     /// （溯源卡是索引不是快照）。无 title 时用 URL 自身充作显示文本。
-    pub(super) fn extract_sources(tool: &str, inner: &Value) -> Vec<(String, String)> {
+    pub(super) fn extract_sources(inner: &Value, plan: &ObsPlan) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut push = |title: &str, url: &str| {
             let url = url.trim();
@@ -328,8 +417,8 @@ impl AgentLoopPlugin {
                 url.to_string(),
             ));
         };
-        match tool {
-            "web_search" => {
+        match plan.sources {
+            Some(ObsSources::ResultList) => {
                 for r in inner.get("results").and_then(Value::as_array).into_iter().flatten() {
                     push(
                         r.get("title").and_then(Value::as_str).unwrap_or(""),
@@ -337,8 +426,8 @@ impl AgentLoopPlugin {
                     );
                 }
             }
-            "web_read" => push("", inner.get("url").and_then(Value::as_str).unwrap_or("")),
-            _ => {}
+            Some(ObsSources::SingleUrl) => push("", inner.get("url").and_then(Value::as_str).unwrap_or("")),
+            None => {}
         }
         out
     }

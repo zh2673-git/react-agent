@@ -265,6 +265,8 @@ TOOLS = {
             "properties": {"command": {"type": "string"}, "timeout_ms": {"type": "integer"}},
             "required": ["command"],
         },
+        # R16 观测胸牌：输出文本扫描产物 + changes[] 快照区变更展开（W16 追溯半）
+        "obs": {"artifacts": "output_text", "changes": {"op": "bash", "from": "change_list"}},
         "run": _run_bash,
     },
 }

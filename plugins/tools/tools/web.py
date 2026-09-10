@@ -334,6 +334,8 @@ TOOLS = {
             "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
             "required": ["query"],
         },
+        # R16 观测胸牌：results[]{title,url} → 溯源卡
+        "obs": {"sources": "result_list"},
         "run": _web_search,
     },
     "web_read": {
@@ -352,6 +354,8 @@ TOOLS = {
             },
             "required": ["url"],
         },
+        # R16 观测胸牌：result.url 单链接 → 溯源卡
+        "obs": {"sources": "single_url"},
         "run": _web_read,
     },
 }

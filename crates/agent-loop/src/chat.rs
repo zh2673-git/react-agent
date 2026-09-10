@@ -427,7 +427,9 @@ impl AgentLoopPlugin {
                     if result.get("ok") != Some(&json!(true)) {
                         tool_failures += 1;
                     }
-                    self.act_end(env, &req.session_id, rounds, tc, &result, ms, &cfg).await;
+                    // R16：胸牌查找（含波次间并入的技能工具）——观测分派元数据化
+                    let obs = tools.iter().find(|t| t.name == tc.name).and_then(|t| t.obs.as_ref());
+                    self.act_end(env, &req.session_id, rounds, tc, &result, ms, &cfg, obs).await;
                     round_msgs.push(MemoryMsg {
                         role: "tool".into(),
                         content: Some(truncate_chars(&result.to_string(), limit)),

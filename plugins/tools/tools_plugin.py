@@ -322,6 +322,8 @@ class ToolsPlugin:
                     "name": name,
                     "description": spec["description"],
                     "parameters": spec["parameters"],
+                    # R16 观测胸牌透传：编排层据此登记产物/变更/来源（不再认工具名）
+                    **({"obs": spec["obs"]} if spec.get("obs") else {}),
                     **({"enabled": name in _ENABLED} if show_all else {}),
                 }
                 for name, spec in pool.items()
@@ -488,6 +490,8 @@ class ToolsPlugin:
                 "exec": {"cmd": [str(c) for c in cmd], "cwd": cwd_raw, "timeout_secs": timeout_secs},
                 "skill": skill_name,
                 "dir": str(skill_dir),
+                # R16 观测胸牌（可选）：tools.json 条目声明 obs 即透传（未声明不产生卡片）
+                **({"obs": item["obs"]} if isinstance(item.get("obs"), dict) else {}),
             }
             # 延迟启用还原：持久化授权（config.json）先于装载到达 → install 即生效
             if name in _DEFERRED_ENABLED:
@@ -516,6 +520,8 @@ class ToolsPlugin:
                     "description": e["description"],
                     "parameters": e["parameters"],
                     "skill": e["skill"],
+                    # R16 观测胸牌透传（tools.json 清单可声明 obs，技能工具同样出卡）
+                    **({"obs": e["obs"]} if e.get("obs") else {}),
                     **({"enabled": name in _ENABLED} if show_all else {}),
                 }
             )

@@ -25,6 +25,45 @@ pub struct ToolSpec {
     pub description: String,
     #[serde(default)]
     pub parameters: Value,
+    /// R16 观测面声明（工具胸牌）：工具自带「我的结果如何被编排层观测」。
+    /// 缺省（未声明）→ 编排层回落遗留注册表（write_file/edit_file/bash/web_search/
+    /// web_read 五个内置名）；显式声明（含空 {}）覆盖注册表。llm providers 按字段名
+    /// 取值（name/description/parameters），本字段对 LLM 线路不可见。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obs: Option<ToolObs>,
+}
+
+/// R16 观测面声明（胸牌 schema）：声明工具结果中可被结构化观测的三类产物。
+/// 未知取值按未声明处理（向后兼容：新增枚举值不破坏旧编排层）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ToolObs {
+    /// 产物登记（前端可点击文件卡）：
+    /// - `"structured"`：`result.path`/`result.bytes` 结构化承载（write_file/edit_file 形态）
+    /// - `"output_text"`：`result.output` 自由文本启发式扫描（bash 形态）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<String>,
+    /// 变更登记（前端「📝 文件变更」chip + 回滚 diff 数据源）：
+    /// `op` 为 file_change 事件的 op 值；`from` 为变更来源形状：
+    /// - 缺省 / `"single_path"`：结果即一次变更（`result.path` + `result.undo` 透传）
+    /// - `"change_list"`：`result.changes[]` 逐条展开（每条自带 path/undo）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<ToolObsChanges>,
+    /// 来源登记（前端溯源卡）：
+    /// - `"result_list"`：`result.results[]{title,url}`（web_search 形态）
+    /// - `"single_url"`：`result.url` 单链接（web_read 形态）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<String>,
+}
+
+/// 胸牌 changes 子结构（R16）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ToolObsChanges {
+    /// file_change 事件的 op 值（前端变更 chip 标签；如 "write"/"edit"/"bash"）。
+    #[serde(default)]
+    pub op: String,
+    /// 变更来源形状（缺省 single_path；"change_list" = result.changes[] 展开）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 /// 会话消息（memory 与 llm-adapter 共用同一形状）。

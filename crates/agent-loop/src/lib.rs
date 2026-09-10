@@ -38,7 +38,7 @@ mod subagent;
 mod tools_exec;
 mod trace;
 
-pub use contract::{Attachment, ChatReq, LlmChatResp, MemoryMsg, StepRecord, ToolCall, ToolSpec};
+pub use contract::{Attachment, ChatReq, LlmChatResp, MemoryMsg, StepRecord, ToolCall, ToolObs, ToolObsChanges, ToolSpec};
 
 use agent_kernel_sdk::*;
 use async_trait::async_trait;
@@ -285,10 +285,13 @@ impl Plugin for AgentLoopPlugin {
 #[cfg(test)]
 mod tests {
     use super::chat::build_user_msg;
+    use super::tools_exec::ObsPlan;
     use super::*;
 
     #[test]
     fn extract_sources_dedupes_and_validates() {
+        // R16：计划经遗留注册表解析（obs 未声明回落路径）+ 元数据直构路径各验一遍
+        let legacy = |name: &str| ObsPlan::resolve(name, None);
         let inner = json!({
             "query": "q", "engine": "bing",
             "results": [
@@ -299,18 +302,23 @@ mod tests {
                 {"title": "", "url": "  https://c.example/3  ", "snippet": "s"} // 空标题用 URL 充当
             ]
         });
-        let items = AgentLoopPlugin::extract_sources("web_search", &inner);
+        let items = AgentLoopPlugin::extract_sources(&inner, &legacy("web_search"));
         assert_eq!(items.len(), 3, "{items:?}");
         assert_eq!(items[0], ("A".into(), "https://a.example/1".into()));
         assert_eq!(items[1], ("B".into(), "https://b.example/2".into()));
         assert_eq!(items[2], ("https://c.example/3".into(), "https://c.example/3".into()));
 
-        // web_read：单 URL；其他工具：空
+        // web_read：单 URL；其他工具：空（遗留路径）
         assert_eq!(
-            AgentLoopPlugin::extract_sources("web_read", &json!({"url": "https://r.example/x"})).len(),
+            AgentLoopPlugin::extract_sources(&json!({"url": "https://r.example/x"}), &legacy("web_read")).len(),
             1
         );
-        assert!(AgentLoopPlugin::extract_sources("bash", &json!({"output": "https://x.example"})).is_empty());
+        assert!(AgentLoopPlugin::extract_sources(&json!({"output": "https://x.example"}), &legacy("bash")).is_empty());
+
+        // 元数据路径：改名工具带胸牌同样提取（R16 核心行为）
+        let obs = ToolObs { sources: Some("result_list".into()), ..Default::default() };
+        let items = AgentLoopPlugin::extract_sources(&inner, &ObsPlan::resolve("search_web", Some(&obs)));
+        assert_eq!(items.len(), 3, "胸牌声明 result_list 的改名工具应同形提取");
     }
 
     #[test]
@@ -318,30 +326,51 @@ mod tests {
         let results: Vec<Value> = (0..30)
             .map(|i| json!({"title": format!("t{i}"), "url": format!("https://e.example/{i}")}))
             .collect();
-        let items = AgentLoopPlugin::extract_sources("web_search", &json!({ "results": results }));
+        let items =
+            AgentLoopPlugin::extract_sources(&json!({ "results": results }), &ObsPlan::resolve("web_search", None));
         assert_eq!(items.len(), 10, "溯源卡上限 10 条");
     }
 
     #[test]
     fn file_change_event_only_for_successful_file_tools() {
-        let tc = |name: &str| ToolCall { id: "1".into(), name: name.into(), arguments: json!({}) };
         let ok = |path: &str| json!({"ok": true, "result": {"path": path}});
-        // 成功 write/edit → 事件（path 归一正斜杠）
-        let ev = AgentLoopPlugin::file_change_events_for(&tc("write_file"), &ok(r"D:\ws\outputs\a.md"))
+        let legacy = |name: &str| ObsPlan::resolve(name, None);
+        // 成功 write/edit → 事件（path 归一正斜杠；遗留注册表 op 映射不变）
+        let ev = AgentLoopPlugin::file_change_events_for(&ok(r"D:\ws\outputs\a.md"), &legacy("write_file"))
             .into_iter()
             .next()
             .unwrap();
         assert_eq!(ev["path"], json!("D:/ws/outputs/a.md"), "反斜杠归一");
         assert_eq!(ev["op"], json!("write"));
-        let ev = AgentLoopPlugin::file_change_events_for(&tc("edit_file"), &ok("x.md"))
+        let ev = AgentLoopPlugin::file_change_events_for(&ok("x.md"), &legacy("edit_file"))
             .into_iter()
             .next()
             .unwrap();
         assert_eq!(ev["op"], json!("edit"));
         // 失败 / 非文件工具 / 缺 path → 不登记
-        assert!(AgentLoopPlugin::file_change_events_for(&tc("write_file"), &json!({"ok": false})).is_empty());
-        assert!(AgentLoopPlugin::file_change_events_for(&tc("bash"), &ok("x")).is_empty());
-        assert!(AgentLoopPlugin::file_change_events_for(&tc("edit_file"), &json!({"ok": true, "result": {}})).is_empty());
+        assert!(AgentLoopPlugin::file_change_events_for(&json!({"ok": false}), &legacy("write_file")).is_empty());
+        assert!(AgentLoopPlugin::file_change_events_for(&ok("x"), &legacy("bash")).is_empty());
+        assert!(AgentLoopPlugin::file_change_events_for(&json!({"ok": true, "result": {}}), &legacy("edit_file")).is_empty());
+        // 元数据路径：改名工具带胸牌产出同形事件（op 取声明值）
+        let obs = ToolObs {
+            artifacts: Some("structured".into()),
+            changes: Some(ToolObsChanges { op: "note".into(), from: None }),
+            ..Default::default()
+        };
+        let ev = AgentLoopPlugin::file_change_events_for(&ok("outputs/n.md"), &ObsPlan::resolve("create_note", Some(&obs)))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(ev["op"], json!("note"), "胸牌声明的 op 原样生效");
+        assert_eq!(ev["path"], json!("outputs/n.md"));
+        // 未知取值降级为未声明（向后兼容：新枚举值不炸旧编排层）——未知 from 按
+        // 缺省 single_path 行事（行为级断言：结果 path 照常成单事件）
+        let obs_bad = ToolObs { changes: Some(ToolObsChanges { op: "x".into(), from: Some("future_shape".into()) }), ..Default::default() };
+        let ev = AgentLoopPlugin::file_change_events_for(&ok("y.md"), &ObsPlan::resolve("future_tool", Some(&obs_bad)))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(ev["path"], json!("y.md"), "未知 from 值按缺省 single_path 处理");
     }
 
     #[test]

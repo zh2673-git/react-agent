@@ -6,7 +6,8 @@
 //! ③ 旁路路径规则：`.stream/{session}.jsonl`（与 host `config.rs::stream_file` 必须一致）；
 //! ④ 保留名路由：`task` 下发模型可见，`load_skill`/`skill_install` 不进 tools 清单；
 //! ⑤ undo 透传：tools 结果中的 `undo` 引用原样进 `file_change` 事件（回滚链路依赖）；
-//! ⑥ 观测登记：write_file→artifact（产物卡）、web_search→sources（溯源卡）、bash changes[]→file_change；
+//! ⑥ 观测登记：遗留路径（write_file→artifact、web_search→sources、bash changes[]→file_change）
+//!    与 R16 元数据路径（ToolSpec.obs 胸牌声明 → 改名工具同形登记、无胸牌不登记）；
 //! ⑦ memory op 面：agent-loop 只会调用 {get, append, summarize, trace.append, trace.read}；
 //! ⑧ llm.chat payload 面：messages + tools + stream_path + sid；
 //! ⑨ tools.exec payload 面：{op, name, args}。
@@ -318,4 +319,160 @@ async fn scripted_chat_fulfills_all_wire_contracts() {
             assert!(c.get(k).is_some(), "tools.exec call 缺 {k}: {c}");
         }
     }
+}
+
+/// R16 回归：观测登记与工具名解耦——改名工具（不在遗留注册表内）经 `ToolSpec.obs`
+/// 胸牌声明，产物卡/变更 chip/溯源卡照常登记；**无胸牌**的同形结果不产生卡片
+/// （改工具名不再静默弄瞎前端，新工具集自带胸牌即插即观测）。
+#[tokio::test]
+async fn metadata_declared_tools_register_without_legacy_names() {
+    let stream_dir = std::env::temp_dir().join("agent-loop-contract-stream");
+    std::fs::create_dir_all(&stream_dir).unwrap();
+    std::env::set_var("AGENT_STREAM_DIR", &stream_dir);
+
+    let trace_events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
+    let store: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
+
+    // memory：最小捕获（get/append/trace.append/trace.read）
+    let memory = {
+        let events = trace_events.clone();
+        let store2 = store.clone();
+        MockPlugin::plug(
+            "memory",
+            &["memory.session"],
+            Arc::new(move |env: &Envelope| {
+                let events = events.clone();
+                let store = store2.clone();
+                let payload = env.payload.clone();
+                Box::pin(async move {
+                    match payload.get("op").and_then(Value::as_str) {
+                        Some("get") => json!({"ok": true, "messages": store.lock().unwrap().clone()}),
+                        Some("append") => {
+                            if let Some(msgs) = payload.get("messages").and_then(Value::as_array) {
+                                store.lock().unwrap().extend(msgs.iter().cloned());
+                            }
+                            json!({"ok": true})
+                        }
+                        Some("trace.append") => {
+                            if let Some(evs) = payload.get("events").and_then(Value::as_array) {
+                                events.lock().unwrap().extend(evs.iter().cloned());
+                            }
+                            json!({"ok": true})
+                        }
+                        Some("trace.read") => json!({"ok": true, "events": events.lock().unwrap().clone()}),
+                        _ => json!({"ok": false, "error": {"code": "K400", "message": "bad op"}}),
+                    }
+                })
+            }),
+        )
+    };
+
+    // llm：① 调两个改名工具 + 一个无胸牌同形工具 ② 收敛
+    let llm = {
+        let seq = Arc::new(Mutex::new(vec![
+            json!({"ok": true, "content": null, "tool_calls": [
+                {"id": "c1", "name": "create_note", "arguments": {"path": "outputs/note.md"}},
+                {"id": "c2", "name": "search_web", "arguments": {"query": "q"}},
+                {"id": "c3", "name": "mystery", "arguments": {}}
+            ], "model": "mock", "finish_reason": "tool_calls"}),
+            json!({"ok": true, "content": "done", "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+        ]));
+        MockPlugin::plug(
+            "llm-adapter",
+            &["llm.chat"],
+            Arc::new(move |_env: &Envelope| {
+                let seq = seq.clone();
+                Box::pin(async move {
+                    let mut s = seq.lock().unwrap();
+                    if s.len() > 1 {
+                        s.remove(0)
+                    } else {
+                        s[0].clone()
+                    }
+                })
+            }),
+        )
+    };
+
+    // tools：清单带胸牌（create_note/search_web 声明 obs；mystery 故意不声明），
+    // 名称不含 write_file/web_search 等遗留注册表名——登记只能来自胸牌。
+    let tools = MockPlugin::plug(
+        "tools",
+        &["tools.exec"],
+        Arc::new(|env: &Envelope| {
+            let payload = env.payload.clone();
+            Box::pin(async move {
+                match (payload.get("op").and_then(Value::as_str), payload.get("name").and_then(Value::as_str)) {
+                    (Some("list"), _) => json!({"ok": true, "tools": [
+                        {"name": "create_note", "description": "d", "parameters": {},
+                         "obs": {"artifacts": "structured", "changes": {"op": "note"}}},
+                        {"name": "search_web", "description": "d", "parameters": {},
+                         "obs": {"sources": "result_list"}},
+                        {"name": "mystery", "description": "d", "parameters": {}}
+                    ]}),
+                    (Some("call"), Some("create_note")) => json!({"ok": true, "result": {
+                        "path": "outputs/note.md", "bytes": 3,
+                        "undo": {"id": "u9", "created": [], "deleted": []}}}),
+                    (Some("call"), Some("search_web")) => json!({"ok": true, "result": {
+                        "results": [{"title": "T", "url": "https://m.example/1"}]}}),
+                    (Some("call"), Some("mystery")) => json!({"ok": true, "result": {
+                        "path": "outputs/mystery.md", "bytes": 1,
+                        "undo": {"id": "u8", "created": [], "deleted": []}}}),
+                    _ => json!({"ok": false, "error": {"code": "K400", "message": "bad call"}}),
+                }
+            })
+        }),
+    );
+
+    let kernel = agent_kernel_kernel::Kernel::new(agent_kernel_sdk::GlobalConfig {
+        node_id: "r16-test".into(),
+        max_total_inflight: 16,
+    });
+    kernel.register(memory).await;
+    kernel.register(llm).await;
+    kernel.register(tools).await;
+    kernel.register(agent_loop_new(8)).await;
+
+    let resp = kernel
+        .dispatch(Envelope::new(PluginId::new("agent-loop"), json!({"op": "chat", "session_id": "r16", "user_text": "go"})))
+        .await
+        .expect("dispatch chat");
+    assert_eq!(resp["ok"], json!(true), "{resp:?}");
+
+    let events = trace_events.lock().unwrap().clone();
+    let types_of = |t: &str| -> Vec<Value> {
+        events.iter().filter(|e| e.get("type").and_then(Value::as_str) == Some(t)).cloned().collect()
+    };
+
+    // 胸牌工具照常登记：产物卡 + 变更（op 取声明值 + undo 透传）+ 溯源卡
+    let artifacts = types_of("artifact");
+    assert!(
+        artifacts.iter().any(|e| e["tool"] == json!("create_note") && e["path"] == json!("outputs/note.md")),
+        "带胸牌的改名工具必须登记 artifact: {artifacts:?}"
+    );
+    let fcs = types_of("file_change");
+    assert!(
+        fcs.iter().any(|e| e["path"] == json!("outputs/note.md") && e["op"] == json!("note")
+            && e["undo"] == json!({"id": "u9", "created": [], "deleted": []})),
+        "带胸牌的改名工具必须登记 file_change（op=声明值，undo 透传）: {fcs:?}"
+    );
+    let sources = types_of("sources");
+    assert!(
+        sources.iter().any(|e| e["tool"] == json!("search_web") && !e["items"].as_array().unwrap().is_empty()),
+        "带胸牌的改名工具必须登记 sources: {sources:?}"
+    );
+
+    // 无胸牌的同形结果不登记（遗留注册表不含 mystery——名字不再有魔力）
+    assert!(
+        !artifacts.iter().any(|e| e["tool"] == json!("mystery")),
+        "无胸牌工具的同形结果不得登记 artifact: {artifacts:?}"
+    );
+    assert!(
+        !fcs.iter().any(|e| e["path"] == json!("outputs/mystery.md")),
+        "无胸牌工具的同形结果不得登记 file_change: {fcs:?}"
+    );
+    assert!(
+        !sources.iter().any(|e| e["tool"] == json!("mystery")),
+        "无胸牌工具不得登记 sources: {sources:?}"
+    );
 }

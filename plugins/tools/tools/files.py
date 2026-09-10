@@ -492,6 +492,8 @@ TOOLS = {
             },
             "required": ["path", "content"],
         },
+        # R16 观测胸牌：结果结构化承载产物路径 + 一次文件变更（编排层据此登记，不再认名）
+        "obs": {"artifacts": "structured", "changes": {"op": "write"}},
         "run": _write_file,
     },
     "edit_file": {
@@ -510,6 +512,8 @@ TOOLS = {
             },
             "required": ["path", "old_string", "new_string"],
         },
+        # R16 观测胸牌：同 write_file（op 标签区分）
+        "obs": {"artifacts": "structured", "changes": {"op": "edit"}},
         "run": _edit_file,
     },
     "list_dir": {
