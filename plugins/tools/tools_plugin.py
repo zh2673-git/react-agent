@@ -56,6 +56,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from agent_kernel.guest import serve
@@ -82,6 +83,43 @@ ALL_TOOLS: dict = _ALL
 _ENABLED: set[str] = set()
 # L2 动态装载：按模块分表保留（某模块 reload 失败时其旧工具原样保留——fail-closed）
 _EXTRA_BY_MODULE: dict[str, dict] = {}
+
+# T7（工具级取消）：运行中子进程登记（session_id → {Popen}）。
+# abort op 按会话终止——覆盖 _exec_command（技能工具）路径；bash/web 内建工具
+# 自带 timeout 上限（≤60s）且子进程独立，泄漏线程由 serve(max_workers=16) 纵深兜底。
+# 并发语义（T6 Concurrent）下本表以 _RUNNING_LOCK 串行化变更；Popen 本身线程安全。
+_RUNNING: dict[str, set] = {}
+_RUNNING_LOCK = threading.Lock()
+
+
+def _register_proc(session_id: str, proc) -> None:
+    if not session_id:
+        return
+    with _RUNNING_LOCK:
+        _RUNNING.setdefault(session_id, set()).add(proc)
+
+
+def _unregister_proc(session_id: str, proc) -> None:
+    with _RUNNING_LOCK:
+        procs = _RUNNING.get(session_id)
+        if procs is not None:
+            procs.discard(proc)
+            if not procs:
+                _RUNNING.pop(session_id, None)
+
+
+def _abort_session(session_id: str) -> int:
+    """终止该会话运行中的工具子进程，返回终止数（进程已在退出态时 kill 为无害 no-op）。"""
+    with _RUNNING_LOCK:
+        procs = _RUNNING.pop(session_id, None) or set()
+    killed = 0
+    for p in procs:
+        try:
+            p.kill()
+            killed += 1
+        except OSError:
+            pass
+    return killed
 
 # §八 MCP 第三池：name(全限定 mcp__server__tool) → {name,description,parameters,server,remote}。
 # 装载 ≠ 启用：进池不进白名单；启用后常驻全会话可见（不绑技能）。失败 server 记 _MCP_FAILED。
@@ -317,6 +355,14 @@ class ToolsPlugin:
             return self._install(payload)
         if op == "skill_tools":
             return self._skill_tools(payload)
+        if op == "abort":
+            # T7（工具级取消）：终止该会话运行中的工具子进程。agent-loop 的 cancel op
+            # 联动触发（Concurrent 语义保证 abort 与在途 call 并行受理）。
+            sid = payload.get("session_id") or ""
+            if not sid:
+                return _err("abort 需 session_id", code="K400", field="session_id")
+            killed = _abort_session(sid)
+            return {"ok": True, "aborted": killed}
         return _err(f"unknown op: {op}", code="K400")
 
     def _configure(self, payload: dict) -> dict:
@@ -487,7 +533,7 @@ class ToolsPlugin:
         args = payload.get("args") or {}
         if not isinstance(args, dict):
             return _err(f"args 必须是对象，收到: {type(args).__name__}", code="BAD_ARGS", field="args")
-        return self._exec_command(_SKILL_TOOLS[name], args)
+        return self._exec_command(_SKILL_TOOLS[name], args, payload.get("session_id") or "")
 
     # ── §八：MCP 工具（stdio 传输第三池） ──────────────────────────────────
 
@@ -541,9 +587,10 @@ class ToolsPlugin:
             return _err(f"MCP 调用失败: {type(exc).__name__}: {exc}", code="MCP_ERROR")
         return {"ok": True, "result": text}
 
-    def _exec_command(self, entry: dict, args: dict) -> dict:
+    def _exec_command(self, entry: dict, args: dict, session_id: str) -> dict:
         """子进程执行 exec.cmd：stdin={"args":{...}}，stdout=Wire 同形 JSON。
-        cwd 缺省技能目录（相对资源可达）；超时杀进程；输出不合契约 → 字段级错误。"""
+        cwd 缺省技能目录（相对资源可达）；超时杀进程；输出不合契约 → 字段级错误。
+        子进程按 session_id 登记（T7：abort op 可按会话终止）。"""
         cmd = entry["exec"]["cmd"]
         cwd = entry["dir"]
         cwd_raw = entry["exec"].get("cwd")
@@ -555,25 +602,37 @@ class ToolsPlugin:
         # T0：声明 timeout_secs 优先，缺省回落全局 SKILL_TOOL_TIMEOUT_SECS（install 已保证正数）
         declared = entry["exec"].get("timeout_secs")
         timeout = float(declared) if declared is not None else _skill_tool_timeout()
+        # T7：Popen + 登记（session_id）——abort op 可按会话终止运行中的子进程
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                input=json.dumps({"args": args}, ensure_ascii=False),
-                capture_output=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 cwd=cwd,
-                timeout=timeout,
             )
+        except OSError as exc:
+            return _err(f"执行体不可达（exec.cmd={cmd}）: {exc}", code="TOOL_EXEC_ERROR")
+        _register_proc(session_id, proc)
+        try:
+            out, err = proc.communicate(input=json.dumps({"args": args}, ensure_ascii=False), timeout=timeout)
         except subprocess.TimeoutExpired:
+            proc.kill()
+            _unregister_proc(session_id, proc)
             return _err(
                 f"技能工具执行超时（>{timeout:g}s），已终止进程；请减小任务规模或检查执行体",
                 code="TOOL_TIMEOUT",
             )
-        except OSError as exc:
-            return _err(f"执行体不可达（exec.cmd={cmd}）: {exc}", code="TOOL_EXEC_ERROR")
-        out = (proc.stdout or "").strip()
+        except BaseException:
+            # 取消/异常路径也必须杀进程 + 注销，防泄漏（abort 已 kill 时为无害 no-op）
+            proc.kill()
+            _unregister_proc(session_id, proc)
+            raise
+        _unregister_proc(session_id, proc)
+        out = (out or "").strip()
         if out:
             try:
                 parsed = json.loads(out)
@@ -584,7 +643,7 @@ class ToolsPlugin:
                 return parsed
         tail = lambda s: (s or "").strip()[-500:]  # noqa: E731
         return _err(
-            f"技能工具输出不符合契约（exit={proc.returncode}）；stderr: {tail(proc.stderr) or '（空）'}；stdout: {tail(out) or '（空）'}",
+            f"技能工具输出不符合契约（exit={proc.returncode}）；stderr: {tail(err) or '（空）'}；stdout: {tail(out) or '（空）'}",
             code="TOOL_EXEC_ERROR",
         )
 

@@ -7,15 +7,14 @@
 //! `skill_install`（R9 技能安装编排，保留名 skill_install 路由终点）与
 //! `install_skill_tools`（R9b 装载编排，load_skill / skill_install 共用）。
 
+use super::config::AgentLoopConfig;
 use super::*;
 
 impl AgentLoopPlugin {
-    /// 提示词组装链（07 §2.1）：env > WORKSPACE_ROOT/SYSTEM.md > PROMPT 具名模板（assets）> 内置缺省。
-    pub(super) async fn resolve_system_prompt(&self, src: &Envelope) -> String {
-        if let Ok(s) = std::env::var("AGENT_SYSTEM_PROMPT") {
-            if !s.trim().is_empty() {
-                return s;
-            }
+    /// 提示词组装链（07 §2.1）：cfg 覆盖（env 单点解析，E3）> WORKSPACE_ROOT/SYSTEM.md > PROMPT 具名模板（assets）> 内置缺省。
+    pub(super) async fn resolve_system_prompt(&self, src: &Envelope, cfg: &AgentLoopConfig) -> String {
+        if let Some(s) = &cfg.system_prompt_override {
+            return s.clone();
         }
         if let Ok(ws) = std::env::var("WORKSPACE_ROOT") {
             if let Ok(s) = std::fs::read_to_string(std::path::Path::new(&ws).join("SYSTEM.md")) {
@@ -24,16 +23,14 @@ impl AgentLoopPlugin {
                 }
             }
         }
-        if let Ok(name) = std::env::var("PROMPT") {
-            if !name.trim().is_empty() {
-                if let Ok(v) = self
-                    .call(src, CAP_ASSETS, json!({"op": "prompts.get", "name": name}), ASSETS_DEADLINE)
-                    .await
-                {
-                    if let Some(c) = v.get("content").and_then(Value::as_str) {
-                        if !c.trim().is_empty() {
-                            return c.to_string();
-                        }
+        if let Some(name) = &cfg.prompt_template {
+            if let Ok(v) = self
+                .call(src, CAP_ASSETS, json!({"op": "prompts.get", "name": name}), ASSETS_DEADLINE)
+                .await
+            {
+                if let Some(c) = v.get("content").and_then(Value::as_str) {
+                    if !c.trim().is_empty() {
+                        return c.to_string();
                     }
                 }
             }
@@ -44,7 +41,7 @@ impl AgentLoopPlugin {
     /// 技能附录（Discovery，07 §2.1）：assets 不可用/空列表 → 省略（不花 token）。
     /// skills.list 附带 root（08 §L1）：root ⊆ WORKSPACE_ROOT 时追加「技能自扩展」授权段——
     /// 模型可用 write_file 创建新技能（文件即注册表，list 每次重扫，下轮对话自动可见）。
-    pub(super) async fn skills_appendix(&self, src: &Envelope) -> String {
+    pub(super) async fn skills_appendix(&self, src: &Envelope, cfg: &AgentLoopConfig) -> String {
         let Ok(v) = self.call(src, CAP_ASSETS, json!({"op": "skills.list"}), ASSETS_DEADLINE).await else {
             return String::new();
         };
@@ -74,7 +71,7 @@ impl AgentLoopPlugin {
         // 混写进技能目录/仓库根。提示词约束非硬边界，越界拦截仍在文件工具侧。
         lines.push(format!(
             "## Artifact output\n- Files produced for the user (word/excel/ppt/html/markdown/images/…) must be written into `{}` (workspace-relative path). Do not scatter them into skill directories or the repo root. Mention the relative path of each artifact in your answer.",
-            Self::output_dir()
+            cfg.output_dir
         ));
         lines.join("\n")
     }

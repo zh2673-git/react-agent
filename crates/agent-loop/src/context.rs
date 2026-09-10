@@ -20,32 +20,9 @@
 //! 云端 API 不消费 num_ctx 且窗口由服务端管理，本闸一并禁用——避免为本地调小的窗口值
 //! 误压云端历史。非名单 provider 一律视同 0（禁用）。
 
+use crate::config::AgentLoopConfig;
 use crate::contract::MemoryMsg;
 use serde_json::{json, Value};
-
-/// 本地窗口型 provider 名单：会消费 `options.num_ctx` 的部署形态（显存受限，常需调小窗口换速度）。
-/// 扩展方式：新本地部署后端（llama.cpp server / vLLM / LM Studio 等）接入后在此加名即可。
-const LOCAL_WINDOW_PROVIDERS: [&str; 1] = ["ollama"];
-
-/// LLM 上下文窗口（token）：`LLM_CONTEXT_TOKENS`；仅本地窗口型 provider 生效，
-/// 其余 provider 返回 0（token 闸禁用 + 不下发 num_ctx）。0/缺省 = 禁用。
-pub fn context_window_tokens() -> usize {
-    let provider = std::env::var("LLM_PROVIDER").unwrap_or_default();
-    if !LOCAL_WINDOW_PROVIDERS.contains(&provider.as_str()) {
-        return 0;
-    }
-    std::env::var("LLM_CONTEXT_TOKENS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
-}
-
-/// 发送预算：窗口 × 0.7（预留模型输出与工具 schema 开销）；窗口 0 → 预算 0（闸禁用）。
-pub fn ctx_budget() -> usize {
-    let w = context_window_tokens();
-    if w == 0 {
-        0
-    } else {
-        (w as f64 * 0.7) as usize
-    }
-}
 
 /// 宽字符判定（保守口径：宽字符按 1 token/字计，宁高估）。
 /// 覆盖 CJK 统一表意/扩展、兼容表意、全角形式、Hangul、Emoji。
@@ -134,8 +111,8 @@ fn retrim_tool_results(msgs: &mut [MemoryMsg], limit: usize) {
 /// 发送前逐级收紧（P7/R5，预防在发送前）：token 闸启用且工作集估算超预算时——
 /// ① 窗口条数减半；② tool_result 限额减半；仍超 → Err（CONTEXT_OVERFLOW payload，不发请求）。
 /// 裁剪只影响本轮发给 LLM 的工作集，memory 全量历史不受影响（下轮重新拉取）。
-pub fn tighten_for_context(mut messages: Vec<MemoryMsg>) -> Result<Vec<MemoryMsg>, Value> {
-    let budget = ctx_budget();
+pub fn tighten_for_context(mut messages: Vec<MemoryMsg>, cfg: &AgentLoopConfig) -> Result<Vec<MemoryMsg>, Value> {
+    let budget = cfg.ctx_budget();
     if budget == 0 {
         return Ok(messages);
     }
@@ -144,7 +121,7 @@ pub fn tighten_for_context(mut messages: Vec<MemoryMsg>) -> Result<Vec<MemoryMsg
         return Ok(messages);
     }
     messages = halve_window(messages);
-    retrim_tool_results(&mut messages, crate::tool_result_limit() / 2);
+    retrim_tool_results(&mut messages, cfg.tool_result_limit / 2);
     let est2 = estimate_messages(&messages);
     if est2 <= budget {
         tracing::info!(target: crate::ID, "context tightened: {est} -> {est2} est tokens (budget {budget})");
@@ -157,16 +134,16 @@ pub fn tighten_for_context(mut messages: Vec<MemoryMsg>) -> Result<Vec<MemoryMsg
             "message": format!(
                 "上下文估算 {est2} tokens（原始 {est}）超出发送预算 {budget}，逐级收紧（窗口/工具结果限额减半）后仍超限；请开启新会话或调大 LLM_CONTEXT_TOKENS"
             ),
-            "ctx": {"limit": context_window_tokens(), "budget": budget, "estimated": est2},
+            "ctx": {"limit": cfg.context_window, "budget": budget, "estimated": est2},
         }
     }))
 }
 
 /// 降级收紧（P8/R7，兜底在响应后）：provider 侧 CONTEXT_OVERFLOW（确定性但可行动）——
 /// 窗口条数减半 + tool_result 限额减半后重试一次。不做预算判定（估算已漏网，provider 是终审）。
-pub fn degrade(mut msgs: Vec<MemoryMsg>) -> Vec<MemoryMsg> {
+pub fn degrade(mut msgs: Vec<MemoryMsg>, cfg: &AgentLoopConfig) -> Vec<MemoryMsg> {
     msgs = halve_window(msgs);
-    retrim_tool_results(&mut msgs, crate::tool_result_limit() / 2);
+    retrim_tool_results(&mut msgs, cfg.tool_result_limit / 2);
     msgs
 }
 
@@ -234,40 +211,5 @@ mod tests {
         assert_eq!(out[0].role, "system");
     }
 
-    // L7 回归：窗口值仅本地窗口型 provider 生效（env 全局，测试串行化避免多线程互踩）
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    #[test]
-    fn window_only_applies_to_local_window_providers() {
-        let _g = env_lock().lock().unwrap();
-        let (prov, tok) =
-            (std::env::var("LLM_PROVIDER").ok(), std::env::var("LLM_CONTEXT_TOKENS").ok());
-
-        std::env::set_var("LLM_PROVIDER", "openai");
-        std::env::set_var("LLM_CONTEXT_TOKENS", "8192");
-        assert_eq!(context_window_tokens(), 0, "云端 provider 不消费窗口：token 闸禁用");
-        assert_eq!(ctx_budget(), 0);
-
-        std::env::set_var("LLM_PROVIDER", "ollama");
-        assert_eq!(context_window_tokens(), 8192, "ollama 读窗口值");
-        assert_eq!(ctx_budget(), 5734); // 8192 × 0.7
-
-        std::env::set_var("LLM_CONTEXT_TOKENS", "0");
-        assert_eq!(context_window_tokens(), 0, "0=禁用（向后兼容）");
-
-        std::env::remove_var("LLM_CONTEXT_TOKENS");
-        assert_eq!(context_window_tokens(), 0, "缺省=禁用");
-
-        match prov {
-            Some(v) => std::env::set_var("LLM_PROVIDER", v),
-            None => std::env::remove_var("LLM_PROVIDER"),
-        }
-        match tok {
-            Some(v) => std::env::set_var("LLM_CONTEXT_TOKENS", v),
-            None => std::env::remove_var("LLM_CONTEXT_TOKENS"),
-        }
-    }
+    // L7 回归用例已随 context_window_tokens 收编迁至 config.rs（E3）
 }

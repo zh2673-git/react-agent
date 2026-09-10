@@ -4,6 +4,7 @@
 //! 持久化 → 就地替换本轮工作集）与 `compaction_marker`（压缩标记消息，与 memory 插件
 //! summarize 的合成消息保持同构）。
 
+use super::config::AgentLoopConfig;
 use super::*;
 
 impl AgentLoopPlugin {
@@ -25,16 +26,19 @@ impl AgentLoopPlugin {
     /// （P7/R6 token 闸，LLM_CONTEXT_TOKENS>0 时启用）时，把除最近 COMPACT_KEEP（默认 10）条
     /// 之外的旧史交 LLM 摘要，经 memory `summarize` op 持久化（含孤儿 tool 消息防撕裂），
     /// 并就地替换本轮工作集。任何失败（llm/memory）→ 降级为不压缩（warn），主流程不受影响。
-    pub(super) async fn maybe_compact(&self, src: &Envelope, session_id: &str, history: Vec<MemoryMsg>) -> Vec<MemoryMsg> {
-        fn env_num(key: &str, default: usize) -> usize {
-            std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
-        }
-        let trigger = env_num("COMPACT_TRIGGER", 40);
-        let keep = env_num("COMPACT_KEEP", 10).min(history.len());
+    pub(super) async fn maybe_compact(
+        &self,
+        src: &Envelope,
+        session_id: &str,
+        history: Vec<MemoryMsg>,
+        cfg: &AgentLoopConfig,
+    ) -> Vec<MemoryMsg> {
+        let trigger = cfg.compact_trigger;
+        let keep = cfg.compact_keep.min(history.len());
         // 双闸（PLAN P7/R6）：条数闸 **或** token 闸任一命中即压缩——
         // 单条大结果在条数闸（40 条）之前就能撑爆 LLM 窗口。
         let count_gate = trigger > 0 && history.len() > trigger;
-        let budget = context::ctx_budget();
+        let budget = cfg.ctx_budget();
         let token_gate = budget > 0 && context::estimate_messages(&history) > budget;
         if !count_gate && !token_gate {
             return history;
@@ -71,7 +75,7 @@ facts learned, files/actions taken, and pending work. Be concise (<= 300 words).
             attachments: None,
         });
         // 压缩摘要不是用户可见输出 → 不走流式旁路；瞬态失败同样重试（T3）
-        let summary = match self.plan_with_retry(src, session_id, &mut sum_msgs, None, None).await {
+        let summary = match self.plan_with_retry(src, session_id, &mut sum_msgs, None, None, cfg).await {
             Ok(r) if r.ok => r.content.unwrap_or_default(),
             Ok(r) => {
                 tracing::warn!(target: ID, "compaction llm failed, keeping full history: {:?}", r.error);

@@ -800,7 +800,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "react-agent-agent-loop"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "agent-kernel-conformance",
  "agent-kernel-kernel",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "react-agent-host"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "agent-kernel-kernel",
  "agent-kernel-process",

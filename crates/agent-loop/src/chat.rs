@@ -5,23 +5,13 @@
 //! P8 超限降级）、`max_rounds`（生效轮次上限）、用户消息装配（`build_user_msg` /
 //! `text_attach_limit` / `base64_decode_utf8`）与历史窗口（`apply_history_limit`）。
 
-use super::budget::{
-    budget_secs, is_transient_kernel_err, is_transient_llm_error, retry_attempts, retry_base_ms, token_budget,
-    ChatBudget, UsageAcc,
-};
+use super::budget::{is_transient_kernel_err, is_transient_llm_error, ChatBudget, UsageAcc};
+use super::config::AgentLoopConfig;
 use super::subagent::task_spec;
 use super::tools_exec::truncate_chars;
 use super::trace::stream_file_for;
 use super::*;
 use std::time::Instant;
-
-/// 文本附件内嵌上限（字符）：0 = 禁用截断。
-pub(super) fn text_attach_limit() -> usize {
-    std::env::var("TEXT_ATTACH_LIMIT")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(DEFAULT_TEXT_ATTACH_CHARS)
-}
 
 /// R3：把用户附件装配进 user 消息。
 ///
@@ -29,7 +19,11 @@ pub(super) fn text_attach_limit() -> usize {
 ///   provider 协议映射（OpenAI 兼容 image_url data URI / ollama native images 数组）；
 /// - 文本文件 → 直接拼入 content（一次内嵌，超限截断并标注）——provider 无需感知；
 /// - 其他二进制类型 → 不内嵌内容，content 中注明名称与类型（不静默丢弃）。
-pub(super) fn build_user_msg(user_text: &str, attachments: Option<&[Attachment]>) -> MemoryMsg {
+pub(super) fn build_user_msg(
+    user_text: &str,
+    attachments: Option<&[Attachment]>,
+    text_attach_limit: usize,
+) -> MemoryMsg {
     let Some(list) = attachments else {
         return MemoryMsg {
             role: "user".into(),
@@ -39,7 +33,7 @@ pub(super) fn build_user_msg(user_text: &str, attachments: Option<&[Attachment]>
             attachments: None,
         };
     };
-    let limit = text_attach_limit();
+    let limit = text_attach_limit;
     let mut content = String::from(user_text);
     let mut images: Vec<Attachment> = Vec::new();
     for a in list {
@@ -77,28 +71,14 @@ pub(super) fn base64_decode_utf8(b64: &str) -> String {
 /// 感知窗口（PLAN R3）：HISTORY_LIMIT 只裁剪**发给 LLM 的工作集**，且必须发生在
 /// 压缩判断之后——修复前截断在前，LIMIT < TRIGGER 时压缩永不触发（memory 无限增长
 /// 且旧史被静默丢弃）。
-pub(super) fn apply_history_limit(mut msgs: Vec<MemoryMsg>) -> Vec<MemoryMsg> {
-    if let Ok(lim) = std::env::var("HISTORY_LIMIT") {
-        if let Ok(n) = lim.trim().parse::<usize>() {
-            if n > 0 && msgs.len() > n {
-                msgs = msgs.split_off(msgs.len() - n);
-            }
-        }
+pub(super) fn apply_history_limit(history_limit: usize, mut msgs: Vec<MemoryMsg>) -> Vec<MemoryMsg> {
+    if history_limit > 0 && msgs.len() > history_limit {
+        msgs = msgs.split_off(msgs.len() - history_limit);
     }
     msgs
 }
 
 impl AgentLoopPlugin {
-    /// 生效轮次上限（E1 收编）：构造值兜底，`MAX_ROUNDS` env 每轮可热改
-    /// （web 设置面板保存即下轮对话生效，无需重启）。
-    pub(super) fn max_rounds(&self) -> usize {
-        std::env::var("MAX_ROUNDS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(self.max_rounds)
-    }
-
     /// 感知：拉取会话**全量**历史（不做窗口裁剪）。
     /// 窗口与压缩的顺序见 `apply_history_limit`（PLAN R3：先压缩判断，后窗口裁剪）。
     pub(super) async fn perceive(&self, src: &Envelope, session_id: &str) -> Result<Vec<MemoryMsg>, KernelError> {
@@ -121,15 +101,16 @@ impl AgentLoopPlugin {
         messages: &[MemoryMsg],
         tools: Option<&[ToolSpec]>,
         stream: Option<(&str, &str)>,
+        cfg: &AgentLoopConfig,
     ) -> Result<LlmChatResp, KernelError> {
         let mut payload = json!({"op": "chat", "messages": messages});
         // L2+L3：`LLM_CONTEXT_TOKENS` 语义为「上下文窗口」——随 payload 透传 num_ctx，
         // ollama native 映射 options.num_ctx（本地估算闸与服务端窗口对齐，一处配置两侧生效）。
-        // L7：仅本地窗口型 provider 生效（context::context_window_tokens 内部判定 LLM_PROVIDER，
+        // L7：仅本地窗口型 provider 生效（config::from_env 内部判定 LLM_PROVIDER，
         // 云端 API / 非名单 provider 返回 0 = 不下发且 token 闸禁用——避免为本地调小的窗口
         // 误压云端历史）。注意 provider 取自 host 启动时 env：Web 热切换 provider 后本判定
         // 滞后，重启校正（provider 切换低频，可接受）。
-        let window = context::context_window_tokens();
+        let window = cfg.context_window;
         if window > 0 {
             payload["num_ctx"] = json!(window);
         }
@@ -171,20 +152,21 @@ impl AgentLoopPlugin {
         messages: &mut Vec<MemoryMsg>,
         tools: Option<&[ToolSpec]>,
         stream: Option<(&str, &str)>,
+        cfg: &AgentLoopConfig,
     ) -> Result<LlmChatResp, KernelError> {
-        let attempts = retry_attempts();
-        let base = retry_base_ms();
+        let attempts = cfg.retry_attempts;
+        let base = cfg.retry_base_ms;
         let mut attempt: u32 = 0;
         let mut degraded = false; // P8：本轮 chat 是否已做过超限降级（只做一次）
         loop {
-            let res = self.plan(src, messages, tools, stream).await;
+            let res = self.plan(src, messages, tools, stream, cfg).await;
             if !degraded {
                 let overflow = matches!(&res, Ok(r) if
                     r.error.as_ref().and_then(|e| e.get("code")).and_then(Value::as_str) == Some("CONTEXT_OVERFLOW"));
                 if overflow {
                     degraded = true;
                     let taken = std::mem::take(messages);
-                    *messages = context::degrade(taken);
+                    *messages = context::degrade(taken, cfg);
                     tracing::warn!(target: ID, session = %session_id, "llm context overflow, halving window/limits and retrying once");
                     self.trace(
                         src,
@@ -249,6 +231,8 @@ impl AgentLoopPlugin {
     }
 
     pub(super) async fn chat_run(&self, env: &Envelope, req: &ChatReq) -> Value {
+        // E3：运行参数快照（每次 chat 解析一次；Web 热通道语义不变——改 env 下轮生效）。
+        let cfg = AgentLoopConfig::from_env(self.max_rounds);
         // 回合开始时间：兜底产物扫描的新鲜度基准（见 turn_starts 字段注释）
         self.turn_starts
             .lock()
@@ -256,7 +240,7 @@ impl AgentLoopPlugin {
             .insert(req.session_id.clone(), std::time::SystemTime::now());
         // 用户消息先入记忆（持久化），随后拉取全量历史。
         // R3：文本附件拼入 content，图片附件走结构化字段（llm-adapter 按 provider 映射）。
-        let user_msg = build_user_msg(&req.user_text, req.attachments.as_deref());
+        let user_msg = build_user_msg(&req.user_text, req.attachments.as_deref(), cfg.text_attach_limit);
         self.observe(env, &req.session_id, &[user_msg.clone()]).await;
         // trace 带全量原始附件（含文本 b64）：UI 重放展示缩略图/文件条，重新生成需原始 data_b64 重发
         let mut user_event = json!({"type": "user", "text": req.user_text});
@@ -266,7 +250,7 @@ impl AgentLoopPlugin {
         self.trace(env, &req.session_id, user_event).await;
 
         // 系统提示词 = 组装链（07 §2.1）+ 技能附录（软）
-        let system = format!("{}{}", self.resolve_system_prompt(env).await, self.skills_appendix(env).await);
+        let system = format!("{}{}", self.resolve_system_prompt(env, &cfg).await, self.skills_appendix(env, &cfg).await);
         let mut messages: Vec<MemoryMsg> = vec![MemoryMsg {
             role: "system".into(),
             content: Some(system),
@@ -278,8 +262,8 @@ impl AgentLoopPlugin {
             Ok(h) => {
                 // 双闸顺序（PLAN R3）：先对全量历史做压缩判断（超 TRIGGER 则摘要落盘），
                 // 再对（可能已压缩的）工作集应用 HISTORY_LIMIT 窗口。
-                let compacted = self.maybe_compact(env, &req.session_id, h).await;
-                messages.extend(apply_history_limit(compacted));
+                let compacted = self.maybe_compact(env, &req.session_id, h, &cfg).await;
+                messages.extend(apply_history_limit(cfg.history_limit, compacted));
             }
             Err(e) => {
                 self.trace(env, &req.session_id, json!({"type": "error", "where": "memory.get", "message": e.to_string()})).await;
@@ -310,18 +294,18 @@ impl AgentLoopPlugin {
         // 各轮 reasoning 收集于此，随最终 assistant 事件持久化（轮次 + 文本）。
         let mut round_reasonings: Vec<(u32, String)> = Vec::new();
         // 流式旁路：宿主以 AGENT_STREAM_DIR 下发目录；未配置即退化为一问一答（行为同改造前）。
-        let stream_path = stream_file_for(&req.session_id);
+        let stream_path = stream_file_for(cfg.stream_dir.as_deref(), &req.session_id);
         let mut usage = UsageAcc::default();
         let mut llm_ms: u64 = 0;
-        // 总预算（T4）：顶层取 env 缺省；子代理继承父链衰减后的剩余（req.*_left）。
+        // 总预算（T4）：顶层取配置缺省；子代理继承父链衰减后的剩余（req.*_left）。
         let budget = ChatBudget {
             deadline: req
                 .budget_ms_left
                 .map(|ms| Instant::now() + Duration::from_millis(ms))
-                .or_else(|| budget_secs().map(|d| Instant::now() + d)),
-            tokens_left: req.tokens_left.or_else(token_budget),
+                .or_else(|| cfg.budget.map(|d| Instant::now() + d)),
+            tokens_left: req.tokens_left.or(cfg.token_budget),
         };
-        let max_rounds = self.max_rounds();
+        let max_rounds = cfg.max_rounds;
         for _round in 0..max_rounds {
             rounds += 1;
             // 停车检查点①：每轮开头（取消 > 时长 > token）
@@ -333,7 +317,7 @@ impl AgentLoopPlugin {
             // P7/R5：发送前逐级收紧（token 闸启用且工作集超发送预算时）——窗口减半 →
             // tool_result 限额减半 → 仍超限即 CONTEXT_OVERFLOW，请求不发出。
             // 裁剪只影响本轮工作集，memory 全量历史不受影响。
-            messages = match context::tighten_for_context(messages) {
+            messages = match context::tighten_for_context(messages, &cfg) {
                 Ok(m) => m,
                 Err(v) => {
                     let msg = v["error"]["message"].as_str().unwrap_or_default().to_string();
@@ -341,7 +325,7 @@ impl AgentLoopPlugin {
                     return v;
                 }
             };
-            let resp = match self.plan_with_retry(env, &req.session_id, &mut messages, Some(&tools), stream).await {
+            let resp = match self.plan_with_retry(env, &req.session_id, &mut messages, Some(&tools), stream, &cfg).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.trace(env, &req.session_id, json!({"type": "error", "where": "llm.chat", "message": e.to_string()})).await;
@@ -362,7 +346,7 @@ impl AgentLoopPlugin {
             }
             if resp.tool_calls.is_empty() {
                 return self
-                    .finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms, std::mem::take(&mut round_reasonings))
+                    .finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms, std::mem::take(&mut round_reasonings), &cfg)
                     .await;
             }
             // 中间轮（带工具调用的轮次）思考留痕：最终轮由 finish 自行追加
@@ -396,7 +380,7 @@ impl AgentLoopPlugin {
                 attachments: None,
             };
             let mut round_msgs = vec![assistant_msg];
-            let limit = tool_result_limit();
+            let limit = cfg.tool_result_limit;
             let wave = self.manifest.max_inflight.unwrap_or(4).max(1);
             for group in resp.tool_calls.chunks(wave) {
                 // 停车检查点②'：波次间取消。工具执行可能很长（bash 等到命令超时 / 技能
@@ -426,7 +410,7 @@ impl AgentLoopPlugin {
                         }
                     }
                     steps.push(StepRecord { round: rounds, tool: tc.name.clone(), ms });
-                    self.act_end(env, &req.session_id, rounds, tc, &result, ms).await;
+                    self.act_end(env, &req.session_id, rounds, tc, &result, ms, &cfg).await;
                     round_msgs.push(MemoryMsg {
                         role: "tool".into(),
                         content: Some(truncate_chars(&result.to_string(), limit)),
@@ -455,7 +439,7 @@ impl AgentLoopPlugin {
         rounds += 1;
         let sid = self.next_sid(&req.session_id); // 单调唯一，形状不变
         let stream = stream_path.as_deref().map(|p| (p, sid.as_str()));
-        messages = match context::tighten_for_context(messages) {
+        messages = match context::tighten_for_context(messages, &cfg) {
             Ok(m) => m,
             Err(v) => {
                 let msg = v["error"]["message"].as_str().unwrap_or_default().to_string();
@@ -463,7 +447,7 @@ impl AgentLoopPlugin {
                 return v;
             }
         };
-        let resp = match self.plan_with_retry(env, &req.session_id, &mut messages, None, stream).await {
+        let resp = match self.plan_with_retry(env, &req.session_id, &mut messages, None, stream, &cfg).await {
             Ok(r) => r,
             Err(e) => {
                 self.trace(env, &req.session_id, json!({"type": "error", "where": "llm.chat", "message": e.to_string()})).await;
@@ -474,7 +458,7 @@ impl AgentLoopPlugin {
         llm_ms += resp.elapsed_ms.unwrap_or(0);
         if resp.ok && resp.tool_calls.is_empty() {
             return self
-                .finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms, std::mem::take(&mut round_reasonings))
+                .finish(env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms, std::mem::take(&mut round_reasonings), &cfg)
                 .await;
         }
         self.trace(env, &req.session_id, json!({"type": "error", "where": "max_rounds", "message": format!("agent loop exhausted max_rounds={max_rounds}")})).await;
@@ -500,6 +484,7 @@ impl AgentLoopPlugin {
         usage: UsageAcc,
         llm_ms: u64,
         mut round_reasonings: Vec<(u32, String)>,
+        cfg: &AgentLoopConfig,
     ) -> Value {
         let answer = resp.content.clone().unwrap_or_default();
         if answer.trim().is_empty() {
@@ -532,7 +517,7 @@ impl AgentLoopPlugin {
         // 答案文本兜底扫描（R10 前的既有设计，过滤改造时调用点曾遗失致 e2e 回归）：
         // 答案里提到的成品路径登记为 artifact（与 bash 输出同款启发式）；同一路径若
         // 已由 write_file 结构化登记，前端按回合+路径去重，不重复出卡。
-        for p in Self::scan_artifact_paths(&answer) {
+        for p in Self::scan_artifact_paths(&answer, &cfg.output_dir) {
             if !self.fresh_artifact(session_id, &p) {
                 continue; // 答案提及但非本轮生成（历史文件）：不上卡，点了也是 404
             }

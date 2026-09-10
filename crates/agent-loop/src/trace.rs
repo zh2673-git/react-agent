@@ -4,18 +4,14 @@
 //! `stream_file_for`（流式旁路文件路径推导与安全校验）。
 
 use super::*;
-use std::path::PathBuf;
-
-/// 流式旁路目录（宿主以 AGENT_STREAM_DIR 下发）；未配置 → 无流式（行为同改造前）。
-fn stream_dir() -> Option<PathBuf> {
-    std::env::var_os("AGENT_STREAM_DIR").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
-}
 
 /// 旁路文件路径：session 名来自 URL 参数，必须过安全校验（防路径穿越）。
 /// `#` 仅为子代理会话分隔符（`{parent}#sub-{n}`，R11）：允许出现在文件名中，
 /// 宿主网关按 `{session}#sub-*.jsonl` 前缀 glob 子文件——`#` 不进 URL，无注入面。
-pub(super) fn stream_file_for(session: &str) -> Option<String> {
-    let dir = stream_dir()?;
+/// 目录来自 `AgentLoopConfig.stream_dir`（E3 收编，宿主以 AGENT_STREAM_DIR 下发）；
+/// 未配置 → 无流式（行为同改造前）。
+pub(super) fn stream_file_for(dir: Option<&std::path::Path>, session: &str) -> Option<String> {
+    let dir = dir?;
     let safe = !session.is_empty()
         && session.len() <= 64
         && !session.contains("..")

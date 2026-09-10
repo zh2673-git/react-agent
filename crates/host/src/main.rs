@@ -133,10 +133,12 @@ async fn assemble(kernel: &Kernel, cfg: &HostConfig) -> anyhow::Result<()> {
         &llm_env,
     );
     let tools_script = cfg.plugins_dir.join("tools").join("tools_plugin.py");
+    // T6：tools 开 Concurrent——插件并发安全已审查（call 仅读 _ENABLED/池，GIL 原子；
+    // 子进程独立；mcp._ensure_running 持锁）。收益：P4 波内并行真实生效 + T7 abort 即时受理。
     let tools_f = spawn::spawn_python(
         py,
         &tools_script,
-        manifests::guest_manifest("tools", &["tools.exec"], false),
+        manifests::guest_manifest("tools", &["tools.exec"], true),
         &tools_env,
     );
     let mut assets_env = cfg.passthrough_env();

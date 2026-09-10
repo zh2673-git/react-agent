@@ -29,6 +29,7 @@
 mod budget;
 mod chat;
 mod compaction;
+mod config;
 mod context;
 mod contract;
 mod secrets;
@@ -178,14 +179,6 @@ fn path_within(child: &str, parent: &str) -> bool {
     c != p && c.starts_with(&format!("{p}\\"))
 }
 
-/// 工具结果回喂上限（字符）：0 = 禁用。
-fn tool_result_limit() -> usize {
-    std::env::var("TOOL_RESULT_LIMIT")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(DEFAULT_TOOL_RESULT_CHARS)
-}
-
 impl AgentLoopPlugin {
     /// 生成下一轮流式 sid（sid 唯一性修复）：`{session}-r{N}`，N 为 per session 单调
     /// 递增序号，首个 sid 以 unix 毫秒为种子。跨对话回合不再碰撞（旧 bug：每回合
@@ -256,6 +249,20 @@ impl Plugin for AgentLoopPlugin {
                 } else {
                     self.cancels.lock().unwrap().insert(sid.to_string());
                     tracing::info!(target: ID, session = %sid, "cancel requested");
+                    // T7（工具级取消）：联动 tools `abort` op——终止该会话运行中的工具子进程
+                    //（技能工具等），使"点停止"对工具执行段也生效（此前需等 deadline）。
+                    // 即发即忘 + 2s 上限；失败仅记录——轮次边界取消仍兜底。
+                    if let Some(host) = self.host.get() {
+                        let host = host.clone();
+                        let payload = json!({"op": "abort", "session_id": sid});
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                host.call_capability(CAP_TOOLS, payload, std::time::Duration::from_secs(2)).await
+                            {
+                                tracing::debug!(target: ID, "tools abort dispatch failed: {e}");
+                            }
+                        });
+                    }
                     Ok(json!({"ok": true, "session_id": sid, "note": "取消信号已置位；当前轮完成后中断"}))
                 }
             }
@@ -373,7 +380,7 @@ mod tests {
         // 文本兜底双闸：bash 输出里 rg/ls/git 列出的整仓 .md/源码不刷卡
         let text = "README.md crates/agent-loop/PLAN.md docs/02-架构设计.md src/main.rs \
                     outputs/report.md outputs/关于开学.docx 泥石流灾害预警防范的通知.docx report.xlsx";
-        let got = AgentLoopPlugin::scan_artifact_paths(text);
+        let got = AgentLoopPlugin::scan_artifact_paths(text, "outputs");
         // 产物目录内放行（md 也收）+ 二进制成品放行（任意位置）
         assert!(got.contains(&"outputs/report.md".to_string()), "{got:?}");
         assert!(got.iter().any(|s| s.ends_with("关于开学.docx")), "{got:?}");
@@ -421,18 +428,10 @@ mod tests {
         }
     }
 
-    /// TEXT_ATTACH_LIMIT 是进程级 env：并行测试同时改写会串扰，用互斥锁串行化。
-    static TEXT_ATTACH_LIMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn build_user_msg_routes_attachments() {
-        // 隔离并行测试的 TEXT_ATTACH_LIMIT 串扰（截断行为由专项测试覆盖）
-        let _guard = TEXT_ATTACH_LIMIT_LOCK.lock().unwrap();
-        let saved_limit = std::env::var("TEXT_ATTACH_LIMIT").ok();
-        std::env::set_var("TEXT_ATTACH_LIMIT", "24000");
-
         // R3：无附件 → 纯文本消息，attachments 不出现
-        let plain = build_user_msg("hi", None);
+        let plain = build_user_msg("hi", None, 24000);
         assert_eq!(plain.content.as_deref(), Some("hi"));
         assert!(plain.attachments.is_none());
 
@@ -442,7 +441,7 @@ mod tests {
             Attachment { name: "b.txt".into(), mime: "text/plain".into(), data_b64: "aGVsbG8=".into() }, // "hello"
             Attachment { name: "c.bin".into(), mime: "application/octet-stream".into(), data_b64: "AAA=".into() },
         ];
-        let m = build_user_msg("看图", Some(&atts));
+        let m = build_user_msg("看图", Some(&atts), 24000);
         let content = m.content.expect("content");
         assert!(content.starts_with("看图"));
         assert!(content.contains("[附件: b.txt]"), "文本附件内嵌 content");
@@ -454,33 +453,22 @@ mod tests {
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].name, "a.png");
         assert_eq!(imgs[0].data_b64, "QUJD");
-
-        match saved_limit {
-            Some(v) => std::env::set_var("TEXT_ATTACH_LIMIT", v),
-            None => std::env::remove_var("TEXT_ATTACH_LIMIT"),
-        }
     }
 
     #[test]
     fn build_user_msg_truncates_oversized_text_attachment() {
-        // R3：文本附件超限 → 截断并显式标注（模型必须感知内容不完整）
-        let _guard = TEXT_ATTACH_LIMIT_LOCK.lock().unwrap();
-        let saved = std::env::var("TEXT_ATTACH_LIMIT").ok();
-        std::env::set_var("TEXT_ATTACH_LIMIT", "4");
+        // R3：文本附件超限 → 截断并显式标注（模型必须感知内容不完整）。
+        // E3 后上限为注入参数（不再读 env），直接传 4 验证截断行为。
         let atts = [Attachment {
             name: "big.txt".into(),
             mime: "text/plain".into(),
             // "abcdefghij"（10 字符，上限 4）
             data_b64: "YWJjZGVmZ2hpag==".into(),
         }];
-        let m = build_user_msg("q", Some(&atts));
+        let m = build_user_msg("q", Some(&atts), 4);
         let c = m.content.expect("content");
         assert!(c.contains("truncated"), "截断必须标注: {c}");
         assert!(c.contains("[附件: big.txt]"));
         assert!(m.attachments.is_none(), "文本附件不进结构化字段");
-        match saved {
-            Some(v) => std::env::set_var("TEXT_ATTACH_LIMIT", v),
-            None => std::env::remove_var("TEXT_ATTACH_LIMIT"),
-        }
     }
 }

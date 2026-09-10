@@ -31,6 +31,9 @@ pub fn kernel_repo() -> PathBuf {
 }
 
 pub fn guest_manifest(id: &str, capabilities: &[&str]) -> Manifest {
+    // T6：tools 开 Concurrent（插件并发安全已审查——call 仅读共享态、子进程独立、
+    // mcp._ensure_running 持锁），波内并行真实生效 + T7 abort 可即时受理。
+    let concurrent = id == "tools";
     Manifest {
         name: PluginId::new(id),
         kind: PluginKind::Capability,
@@ -39,7 +42,7 @@ pub fn guest_manifest(id: &str, capabilities: &[&str]) -> Manifest {
         capabilities: capabilities.iter().map(|c| Capability::new(*c)).collect(),
         dependencies: vec![],
         domain: Domain::Process,
-        semantics: Semantics::Serial,
+        semantics: if concurrent { Semantics::Concurrent } else { Semantics::Serial },
         priority: 1,
         max_inflight: Some(8),
         fuel_limit: None,

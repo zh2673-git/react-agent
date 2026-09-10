@@ -51,7 +51,8 @@ react-agent 的大脑：把"用户一句话"变成"多轮感知 → 规划 → �
 
 浏览器 SSE 就是轮询这些 trace 事件。**新增 / 改事件类型要同步前端 `render()`**：
 
-- `chat_start` / `user` / `thinking`（规划摘要）/ `plan` / `tool_call` / `tool_result` / `assistant` / `error`
+- 全集（13 类，2026-09-10 修正：早期文档列出的 `chat_start`/`thinking`/`plan` 不存在——思考流由旁路 `stream_*` 承载）：
+  `user` / `assistant` / `tool_call` / `tool_result` / `artifact` / `sources` / `file_change` / `compaction` / `subagent` / `skill_loaded` / `skill_installed` / `error` / `retry`
 - `retry`（PLAN T3）：LLM 瞬态失败重试观测，带 `attempt` / `delay_ms` / `reason`；前端未知类型按前向兼容忽略。
 - `tool_call` / `tool_result` 事件带 `id`（tool_call_id，审计对位）；`tool_result` 另带 `ms`（该工具
   自身耗时）、`ok`、`result_truncated`（2000 字符）、`memory_truncated`（回喂进 memory 的内容是否被截断）。
@@ -107,8 +108,10 @@ react-agent 的大脑：把"用户一句话"变成"多轮感知 → 规划 → �
 
 - `stream_file_for(session, round)`：生成 `.stream/<session>.jsonl` 绝对路径（session 名过安全校验）。
   **规则必须与 host 侧 `config.rs::stream_file` 完全一致**，否则前端读不到。
-- 每轮 `llm.chat` 的 `payload` 带 `stream_path` + `sid`；首个 `thinking` / `plan` 阶段即 `startStream`，
-  后续 `assistant` 增量经 `stream_delta` 显示，最终 `assistant` 事件带完整内容。
+- 每轮 `llm.chat` 的 `payload` 带 `stream_path` + `sid`；llm-adapter 在生成过程中往旁路文件写
+  `start`/`delta`/`end`/`error` 帧，host 网关 tail 后映射为 `stream_start`/`stream_delta`/
+  `stream_end`/`stream_error` 推前端（`error` 与 trace 的 `error` 撞名故加前缀），最终 `assistant`
+  事件带完整内容。
 - 多轮 `usage` 在 `UsageAcc` 里累计（用户看总消耗）；`elapsed_ms` 取本轮 LLM 耗时。
 
 > **sid 唯一性（已修复，2026-09-08）**：`sid` 形如 `{session}-r{N}`，N 为 per session
@@ -140,5 +143,8 @@ ReAct 主循环在**轮次边界**轮询取消标志（PLAN P2/T1），运行中
 - **前端**：发送期间显示「停止」按钮（与发送互斥），点击发取消请求并以状态条反馈。
 
 **粒度边界**：轮次边界取消（K499）+ 流式逐帧中断（R1）双通道后，进行中的 LLM 流式可即时中断；
-工具执行不中断——照常完成，随后不再进入下一轮。
+工具执行段自 T7 起可中断——cancel op 联动向 tools 插件发 `abort` op（即发即忘，2s 上限），
+按会话终止运行中的工具子进程（覆盖技能工具 `_exec_command` 路径；bash/web 内建工具自带
+≤60s timeout，泄漏线程由 serve(max_workers=16) 纵深兜底）。tools 插件已开 Concurrent
+（T6，并发安全已审查），abort 与在途 call 并行受理不再排队。
 同族停车检查还有总预算（时长/token，K508，见「核心循环」）。

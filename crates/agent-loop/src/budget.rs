@@ -8,37 +8,8 @@
 use super::*;
 use std::time::Instant;
 
-/// 单次 chat 总时长预算（T4）：`CHAT_BUDGET_SECS`（秒，支持小数便于测试；0=禁用，缺省 900）。
-/// 这是轮次边界的护栏——轮内超支由单步 deadline（5s/60s/600s）封顶，不追求精确。
-/// 缺省 900s 须 ≥ LLM_DEADLINE(600s)：否则一次长思考 + 工具轮会在轮边界被误掐。
-pub(super) fn budget_secs() -> Option<Duration> {
-    let v: f64 = std::env::var("CHAT_BUDGET_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(900.0);
-    if v <= 0.0 {
-        return None;
-    }
-    Duration::try_from_secs_f64(v).ok()
-}
-
-/// 单次 chat 总 token 预算（T4）：`CHAT_TOKEN_BUDGET`（input+output 累计；0=禁用）。
-pub(super) fn token_budget() -> Option<u64> {
-    match std::env::var("CHAT_TOKEN_BUDGET").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(n) if n > 0 => Some(n),
-        _ => None,
-    }
-}
-
-/// LLM 瞬态失败重试次数（T3）：`LLM_RETRY_ATTEMPTS`（缺省 2，上限 6）。
-pub(super) fn retry_attempts() -> u32 {
-    std::env::var("LLM_RETRY_ATTEMPTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2).min(6)
-}
-
-/// 重试退避基数毫秒（T3）：`LLM_RETRY_BASE_MS`（缺省 500；0 用于测试立即重试）。
-pub(super) fn retry_base_ms() -> u64 {
-    std::env::var("LLM_RETRY_BASE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(500)
-}
+// 预算/重试参数已于 E3 收编至 `config::AgentLoopConfig`（from_env 单点解析 +
+// warn-on-invalid）；本文件保留瞬态判定、预算结构与轮次边界停车检查。
 
 /// 瞬态判定（T3）：限流/超时/网关类错误值得重试；参数/鉴权类重试无益。
 /// llm-adapter 的 provider 异常统一为 code=LLM_ERROR + message="{ExcType}: {exc}"，

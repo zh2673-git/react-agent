@@ -51,6 +51,7 @@ class McpServer:
         self._responses: queue.Queue = queue.Queue()
         self._next_id = 0
         self._id_lock = threading.Lock()
+        self._ensure_lock = threading.Lock()  # T6：_ensure_running 全程持锁，防并发双 start
         self._last_start = 0.0  # monotonic；崩溃退避窗口基准
         self.status = "stopped"
 
@@ -113,12 +114,14 @@ class McpServer:
         return result
 
     def _ensure_running(self) -> None:
-        """调用前保活：活着直接用；崩溃则按退避窗口重启（窗口内拒绝，防抖动）。"""
-        if self._proc is not None and self._proc.poll() is None and self.status == "ready":
-            return
-        if time.monotonic() - self._last_start < RESTART_BACKOFF_SECS:
-            raise McpError(f"MCP server '{self.name}' 不可用（崩溃退避中，稍后重试）", "MCP_UNAVAILABLE")
-        self.start()
+        """调用前保活：活着直接用；崩溃则按退避窗口重启（窗口内拒绝，防抖动）。
+        T6：tools 开 Concurrent 后多线程并发调用——全程持锁防双 start 竞态。"""
+        with self._ensure_lock:
+            if self._proc is not None and self._proc.poll() is None and self.status == "ready":
+                return
+            if time.monotonic() - self._last_start < RESTART_BACKOFF_SECS:
+                raise McpError(f"MCP server '{self.name}' 不可用（崩溃退避中，稍后重试）", "MCP_UNAVAILABLE")
+            self.start()
 
     # ── JSON-RPC ─────────────────────────────────────────────────────────
 

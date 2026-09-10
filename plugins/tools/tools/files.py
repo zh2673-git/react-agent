@@ -19,6 +19,7 @@ import difflib
 import fnmatch
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -251,7 +252,7 @@ def _write_file(args: dict) -> dict:
             if tag in ("insert", "replace"):
                 added += j2 - j1
         result["changes"] = {"added_lines": added, "removed_lines": removed}
-    tmp = real.with_name(real.name + f".tmp{os.getpid()}")  # 同目录临时文件 + 原子替换
+    tmp = real.with_name(real.name + f".tmp{os.getpid()}_{threading.get_ident()}")  # 同目录临时文件 + 原子替换（T6：并发写入加线程号防撞名）
     try:
         _write_newline_safe(tmp, content)
         os.replace(tmp, real)

@@ -5,6 +5,7 @@
 //! `output_dir` / `fresh_artifact`）、来源登记（`detect_sources` / `extract_sources`）、
 //! 字符截断（`truncate_chars`）。
 
+use super::config::AgentLoopConfig;
 use super::*;
 use std::time::Instant;
 
@@ -99,7 +100,12 @@ impl AgentLoopPlugin {
             v
         } else {
             match self
-                .call(src, CAP_TOOLS, json!({"op": "call", "name": tc.name, "args": tc.arguments}), TOOLS_DEADLINE)
+                .call(
+                    src,
+                    CAP_TOOLS,
+                    json!({"op": "call", "name": tc.name, "args": tc.arguments, "session_id": session_id}),
+                    TOOLS_DEADLINE,
+                )
                 .await
             {
                 Ok(v) => v,
@@ -116,12 +122,21 @@ impl AgentLoopPlugin {
 
     /// 行动收尾：tool_result 观测。`ms` 为该工具自身耗时（并行下与墙钟无关）；
     /// `memory_truncated` 表明回喂进 memory 的内容是否被截断（PLAN R2 后全文不再入库）。
-    pub(super) async fn act_end(&self, src: &Envelope, session_id: &str, round: u32, tc: &ToolCall, result: &Value, ms: u64) {
+    pub(super) async fn act_end(
+        &self,
+        src: &Envelope,
+        session_id: &str,
+        round: u32,
+        tc: &ToolCall,
+        result: &Value,
+        ms: u64,
+        cfg: &AgentLoopConfig,
+    ) {
         tracing::info!(target: "react_progress", round, tool = %tc.name, ms, "✓ round {round}: {} ({}ms)", tc.name, ms);
         // 事件日志：结果截断（防大输出撑爆审计文件），memory 侧另有 8000 字符预算
         let result_str = result.to_string();
         let full_chars = result_str.chars().count();
-        let limit = tool_result_limit();
+        let limit = cfg.tool_result_limit;
         let truncated: String = result_str.chars().take(2000).collect();
         self.trace(
             src,
@@ -135,7 +150,7 @@ impl AgentLoopPlugin {
         )
         .await;
         // 产物登记：给用户的成品文件在事件流里结构化落账，前端渲染可点击文件卡片
-        self.detect_artifacts(src, session_id, tc, result).await;
+        self.detect_artifacts(src, session_id, tc, result, cfg).await;
         // 来源登记：web 检索/阅读的引用链接结构化落账，前端渲染溯源卡（信息溯源）
         self.detect_sources(src, session_id, tc, result).await;
         // 变更登记（V2 执行可见性）：write/edit 成功 → file_change 事件结构化落账，
@@ -146,7 +161,14 @@ impl AgentLoopPlugin {
     /// 产物检测：write_file/edit_file 是结构化结果直接取 path/bytes；bash 从输出文本
     /// 扩展名启发式扫描（python-docx 等子进程产物）。误报无害——前端点击由 /files
     /// 服务兜底 404；漏报仅少一张卡片。
-    pub(super) async fn detect_artifacts(&self, src: &Envelope, session_id: &str, tc: &ToolCall, result: &Value) {
+    pub(super) async fn detect_artifacts(
+        &self,
+        src: &Envelope,
+        session_id: &str,
+        tc: &ToolCall,
+        result: &Value,
+        cfg: &AgentLoopConfig,
+    ) {
         if result.get("ok") != Some(&json!(true)) {
             return;
         }
@@ -176,7 +198,7 @@ impl AgentLoopPlugin {
             }
             "bash" => {
                 let out = inner.get("output").and_then(Value::as_str).unwrap_or("");
-                for p in Self::scan_artifact_paths(out) {
+                for p in Self::scan_artifact_paths(out, &cfg.output_dir) {
                     if !self.fresh_artifact(session_id, &p) {
                         continue; // 历史文件：ls/git 输出误报，不上卡
                     }
@@ -247,16 +269,6 @@ impl AgentLoopPlugin {
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
-    }
-
-    /// 产物输出目录（方案 A）：AGENT_OUTPUT_DIR，缺省 `outputs`（工作区内相对路径）。
-    /// 安全边界不变——文件工具越界拦截照旧，本约定只是给模型一个统一去处。
-    pub(super) fn output_dir() -> String {
-        std::env::var("AGENT_OUTPUT_DIR")
-            .ok()
-            .map(|s| s.trim().trim_matches(['/', '\\']).to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "outputs".into())
     }
 
     /// 兜底扫描路径的「新鲜度」闸：文件真实存在且 mtime ≥ 回合开始（容差 2s，吸收
@@ -338,13 +350,13 @@ impl AgentLoopPlugin {
     /// 二进制成品扩展名放行；文本类扩展（md/html/txt…）仅产物目录内放行——bash 输出
     /// 里 rg/ls/git 列出的源码与文档路径高频出现，不设此闸必刷屏。文本类成品仍可经
     /// write_file 结构化登记（PRODUCT_EXTS 全集，不受此限）。
-    pub(super) fn scan_artifact_paths(text: &str) -> Vec<String> {
+    pub(super) fn scan_artifact_paths(text: &str, output_dir: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         // 工作区目录名（如 react-agent）：用于截掉绝对路径前缀（含空格路径被空白切断的场景）
         let root_name = std::env::var("WORKSPACE_ROOT")
             .ok()
             .and_then(|ws| std::path::Path::new(&ws).file_name().map(|n| n.to_string_lossy().into_owned()));
-        let out_dir_prefix = format!("{}/", Self::output_dir());
+        let out_dir_prefix = format!("{}/", output_dir);
         for tok in text.split_whitespace() {
             let t = tok.trim_matches(|c: char| "()[]{}<>\"'`，。；：！？）【】、".contains(c));
             // 截前缀：token 中含「<sep>工作区目录名<sep>」→ 取其后的相对路径
