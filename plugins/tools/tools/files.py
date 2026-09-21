@@ -82,7 +82,7 @@ def _is_core_path(real: Path) -> bool:
     # plugins/tools 顶层：只允许新建/改非内置模块 .py（L2 自扩展），内置名保护
     if len(parts) >= 3 and parts[0] == "plugins" and parts[1] == "tools":
         name = parts[2]
-        if name in {"files", "bash", "web", "grep", "symbols", "mcp", "__init__", "__pycache__"}:
+        if name in {"files", "bash", "web", "grep", "symbols", "mcp", "todo", "__init__", "__pycache__"}:
             return True
     return False
 

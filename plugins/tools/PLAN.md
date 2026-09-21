@@ -479,3 +479,96 @@
 
 - secrets 单测 4 项（嵌套替换/无密钥 no-op/收集去重与短值过滤/敏感键名发现）+ agent-loop
   既有 37 集成全绿；`act_exec`/`act_begin` 咽喉接线由集成路径覆盖。
+
+## 十一、v5：内置工具效率增强 ✅（2026-09-21 立项并实施）
+
+> 触发：用户对照 pi / DeepSeek Harness / opencode 评审后指出「agent 执行时反复试、效率低」，
+> 要求按建议实施。审计定位：**工具数量不少（9+3+三池），弱在"单位轮次信息产出"**——
+> 命中后二次读取、语义导航断层、任务计划不外化、回喂一刀切截断四个根因。
+> **用户同时确认：真 LSP 因太重不采用（与 §七「已评估暂不做」决策一致），继续轻量
+> tree-sitter 路线**——本节全部走「现有工具加参数 + 一件新工具 + 编排层一处策略分化」。
+
+### 审计结论（效率根因，按影响排序）
+
+1. **回喂截断一刀切**：`TOOL_RESULT_LIMIT=8000` 对所有工具统一生效（`chat.rs` 回喂点 +
+   `act_end` 观测点），read_file（limit 默认 2000 行）与 grep 大概率被腰斩 → agent 被迫
+   多轮 offset 续读；token 闸仅本地窗口 provider 生效，云端无预算分化。
+2. **grep 信息密度低**：无上下文行（命中即断行，定位必跟一次 read_file）、无 count/
+   files_with_matches 模式（无法先量级后细看）、不读 .gitignore（噪音稀释命中）。
+3. **语义导航只有"定义"一半**：symbols_search 仅回定义（§七 v4），"谁调用了 X"类问题
+   只能 grep→read 循环；§七已预留 v5=语法级引用查询，本节落地。
+4. **任务计划不外化**：无 todo 工具，长任务计划存于上下文，压缩（COMPACT_TRIGGER）后
+   丢失即重新探索。
+
+### 方案
+
+1. **grep 增强**（`tools/grep.py`，全部加参不改既有默认行为）：
+   - `context_before` / `context_after`（0-10，默认 0）：上下文行按 rg 风格输出
+     （`path-ln- text`，连续块间 `--` 分隔），重叠区间合并；max_results 仍按命中行计数。
+   - `output_mode`：`content`（默认，旧行为）/ `count`（每文件命中数 `path:count`）/
+     `files_with_matches`（文件清单）——先量级后细看的两段式检索。
+   - `respect_gitignore`（默认 true）：轻量 .gitignore 解析（逐目录加载规则，支持 `!`
+     取反 / 尾 `/` 目录锚 / 首 `/` 锚定 / basename 与路径后缀匹配；最后匹配生效），
+     命中忽略规则的文件跳过并计数；剪枝遍历时忽略目录不再下钻。点目录与噪音目录
+     硬剪枝不变（.gitignore 只是增量）。
+2. **symbols_search 引用查询**（`tools/symbols.py`，§七 v5 预留落地）：
+   - 新参 `mode`：`definitions`（默认，旧行为）/ `references`。
+   - references 语义：tree-sitter 语法级**精确同名**标识符匹配（identifier /
+     type_identifier，大小写敏感），排除定义名节点（语法级非语义级——同名不同符号、
+     宏展开、跨文件类型分发不区分，与 §七「已知限制」一致，语义兜底仍靠 bash 编译/
+     测试闭环）；返回 `{references:[{file,line,text}],total,truncated}`。
+   - references 模式 query 必填；kind 不适用（给了给字段级错误）；language 过滤沿用。
+   - 仍即时解析无索引无跨调用状态（A1 精神，空间契约不变）。
+3. **新内置工具 `todo`（第 10 件，解冻依据=用户明确要求实施）**（`tools/todo.py`）：
+   - `{todos:[{id,content,status(pending|in_progress|completed|cancelled)}],merge?}` 写入
+     / 校验（id 非空唯一、status 枚举、≤50 条）；省略 todos = 只读返回当前清单。
+   - 持久化 `MEMORY_DATA_DIR/todo.json`（缺省回退工作区 `.stream/`）——跨压缩、跨会话
+     可恢复；内存态 + 落盘同写。
+   - 注册三处同步：`tools_plugin._ALL` / `_BUILTIN_MODULES`、`files._is_core_path` 内置
+     名集、`config.rs::ALL_TOOL_NAMES`（9→10）；manifest 0.5.0→0.6.0。
+   - TOOLS_ENABLED 缺省=内置全集，todo 自动启用，零配置。
+4. **回喂预算按工具分化**（编排层 `agent-loop`，一处咽喉）：
+   - `effective_result_limit(tool, cfg)`：read_file ×4（8000→32000，2000 行级文件可一次
+     读全）、grep / symbols_search ×3（命中块 + 引用清单不被腰斩）、其余维持基线；
+     `TOOL_RESULT_LIMIT` / `0=禁用` 语义不变（作基线乘）。
+   - 接线两处：`chat.rs` 回喂点 + `act_end` 的 `memory_truncated` 判定（两处口径一致）。
+
+### 已评估不做（本轮）
+
+- **真 LSP 桥接**：维持 §七决策——太重（server 启动/内存/生命周期成本与「问一次就走」
+  不匹配），用户本次再次确认；语法级 references 为轻量替代。
+- **bash 持久会话 / 后台作业**：改动面大（§六已记录），本轮不做，维持现状。
+- **gitignore 全语义**（`**` 递归通配、字符类、全局 excludesfile）：轻量实现只覆盖常见
+  规则形态，`**` 由 fnmatch 的 `*` 跨 `/` 近似；复杂仓库噪音由硬剪枝兜底。
+
+### 验证契约（P/Q/I）
+
+- P：临时工作区夹具（多文件/嵌套 .gitignore 含取反与目录锚/含定义与调用的 py+rs 源码）。
+- Q：grep 上下文行块与 `--` 分隔、count/files_with_matches、gitignore 跳过计数与取反；
+  symbols references 命中调用点且排除定义行、kind+references 拒绝；todo 写读往返、
+  状态枚举与重名校验、落盘恢复；`ALL_TOOL_NAMES` list=10。
+- I：grep/symbols 既有默认行为回归（不带新参输出不变）；`cargo test --workspace` 全绿
+  （Rust 改动仅回喂预算，`oversized_tool_result_is_truncated_in_context` 回归必须过）；
+  越界拦截 / 装载≠启用 / reload 保护不变。
+
+### 实施记录（2026-09-21）
+
+- 交付：`tools/grep.py`（_Ignore 轻量 gitignore + 上下文块合并 + 三输出模式）+
+  `tools/symbols.py`（`mode=references`：_def_name_points 排除定义名节点，标识符节点类型
+  按语言枚举 rust identifier/type_identifier/field_identifier、py identifier、ts 系
+  identifier/type_identifier/property_identifier；精确同名大小写敏感）+ `tools/todo.py`
+  （第 10 件，全量替换式 + MEMORY_DATA_DIR/todo.json 原子落盘，落盘失败降级内存态并标注）
+  + agent-loop `effective_result_limit`（read_file ×4 / grep、symbols_search ×3 / 其余基线；
+  `chat.rs` 回喂点与 `act_end` memory_truncated 两处同口径）+ 注册四处同步（tools_plugin
+  _ALL/_BUILTIN_MODULES/manifest 0.6.0、files._is_core_path、config.rs ALL_TOOL_NAMES 9→10）
+  + SYSTEM.md 探索纪律更新（grep 上下文/量级两段式、references、todo）+ README 契约同步。
+- 验证：python 行为断言 35 项全过（gitignore 取反/目录锚/嵌套/关闭开关、上下文块 `--`
+  分隔与 rg 风格行前缀、count/files_with_matches、references 命中调用点且排除定义行
+  total=3、references 参数闸、todo 写读往返/落盘恢复/重名/枚举/上限）；py_compile 5 文件过；
+  `cargo test --workspace` 全绿（agent-loop 18+37、host 21、e2e 全套；其中
+  `oversized_tool_result_is_truncated_in_context` 回归过——该用例工具名 calculator 走基线
+  预算不受分化影响）。首轮曾现 host lib 单测 1 项偶发失败（2s 级时序敏感），连跑三轮均绿，
+  与本改动无关（本改动未触碰其断言面）。
+- 时空契约：空间 = todo 落盘 MEMORY_DATA_DIR（既有快照/undo 体系目录），symbols 仍无索引
+  无跨调用状态；时间 = 三工具均为单次请求-响应，agent-loop 主循环零改动（仅回喂预算函数）；
+  规则 = grep/symbols 越界仍走 `_guard` 唯一拦截点，todo 无文件系统面（落盘点固定）。

@@ -411,7 +411,6 @@ impl AgentLoopPlugin {
                 attachments: None,
             };
             let mut round_msgs = vec![assistant_msg];
-            let limit = cfg.tool_result_limit;
             let wave = self.manifest.max_inflight.unwrap_or(4).max(1);
             for group in resp.tool_calls.chunks(wave) {
                 // 停车检查点②'：波次间取消。工具执行可能很长（bash 等到命令超时 / 技能
@@ -449,7 +448,11 @@ impl AgentLoopPlugin {
                     self.act_end(env, &req.session_id, rounds, tc, &result, ms, &cfg, obs).await;
                     round_msgs.push(MemoryMsg {
                         role: "tool".into(),
-                        content: Some(truncate_chars(&result.to_string(), limit)),
+                        // 回喂预算按工具分化（PLAN tools §十一）：信息密集型工具放宽
+                        content: Some(truncate_chars(
+                            &result.to_string(),
+                            super::tools_exec::effective_result_limit(&tc.name, &cfg),
+                        )),
                         tool_calls: None,
                         tool_call_id: Some(tc.id.clone()),
                         attachments: None,

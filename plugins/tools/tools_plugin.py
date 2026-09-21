@@ -66,6 +66,7 @@ from tools import bash as bash_mod
 from tools import files as files_mod
 from tools import grep as grep_mod
 from tools import mcp as mcp_mod
+from tools import todo as todo_mod
 from tools import web as web_mod
 
 # v4 第 9 件（symbols_search）：依赖 tree-sitter-language-pack（pin <1.0）。依赖缺失时
@@ -76,7 +77,7 @@ except ImportError as _exc:  # pragma: no cover - 缺依赖环境
     symbols_mod = None
     print(f"[tools] symbols_search 未装载（缺依赖）: {_exc}", file=sys.stderr)
 
-_ALL: dict = {**files_mod.TOOLS, **bash_mod.TOOLS, **web_mod.TOOLS, **grep_mod.TOOLS}
+_ALL: dict = {**files_mod.TOOLS, **bash_mod.TOOLS, **web_mod.TOOLS, **grep_mod.TOOLS, **todo_mod.TOOLS}
 if symbols_mod is not None:
     _ALL = {**_ALL, **symbols_mod.TOOLS}
 ALL_TOOLS: dict = _ALL
@@ -137,7 +138,7 @@ _DEFERRED_ENABLED: set[str] = set()
 
 # reload 时跳过的内置模块名（重入 sys.modules 清理无意义，且防止测试/误删内置实现；
 # mcp 是传输模块无 TOOLS dict，列入防 reload 误扫）
-_BUILTIN_MODULES = frozenset({"files", "bash", "web", "grep", "symbols", "mcp"})
+_BUILTIN_MODULES = frozenset({"files", "bash", "web", "grep", "symbols", "mcp", "todo"})
 # 动态工具条目必须暴露的键（与内置 ToolSpec 三元组同规范：dict 键即 name，不要求冗余键）
 _REQUIRED_KEYS = ("description", "parameters", "run")
 
@@ -303,7 +304,7 @@ def _reload_modules() -> tuple[list[str], list[str], list[dict]]:
 
 class ToolsPlugin:
     def manifest(self) -> dict:
-        return {"id": "tools", "version": "0.5.0", "api_version": "0.1"}
+        return {"id": "tools", "version": "0.6.0", "api_version": "0.1"}
 
     def init(self, config) -> None:
         global _ENABLED

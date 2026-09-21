@@ -12,8 +12,9 @@
 | `tools/files.py` | `read_file` / `write_file` / `edit_file` / `list_dir`（`_guard` 越界拦截、`_guard_write` v6 核心写保护、`_snapshot_change` W15 变更快照、undo 落盘） |
 | `tools/bash.py` | `bash`（沙箱策略 + W16 快照区执行前后比对 → `changes[]` 追溯） |
 | `tools/web.py` | `web_search` / `web_read` |
-| `tools/grep.py` | `grep`（正则内容搜索，复用 files 的 `_guard`/`_display`/`_decode`） |
-| `tools/symbols.py` | `symbols_search`（tree-sitter 语法级符号检索；缺依赖时本模块不装载） |
+| `tools/grep.py` | `grep`（正则内容搜索，复用 files 的 `_guard`/`_display`/`_decode`；v5 起支持上下文行 / count / files_with_matches / .gitignore） |
+| `tools/symbols.py` | `symbols_search`（tree-sitter 语法级符号检索，definitions/references 双模式；缺依赖时本模块不装载） |
+| `tools/todo.py` | `todo`（任务清单外化，全量替换式写入 + 落盘持久化，v5 第 10 件） |
 
 ## op 契约（线契约 03 §2.3 + R9 扩展）
 
@@ -31,7 +32,7 @@
 `MISSING_ARG`、`BAD_ARG`、`TOOL_ERROR`、`TOOL_TIMEOUT`（技能工具超时）、`TOOL_EXEC_ERROR`
 （技能工具执行体失败）。带 `field` 时宿主面板可定位到具体参数。
 
-## 工具清单（9 个）
+## 工具清单（10 个）
 
 | 工具 | 文件 | 要点 |
 |---|---|---|
@@ -42,8 +43,9 @@
 | `bash` | bash | 受沙箱策略约束（见下）；W16 起执行前后自动快照比对，间接改文件同样可追溯（见「bash 文件追溯」） |
 | `web_search` | web | 返回 `[{title,url,snippet}]`，后端可配 |
 | `web_read` | web | 网页转 markdown 文本 |
-| `grep` | grep | 正则内容搜索 `path:line: text`，剪枝噪音/二进制/大文件 |
-| `symbols_search` | symbols | 语法级定义检索（function/method/class/…），query=名字子串大小写不敏感 + kind/language 过滤；依赖 `tree-sitter-language-pack<1.0`（1.x 改按需下载，禁用），缺依赖自动降级为 8 件 |
+| `grep` | grep | 正则内容搜索 `path:line: text`，剪枝噪音/二进制/大文件；v5：`context_before/after`（0-10，rg 风格 `path-ln- text`，块间 `--`）、`output_mode`（content/count/files_with_matches）、`respect_gitignore`（默认 true，轻量子集：取反/目录锚/锚定，最后匹配生效） |
+| `symbols_search` | symbols | 语法级符号检索：`mode=definitions`（默认，query=名字子串大小写不敏感 + kind/language 过滤）/ `mode=references`（精确同名标识符引用，排除定义名节点，大小写敏感，kind 不适用）；依赖 `tree-sitter-language-pack<1.0`（1.x 改按需下载，禁用），缺依赖自动降级为 9 件 |
+| `todo` | todo | 任务清单外化：全量替换式写入 `{todos:[{id,content,status}]}`（省略 todos=只读），落盘 `MEMORY_DATA_DIR/todo.json`（缺省 `.stream/`），跨压缩/跨会话可恢复 |
 
 全集名同时硬编码在 `crates/host/src/config.rs::ALL_TOOL_NAMES`——**增删工具必须同步改那里**。
 

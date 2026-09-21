@@ -334,7 +334,7 @@ pub fn apply_config_file_to_env() -> usize {
 }
 
 /// 工具全集名（与 plugins/tools/tools_plugin.py 的 ALL_TOOLS 保持同步）。
-pub const ALL_TOOL_NAMES: [&str; 9] = [
+pub const ALL_TOOL_NAMES: [&str; 10] = [
     "read_file",
     "write_file",
     "edit_file",
@@ -344,6 +344,7 @@ pub const ALL_TOOL_NAMES: [&str; 9] = [
     "web_read",
     "grep",
     "symbols_search",
+    "todo",
 ];
 
 #[cfg(test)]

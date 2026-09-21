@@ -107,6 +107,21 @@ pub(super) fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// 回喂预算按工具分化（PLAN tools §十一 v5）：统一 8000 字符会把 read_file / grep /
+/// symbols_search 的大结果腰斩，agent 被迫多轮 offset 续读（效率根因 #1）。
+/// 信息密集型工具按基线（TOOL_RESULT_LIMIT，0=禁用语义不变）放大倍数放行，其余维持基线。
+pub(super) fn effective_result_limit(tool: &str, cfg: &AgentLoopConfig) -> usize {
+    if cfg.tool_result_limit == 0 {
+        return 0;
+    }
+    let mult = match tool {
+        "read_file" => 4,                       // 2000 行级文件尽量一次读全
+        "grep" | "symbols_search" => 3,         // 命中块 / 引用清单不被腰斩
+        _ => 1,
+    };
+    cfg.tool_result_limit * mult
+}
+
 impl AgentLoopPlugin {
     /// 行动前奏：登记 tool_call 观测（trace + tracing 日志）。
     /// 并行波次开始前由 chat_body 按**声明顺序**统一发出（trace 顺序稳定）。
@@ -222,10 +237,11 @@ impl AgentLoopPlugin {
     ) {
         let plan = ObsPlan::resolve(&tc.name, obs);
         tracing::info!(target: "react_progress", round, tool = %tc.name, ms, "✓ round {round}: {} ({}ms)", tc.name, ms);
-        // 事件日志：结果截断（防大输出撑爆审计文件），memory 侧另有 8000 字符预算
+        // 事件日志：结果截断（防大输出撑爆审计文件），memory 侧另有按工具分化的预算
+        // （effective_result_limit，与 chat.rs 回喂点口径一致）
         let result_str = result.to_string();
         let full_chars = result_str.chars().count();
-        let limit = cfg.tool_result_limit;
+        let limit = effective_result_limit(&tc.name, cfg);
         let truncated: String = result_str.chars().take(2000).collect();
         self.trace(
             src,

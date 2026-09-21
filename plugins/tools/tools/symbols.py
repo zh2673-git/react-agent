@@ -1,9 +1,14 @@
-"""symbols_search 工具：语法级符号检索（2026-09-07 解冻新增，第 9 件内置工具，PLAN v4）。
+"""symbols_search 工具：语法级符号检索（2026-09-07 解冻新增，第 9 件内置工具，PLAN v4；
+2026-09-21 v5 引用查询：mode=references 语法级引用定位，PLAN §十一 / §七 v5 预留落地）。
 
-把「文本搜索」升级为「语法级符号地图」：tree-sitter 解析源码，只回定义位置
-（function/method/class/struct/...），模型无需从 grep 命中噪声里辨认哪一行是定义。
-query = 符号名子串匹配（大小写不敏感）+ kind/language 过滤；不暴露原生 S-expression
-query（模型手写语法错误率高，且定位语义即名字级搜索）。
+把「文本搜索」升级为「语法级符号地图」：tree-sitter 解析源码，definitions 模式只回定义位置
+（function/method/class/struct/...），模型无需从 grep 命中噪声里辨认哪一行是定义；
+references 模式回**精确同名**标识符的全部引用位置（排除定义名节点），回答「谁调用了 X」。
+query = 符号名子串匹配（definitions，大小写不敏感）/ 精确同名（references，大小写敏感）；
+不暴露原生 S-expression query（模型手写语法错误率高，且定位语义即名字级搜索）。
+
+references 语法级非语义级：同名不同符号、宏展开、跨文件类型分发不区分（§七已知限制），
+语义兜底靠 bash 编译/测试闭环；仍即时解析不建索引（无跨调用可变态）。
 
 纪律：与 grep 同源——_guard realpath 越界拦截（唯一拦截点）、点目录与噪音目录剪枝、
 大文件（>1MB）跳过并计数、max_results 全局早停；即时解析不建索引（无跨调用可变态）。
@@ -71,6 +76,15 @@ _LANG_DEFS: dict[str, dict] = {"rust": _RUST_DEFS, "python": _PY_DEFS, "typescri
 # 可变值才视为函数绑定：const arrow = (x) => ...（排除 const x = foo() 调用结果）
 _FN_VALUE_TYPES = {"arrow_function", "function_expression", "function"}
 
+# 引用查询（v5）：各语言的「值标识符」节点类型（identifier / 类型名 / 字段名）
+_REFS_NODE_TYPES: dict[str, set[str]] = {
+    "rust": {"identifier", "type_identifier", "field_identifier"},
+    "python": {"identifier"},
+    "typescript": {"identifier", "type_identifier", "property_identifier"},
+    "tsx": {"identifier", "type_identifier", "property_identifier"},
+    "javascript": {"identifier", "type_identifier", "property_identifier"},
+}
+
 
 def _signature(text: str) -> str:
     """签名 = 节点文本截到第一个 {/;/换行，压平空白，封顶 160 字符。"""
@@ -127,11 +141,69 @@ def _extract(root_node, lang: str) -> list[tuple[str, str, int, str]]:
     return out
 
 
+def _def_name_points(root_node, lang: str) -> set[tuple[int, int]]:
+    """定义名节点的 (line0, col0) 集合——references 结果排除这些位置（定义不算引用）。"""
+    defs = _LANG_DEFS[lang]
+    pts: set[tuple[int, int]] = set()
+    stack = [root_node]
+    while stack:
+        n = stack.pop()
+        if not n.is_named:
+            continue
+        rule = defs.get(n.type)
+        if rule:
+            _, field = rule
+            name_node = n.child_by_field_name(field)
+            if name_node is not None:
+                pts.add(name_node.start_point)
+        if n.type == "variable_declarator":
+            val = n.child_by_field_name("value")
+            name_node = n.child_by_field_name("name")
+            if val is not None and val.type in _FN_VALUE_TYPES and name_node is not None:
+                pts.add(name_node.start_point)
+            continue
+        stack.extend(reversed(n.children))
+    return pts
+
+
+def _references(root_node, lang: str, src_lines: list[str], needle_bytes: bytes,
+                def_pts: set[tuple[int, int]]) -> list[tuple[int, str]]:
+    """语法级精确同名标识符引用：[(line(1-based), 行文本截断)]，按行升序。"""
+    wanted = _REFS_NODE_TYPES[lang]
+    out: list[tuple[int, str]] = []
+    stack = [root_node]
+    while stack:
+        n = stack.pop()
+        if not n.is_named:
+            continue
+        if n.type in wanted and n.start_point not in def_pts and n.text == needle_bytes:
+            line0 = n.start_point[0]
+            text = " ".join(src_lines[line0].split())[:_MAX_SIG_CHARS] if line0 < len(src_lines) else ""
+            out.append((line0 + 1, text))
+        stack.extend(reversed(n.children))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
 def _symbols_search(args: dict) -> str:
     query = args.get("query")
     if query is not None and (not isinstance(query, str) or not query.strip()):
         raise ToolError("参数 'query' 必须是非空字符串（符号名子串，大小写不敏感；省略则列出全部）", code="BAD_ARG", field="query")
     needle = query.strip().lower() if isinstance(query, str) else None
+    mode = args.get("mode") or "definitions"
+    if mode not in ("definitions", "references"):
+        raise ToolError(
+            f"参数 'mode' 须为 'definitions' 或 'references'，收到: {mode!r}",
+            code="BAD_ARG", field="mode",
+        )
+    if mode == "references":
+        if needle is None:
+            raise ToolError(
+                "references 模式必须提供 'query'（精确同名标识符，大小写敏感）",
+                code="MISSING_ARG", field="query",
+            )
+        if args.get("kind") is not None:
+            raise ToolError("references 模式不支持 'kind' 过滤（引用无定义类别语义）", code="BAD_ARG", field="kind")
     kind = args.get("kind")
     if kind is not None:
         if not isinstance(kind, str) or kind.strip().lower() not in _KINDS:
@@ -158,6 +230,7 @@ def _symbols_search(args: dict) -> str:
         roots = [root]
 
     symbols: list[dict] = []
+    refs: list[dict] = []
     skipped_big = skipped_lang = 0
     truncated = False
     for root in roots:
@@ -185,6 +258,21 @@ def _symbols_search(args: dict) -> str:
                 tree = get_parser(lang_of_file).parse(src)
             except Exception:  # noqa: BLE001 - 单文件解析失败跳过（fail-open 于观测，不影响其余文件）
                 continue
+            if mode == "references":
+                src_lines = src.decode("utf-8", "replace").splitlines()
+                pts = _def_name_points(tree.root_node, lang_of_file)
+                for line, text in _references(
+                    tree.root_node, lang_of_file, src_lines, query.strip().encode("utf-8"), pts
+                ):
+                    refs.append({
+                        "file": _display(p).replace(os.sep, "/"),
+                        "line": line,
+                        **({"text": text} if text else {}),
+                    })
+                    if len(refs) >= max_results:
+                        truncated = True
+                        break
+                continue
             for k, name, line, sig in _extract(tree.root_node, lang_of_file):
                 if kind is not None and k != kind:
                     continue
@@ -200,6 +288,17 @@ def _symbols_search(args: dict) -> str:
                 if len(symbols) >= max_results:
                     truncated = True
                     break
+    if mode == "references":
+        refs.sort(key=lambda r: (r["file"], r["line"]))
+        return json.dumps(
+            {
+                "references": refs,
+                "total": len(refs),
+                "truncated": truncated,
+                **({"skipped": {"oversize": skipped_big, "unsupported_ext": skipped_lang}} if (skipped_big or skipped_lang) else {}),
+            },
+            ensure_ascii=False,
+        )
     symbols.sort(key=lambda s: (s["file"], s["line"]))
     return json.dumps(
         {
@@ -222,22 +321,28 @@ def _walk_os(root: Path):
 TOOLS = {
     "symbols_search": {
         "description": (
-            "Syntax-level symbol search over source files via tree-sitter: returns definition sites only "
+            "Syntax-level symbol search over source files via tree-sitter. "
+            "mode='definitions' (default): returns definition sites "
             "(kind/name/file/line/signature for function, method, class, struct, enum, trait, impl, module, "
-            "typedef, const, interface). query is a case-insensitive substring of the symbol name; omit it to "
-            "list all definitions in range. Languages: rust/py/ts/tsx/js (by extension). Skips dot-dirs, noise "
-            "dirs, binary and >1MB files. Args: query?, file? | path? (mutually exclusive), kind?, language?, "
-            "max_results (1-200, default 50)."
+            "typedef, const, interface); query is a case-insensitive substring of the symbol name, omit it to "
+            "list all definitions in range. "
+            "mode='references': finds all syntactic usages of an exact symbol name (case-sensitive; "
+            "definition sites excluded) — use it to answer 'who calls/uses X' instead of grep+read loops. "
+            "Note: syntactic not semantic (same-name identifiers across scopes are not disambiguated). "
+            "Languages: rust/py/ts/tsx/js (by extension). Skips dot-dirs, noise dirs, binary and >1MB files. "
+            "Args: query?, mode? ('definitions'|'references'), file? | path? (mutually exclusive), "
+            "kind? (definitions only), language?, max_results (1-200, default 50)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "symbol-name substring (case-insensitive); omit for all"},
+                "query": {"type": "string", "description": "symbol-name substring (definitions, case-insensitive) or exact name (references, case-sensitive)"},
+                "mode": {"type": "string", "enum": ["definitions", "references"], "description": "default definitions"},
                 "file": {"type": "string", "description": "single file to scan (mutually exclusive with path)"},
                 "path": {"type": "string", "description": "file or dir to scan (default '.')"},
-                "kind": {"type": "string", "enum": sorted(_KINDS)},
+                "kind": {"type": "string", "enum": sorted(_KINDS), "description": "definitions mode only"},
                 "language": {"type": "string", "enum": SUPPORTED_LANGS},
-                "max_results": {"type": "integer", "description": "max symbols (1-200)"},
+                "max_results": {"type": "integer", "description": "max symbols/references (1-200)"},
             },
         },
         "run": _symbols_search,
