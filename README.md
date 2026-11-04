@@ -2,6 +2,15 @@
 
 基于 [agent-kernel](https://github.com/zh2673-git/agent-kernel)（v0.1.8，git 依赖 tag）构建的下游 agent 项目：**Rust InProcess 编排 + Python/TS 跨语言插件（gRPC Process 域）** 的 ReAct 式 agent。
 
+## 宣传片
+
+[![《自己给自己加装零件的机器》宣传片](docs/images/react-agent-poster.jpg)](https://zh2673-git.github.io/react-agent/showcase.html)
+
+《自己给自己加装零件的机器》——2 分 04 秒，20 镜，全片由代码逐镜绘制（HTML Canvas + 动效原语），
+讲一个 ReAct agent 怎么把"四拍循环"做成可观测、可回滚、可自扩展的机器。
+[▶ 在线观看](https://zh2673-git.github.io/react-agent/showcase.html)
+
+
 ```
 宿主(装配内核+前端) ──dispatch──> agent-loop(Rust, InProcess)
                                       │ call_plugin（按 Envelope.target 路由，跨域）

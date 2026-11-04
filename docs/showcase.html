@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>react-agent · 宣传片《自己给自己加装零件的机器》</title>
+<meta name="description" content="react-agent 宣传片：ReAct 循环 + 生产级工具 + 三家 LLM + 双前端 + 自扩展。全片由代码逐镜绘制，2 分 04 秒。">
+<meta property="og:title" content="react-agent · 宣传片">
+<meta property="og:description" content="这不是一个更聪明的助手，这是第一台自己给自己加装零件的机器。">
+<meta property="og:type" content="video.other">
+<meta property="og:image" content="https://zh2673-git.github.io/react-agent/images/react-agent-poster.jpg">
+<meta property="og:video" content="https://zh2673-git.github.io/react-agent/images/react-agent.mp4">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #07050a; color: #f4efe8; }
+  body {
+    font-family: 'Microsoft YaHei', 'PingFang SC', system-ui, sans-serif;
+    min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 32px 20px 40px;
+  }
+  .film { width: min(1200px, 100%); }
+  .kicker {
+    font-size: 12px; letter-spacing: .26em; text-transform: uppercase;
+    color: #e0955a; margin: 0 0 14px; text-align: center;
+  }
+  h1 {
+    font-size: clamp(20px, 3.2vw, 34px); font-weight: 700; line-height: 1.35;
+    text-align: center; margin: 0 0 8px; letter-spacing: .04em;
+  }
+  .sub { text-align: center; color: #a89a8c; font-size: 14px; margin: 0 0 26px; }
+  .player {
+    position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000;
+    border: 1px solid rgba(224, 149, 90, .2);
+    box-shadow: 0 24px 80px rgba(0, 0, 0, .72);
+  }
+  .player video { width: 100%; height: 100%; display: block; }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 10px 22px; justify-content: space-between;
+    margin-top: 18px; font-size: 13px; color: #8a7c6e;
+  }
+  .meta a { color: #d8c8b6; text-decoration: none; border-bottom: 1px solid rgba(216, 200, 182, .3); }
+  .meta a:hover { color: #f4efe8; border-color: #f4efe8; }
+  footer { margin-top: 34px; font-size: 12px; color: #5a4e44; letter-spacing: .08em; text-align: center; line-height: 1.9; }
+</style>
+</head>
+<body>
+<main class="film">
+  <p class="kicker">react-agent · showcase</p>
+  <h1>自己给自己加装零件的机器</h1>
+  <p class="sub">感知 · 规划 · 行动 · 观察 —— 四拍一轮，每一拍都不许成黑箱</p>
+  <div class="player">
+    <video controls playsinline preload="metadata" poster="images/react-agent-poster.jpg">
+      <source src="images/react-agent.mp4" type="video/mp4">
+      你的浏览器不支持视频播放，可<a href="images/react-agent.mp4">下载观看</a>。
+    </video>
+  </div>
+  <div class="meta">
+    <span>2 分 04 秒 · 20 镜 · 1920×1080 · 30fps</span>
+    <span><a href="https://github.com/zh2673-git/react-agent">github.com/zh2673-git/react-agent</a></span>
+  </div>
+  <footer>
+    全片由 make-video 代码逐镜绘制（HTML Canvas + MV 动效原语），无任何第三方图像/视频生成<br>
+    旁白为 TTS 合成，配乐为程序化编写的交响床垫
+  </footer>
+</main>
+</body>
+</html>
