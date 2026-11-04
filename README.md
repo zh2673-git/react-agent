@@ -4,11 +4,7 @@
 
 ## 宣传片
 
-[![《自己给自己加装零件的机器》宣传片](docs/images/react-agent-poster.jpg)](https://zh2673-git.github.io/react-agent/showcase.html)
-
-《自己给自己加装零件的机器》——2 分 04 秒，20 镜，全片由代码逐镜绘制（HTML Canvas + 动效原语），
-讲一个 ReAct agent 怎么把"四拍循环"做成可观测、可回滚、可自扩展的机器。
-[▶ 在线观看](https://zh2673-git.github.io/react-agent/showcase.html)
+[![《自己给自己加装零件的机器》——2 分 00 秒，20 镜，**亮调纸感**（米白纸面 + 墨蓝结构 + 青×琥珀强调），\n主讲人是你的卡通形象（右下角悬浮小头像，全程在场不遮挡画面），\n**旁白是真人声音克隆**（Qwen3-TTS 零样本，非合成音库）；\n画面 16 镜代码逐镜绘制，4 镜插入**真实素材**（真实工作台、键盘、城市光轨、车间照片）。\n讲一个 ReAct agent 怎么把\四拍循环\做成可观测、可回滚、可自扩展的机器。\n[▶ 在线观看](https://zh2673-git.github.io/react-agent/showcase.html) · [MP4](docs/images/react-agent.mp4)
 
 
 ```

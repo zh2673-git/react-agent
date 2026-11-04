@@ -4,66 +4,79 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>react-agent · 宣传片《自己给自己加装零件的机器》</title>
-<meta name="description" content="react-agent 宣传片：ReAct 循环 + 生产级工具 + 三家 LLM + 双前端 + 自扩展。全片由代码逐镜绘制，2 分 04 秒。">
-<meta property="og:title" content="react-agent · 宣传片">
-<meta property="og:description" content="这不是一个更聪明的助手，这是第一台自己给自己加装零件的机器。">
+<meta name="description" content="react-agent 宣传片：ReAct 四拍循环 —— 可观测、可回滚、可自扩展。20 镜 / 2 分 00 秒，亮调纸感，真人克隆音色与卡通主讲同框，真实素材与代码绘制混用。">
+<meta property="og:title" content="react-agent · 宣传片《自己给自己加装零件的机器》">
+<meta property="og:description" content="这不是更聪明的助手，这是第一台自己给自己加装零件的机器。">
 <meta property="og:type" content="video.other">
-<meta property="og:image" content="https://zh2673-git.github.io/react-agent/images/react-agent-poster.jpg">
-<meta property="og:video" content="https://zh2673-git.github.io/react-agent/images/react-agent.mp4">
+<meta property="og:image" content="https://zh2673-git.github.io/react-agent/docs/images/react-agent-poster.jpg">
+<meta property="og:video" content="https://zh2673-git.github.io/react-agent/docs/images/react-agent.mp4">
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: light; }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: #07050a; color: #f4efe8; }
+  html, body { margin: 0; padding: 0; background: #f4efe4; color: #2b333d; }
   body {
     font-family: 'Microsoft YaHei', 'PingFang SC', system-ui, sans-serif;
     min-height: 100vh;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
-    padding: 32px 20px 40px;
+    padding: 34px 20px 44px;
+    background-image:
+      radial-gradient(ellipse at 50% 0%, #fffdf7 0%, #f4efe4 46%, #ebe4d5 100%),
+      repeating-linear-gradient(0deg, rgba(86,72,50,0.018) 0 1px, transparent 1px 3px);
   }
   .film { width: min(1200px, 100%); }
   .kicker {
     font-size: 12px; letter-spacing: .26em; text-transform: uppercase;
-    color: #e0955a; margin: 0 0 14px; text-align: center;
+    color: #0d6e86; margin: 0 0 14px; text-align: center; font-weight: 700;
   }
   h1 {
-    font-size: clamp(20px, 3.2vw, 34px); font-weight: 700; line-height: 1.35;
-    text-align: center; margin: 0 0 8px; letter-spacing: .04em;
+    font-size: clamp(21px, 3.3vw, 36px); font-weight: 800; line-height: 1.32;
+    text-align: center; margin: 0 0 8px; letter-spacing: .03em; color: #1d242c;
   }
-  .sub { text-align: center; color: #a89a8c; font-size: 14px; margin: 0 0 26px; }
+  .sub { text-align: center; color: #6a7480; font-size: 14px; margin: 0 0 26px; }
   .player {
-    position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000;
-    border: 1px solid rgba(224, 149, 90, .2);
-    box-shadow: 0 24px 80px rgba(0, 0, 0, .72);
+    position: relative; width: 100%; aspect-ratio: 16 / 9; background: #12161b;
+    border-radius: 14px; overflow: hidden;
+    border: 1px solid rgba(120,104,80,.22);
+    box-shadow: 0 30px 70px rgba(78,62,38,.28), 0 3px 10px rgba(78,62,38,.14);
   }
   .player video { width: 100%; height: 100%; display: block; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; justify-content: center; }
+  .chip {
+    font-size: 12px; padding: 5px 12px; border-radius: 999px;
+    background: #fffdf7; border: 1px solid rgba(120,104,80,.24); color: #4d5a67;
+  }
+  .chip b { color: #a8620f; font-weight: 700; }
   .meta {
     display: flex; flex-wrap: wrap; gap: 10px 22px; justify-content: space-between;
-    margin-top: 18px; font-size: 13px; color: #8a7c6e;
+    margin-top: 16px; font-size: 13px; color: #6a7480;
   }
-  .meta a { color: #d8c8b6; text-decoration: none; border-bottom: 1px solid rgba(216, 200, 182, .3); }
-  .meta a:hover { color: #f4efe8; border-color: #f4efe8; }
-  footer { margin-top: 34px; font-size: 12px; color: #5a4e44; letter-spacing: .08em; text-align: center; line-height: 1.9; }
+  .meta a { color: #0d6e86; text-decoration: none; border-bottom: 1px solid rgba(13,110,134,.32); }
+  .meta a:hover { color: #a8620f; border-color: #a8620f; }
+  footer { margin-top: 32px; font-size: 12px; color: #8a8478; letter-spacing: .06em; text-align: center; line-height: 1.9; }
 </style>
 </head>
 <body>
 <main class="film">
   <p class="kicker">react-agent · showcase</p>
   <h1>自己给自己加装零件的机器</h1>
-  <p class="sub">感知 · 规划 · 行动 · 观察 —— 四拍一轮，每一拍都不许成黑箱</p>
+  <p class="sub">ReAct 四拍循环 —— 可观测、可回滚、可自扩展</p>
   <div class="player">
-    <video controls playsinline preload="metadata" poster="images/react-agent-poster.jpg">
-      <source src="images/react-agent.mp4" type="video/mp4">
-      你的浏览器不支持视频播放，可<a href="images/react-agent.mp4">下载观看</a>。
+    <video controls playsinline preload="metadata" poster="docs/images/react-agent-poster.jpg">
+      <source src="docs/images/react-agent.mp4" type="video/mp4">
+      你的浏览器不支持视频播放，可<a href="docs/images/react-agent.mp4">下载观看</a>。
     </video>
   </div>
-  <div class="meta">
-    <span>2 分 04 秒 · 20 镜 · 1920×1080 · 30fps</span>
-    <span><a href="https://github.com/zh2673-git/react-agent">github.com/zh2673-git/react-agent</a></span>
+  <div class="chips">
+    <span class="chip"><b>亮调纸感</b> · 米白基底 / 墨蓝结构 / 青×琥珀</span>
+    <span class="chip"><b>真人音色克隆</b> · Qwen3-TTS 零样本</span>
+    <span class="chip"><b>卡通主讲</b> · 悬浮角标全程在场</span>
+    <span class="chip"><b>真实素材</b> · 4 镜实拍/实码/实日志</span>
   </div>
-  <footer>
-    全片由 make-video 代码逐镜绘制（HTML Canvas + MV 动效原语），无任何第三方图像/视频生成<br>
-    旁白为 TTS 合成，配乐为程序化编写的交响床垫
-  </footer>
+  <div class="meta">
+    <span>20 镜 · 2 分 00 秒 · 1920×1080 / 30fps</span>
+    <span><a href="docs/images/react-agent.mp4">下载 MP4</a> · <a href="../">返回仓库首页</a></span>
+  </div>
+  <footer>这不是更聪明的助手，这是第一台自己给自己加装零件的机器。<br>react-agent · 用 make-video 生产</footer>
 </main>
 </body>
 </html>
