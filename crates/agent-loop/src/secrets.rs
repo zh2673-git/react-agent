@@ -184,6 +184,7 @@ mod tests {
 
     #[test]
     fn config_mtime_is_zero_for_missing_file() {
+        std::env::remove_var("CONFIG_FILE");
         // CONFIG_FILE 未配置/文件不存在 → 0（仅 env 兜底键参与收集，不 panic）
         assert_eq!(config_mtime(), 0);
     }

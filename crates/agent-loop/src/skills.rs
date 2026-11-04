@@ -176,6 +176,37 @@ impl AgentLoopPlugin {
             Ok(v) => return v,
             Err(e) => return json!({"ok": false, "error": {"code": e.code(), "message": e.to_string()}}),
         };
+        // ② Phase 1 质量门：安装前跑 assets `skills.validate`（mode=install 只拦结构错误，
+        //    存量技能不被误伤）；不通过即拒绝安装，错误逐条回喂（code/path/message）。
+        //    门禁只对「结构化拒绝」生效：`errors` 非空才拦；空错误（旧版 assets 未实现
+        //    该 op / 内部异常）按「校验不可用」放行，避免误伤存量与第三方资产插件。
+        if let Ok(v) = self
+            .call(env, CAP_ASSETS, json!({"op": "skills.validate", "name": name, "mode": "install"}), ASSETS_DEADLINE)
+            .await
+        {
+            let errors = v.get("errors").and_then(Value::as_array).cloned().unwrap_or_default();
+            if v.get("ok") == Some(&json!(false)) && !errors.is_empty() {
+                let errors = Value::Array(errors);
+                self.trace(
+                    env,
+                    session_id,
+                    json!({"type": "skill_rejected", "skill": name, "errors": errors}),
+                )
+                .await;
+                return json!({
+                    "ok": false,
+                    "skill": name,
+                    "error": {
+                        "code": "SKILL_INVALID",
+                        "message": "技能未通过安装校验（结构错误），已在注册前拒绝",
+                        "details": errors,
+                    },
+                });
+            }
+            if v.get("ok") == Some(&json!(false)) {
+                tracing::warn!(target: ID, "skills.validate 未返回错误明细，按校验不可用放行: {v}");
+            }
+        }
         let (tools_loaded, tools_pending, issues) = self.install_skill_tools(env, name, &loaded).await;
         // ③ 事件日志（SSE 实时可达 → 前端内联卡 + 一键启用）
         self.trace(

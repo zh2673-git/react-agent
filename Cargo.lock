@@ -823,6 +823,7 @@ dependencies = [
  "agent-kernel-sdk",
  "anyhow",
  "async-trait",
+ "futures",
  "react-agent-agent-loop",
  "serde_json",
  "tokio",

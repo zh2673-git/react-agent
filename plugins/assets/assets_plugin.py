@@ -32,29 +32,14 @@ import sys
 from pathlib import Path
 
 from agent_kernel.guest import serve
+from skillkit import parse_frontmatter as _parse_frontmatter
+from skillkit import read_state, set_state, validate_skill
 
 _MAX_LOAD_BYTES = 256 * 1024
 
 
 def _err(message: str, code: str = "ASSET_ERROR") -> dict:
     return {"ok": False, "error": {"code": code, "message": message}}
-
-
-def _parse_frontmatter(text: str) -> dict | None:
-    """最小 frontmatter：`---` 围栏内的 `key: value` 行。缺 name/description → None。"""
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return None
-    meta: dict = {}
-    for line in lines[1:]:
-        if line.strip() == "---":
-            break
-        if ":" in line and not line.startswith((" ", "\t")):
-            key, _, value = line.partition(":")
-            meta[key.strip()] = value.strip()
-    if not meta.get("name") or not meta.get("description"):
-        return None
-    return meta
 
 
 def _valid_tools_decl(value: str) -> bool:
@@ -86,11 +71,15 @@ def _scan_skills(root: Path) -> dict:
         # 来源判定：显式 `origin: preset` → 出厂件；缺省/其他 → 用户件（出厂件必须显式
         # 声明——预置技能归 git 管理并打标，存量用户技能缺字段即正确归类，可删可改）
         origin = "preset" if meta.get("origin", "").strip() == "preset" else "user"
+        state = read_state(d, meta)
         catalog[meta["name"]] = {
             "description": meta["description"],
             "path": skill_md,
             "tools": tools_decl if _valid_tools_decl(tools_decl) else None,
             "origin": origin,
+            "status": state["status"],
+            "verification": state["verification"],
+            "legacy": state["legacy"],
         }
     return catalog
 
@@ -140,6 +129,7 @@ class AssetsPlugin:
                     # tools: true = 声明了配套工具（R9）；声明指向的文件是否存在不在此校验；
                     # origin 显式回传 preset|user（Phase A，老消费方忽略即兼容）
                     {"name": n, "description": s["description"], "origin": s["origin"],
+                     "status": s.get("status", "draft"), "verification": s.get("verification", "unverified"),
                      **({"tools": True} if s.get("tools") else {})}
                     for n, s in self._skills.items()
                 ],
@@ -156,7 +146,8 @@ class AssetsPlugin:
                 content = entry["path"].read_text(encoding="utf-8")[:_MAX_LOAD_BYTES]
             except OSError as exc:
                 return _err(f"skill 读取失败: {exc}")
-            resp = {"ok": True, "content": content, "origin": entry["origin"]}
+            resp = {"ok": True, "content": content, "origin": entry["origin"],
+                    "status": entry.get("status", "draft"), "verification": entry.get("verification", "unverified")}
             # origin 随 load 回传（tools.install 据此自动启用出厂技能工具；缺省消费方忽略即兼容）
             # R9：配套工具声明 → 回传 tools.json 绝对路径（供 tools.install 定点装载）；
             # 声明存在但文件缺失时附 missing（观察回写要让模型知道）。
@@ -168,6 +159,38 @@ class AssetsPlugin:
                     manifest["missing"] = [tools_decl]
                 resp["tools_manifest"] = manifest
             return resp
+        if op == "skills.validate":
+            # 静态质量门（Phase 1 接缝）：mode=install 只拦结构错误（存量技能不误伤）；
+            # mode=full 追加验收段/案例/契约/工具声明等质量门（candidate/active 必过）。
+            name = payload.get("name")
+            mode = payload.get("mode") or "full"
+            if mode not in ("full", "install"):
+                return _err(f"未知 mode: {mode}（合法值: full, install）", code="K400")
+            self._skills = _scan_skills(self._skills_root)
+            entry = self._skills.get(name)
+            if entry is None:
+                avail = ", ".join(sorted(self._skills)) or "（无）"
+                return _err(f"unknown skill: {name}（可用: {avail}）", code="UNKNOWN_SKILL")
+            return validate_skill(entry["path"].parent, mode)
+        if op == "skills.state":
+            # 读取优先；显式 set 走状态迁移表（不允许跳步），写入 state.json。
+            name = payload.get("name")
+            self._skills = _scan_skills(self._skills_root)
+            entry = self._skills.get(name)
+            if entry is None:
+                avail = ", ".join(sorted(self._skills)) or "（无）"
+                return _err(f"unknown skill: {name}（可用: {avail}）", code="UNKNOWN_SKILL")
+            dst = payload.get("set")
+            if dst:
+                return set_state(entry["path"].parent, dst)
+            state = read_state(entry["path"].parent)
+            return {
+                "ok": True,
+                "skill": name,
+                "status": state["status"],
+                "verification": state["verification"],
+                "legacy": state["legacy"],
+            }
         if op == "prompts.list":
             self._prompts = _scan_prompts(self._prompts_root)
             return {

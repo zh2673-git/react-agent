@@ -74,6 +74,43 @@ pub const RESERVED_TASK: &str = "task";
 /// 事件供前端内联卡与一键启用。不下发 tools。
 pub const RESERVED_SKILL_INSTALL: &str = "skill_install";
 
+/// RSI 策略钩子（Phase 1 接缝，**默认关闭**）：由 rsi-agent 的配置显式开启。
+/// - `contract_first`：非平凡任务的第一个工具调用前要求先写验收清单（可落 todo）；
+/// - `verify_before_final`：最终答复前要求逐条核对验收清单。
+/// 关闭时循环行为与启用前完全一致（不引入任何新分支）；提醒只发一次，避免死循环。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoopPolicy {
+    pub contract_first: bool,
+    pub verify_before_final: bool,
+}
+
+impl LoopPolicy {
+    /// 从 env 解析（config.json agent 段可写 `rsi_contract_first` / `rsi_verify_before_final`）。
+    pub fn from_env() -> Self {
+        Self {
+            contract_first: env_flag("RSI_CONTRACT_FIRST"),
+            verify_before_final: env_flag("RSI_VERIFY_BEFORE_FINAL"),
+        }
+    }
+}
+
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
+/// 验收清单痕迹判定（提示词层面）：接受中英文关键词；缺省无痕迹即视为「未核对」。
+pub fn has_acceptance_marker(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    ["验收", "acceptance", "checklist", "核对清单"]
+        .iter()
+        .any(|k| t.contains(k))
+}
+
+const CONTRACT_REMINDER: &str = "[policy:contract_first] 先写验收清单再行动：请在不调用工具的情况下，用 todo 或文本列出本次任务的验收标准（逐条、可核对），然后再开始调用工具。";
+const VERIFY_REMINDER: &str = "[policy:verify_before_final] 最终答复前请逐条核对验收清单，并在答复中给出每条标准的满足情况（满足/不满足/原因）。";
+
 /// 各转发步的相对截止（A2：Envelope.deadline 为相对时长）。
 /// LLM_DEADLINE=600s：深度思考模型长推理是常态（110s 时代被误伤）——单步上限放宽到
 /// 10 分钟覆盖全部商用推理模型流式思考；必须与 llm_adapter PROVIDER_DEADLINE=590s
@@ -101,6 +138,8 @@ Presemble precise tool arguments: read before writing files, and prefer edit_fil
 
 pub struct AgentLoopPlugin {
     max_rounds: usize,
+    /// RSI 策略钩子（默认关闭；见 `LoopPolicy`）。
+    policy: LoopPolicy,
     manifest: Manifest,
     host: OnceLock<Arc<dyn HostApi>>,
     /// 子会话计数（sub_session id 唯一性；并发下各链父会话 id 不同，全局递增即可）。
@@ -127,8 +166,13 @@ pub struct AgentLoopPlugin {
     sid_floor: AtomicU64,
 }
 
-/// 构造插件实例（`Arc<dyn Plugin>`）。
+/// 构造插件实例（`Arc<dyn Plugin>`）：策略钩子按 env 解析（缺省关闭）。
 pub fn new(max_rounds: usize) -> PluginInstance {
+    new_with_policy(max_rounds, LoopPolicy::from_env())
+}
+
+/// 构造插件实例并显式注入策略钩子（发行形态用；`LoopPolicy::default()` = 行为不变）。
+pub fn new_with_policy(max_rounds: usize, policy: LoopPolicy) -> PluginInstance {
     let manifest = Manifest {
         name: PluginId::new(ID),
         kind: PluginKind::Orchestrator,
@@ -154,6 +198,7 @@ pub fn new(max_rounds: usize) -> PluginInstance {
     };
     Arc::new(AgentLoopPlugin {
         max_rounds,
+        policy,
         manifest,
         host: OnceLock::new(),
         sub_counter: AtomicU64::new(0),
@@ -378,6 +423,7 @@ mod tests {
         // 直接构造结构体（tests 模块在 crate root 子级，可访问私有字段）
         let p = AgentLoopPlugin {
             max_rounds: 8,
+            policy: LoopPolicy::default(),
             manifest: Manifest {
                 name: PluginId::new(ID),
                 kind: PluginKind::Orchestrator,
@@ -507,5 +553,19 @@ mod tests {
         assert!(c.contains("truncated"), "截断必须标注: {c}");
         assert!(c.contains("[附件: big.txt]"));
         assert!(m.attachments.is_none(), "文本附件不进结构化字段");
+    }
+
+    #[test]
+    fn loop_policy_defaults_off_and_marker_detection() {
+        // Phase 1 接缝：默认策略必须关闭（行为零变化）；显式构造可开启。
+        assert_eq!(LoopPolicy::default(), LoopPolicy { contract_first: false, verify_before_final: false });
+        let on = LoopPolicy { contract_first: true, verify_before_final: true };
+        assert_ne!(on, LoopPolicy::default());
+
+        // 验收痕迹：中英文关键词命中；普通答复视为未核对。
+        assert!(has_acceptance_marker("验收标准：1. ... 2. ..."));
+        assert!(has_acceptance_marker("Acceptance criteria checked"));
+        assert!(has_acceptance_marker("todo checklist"));
+        assert!(!has_acceptance_marker("已完成，结果如下"));
     }
 }

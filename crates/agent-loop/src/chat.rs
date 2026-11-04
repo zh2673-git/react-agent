@@ -309,6 +309,11 @@ impl AgentLoopPlugin {
 
         let mut steps: Vec<StepRecord> = Vec::new();
         let mut rounds: u32 = 0;
+        // RSI 策略钩子状态（仅 `self.policy` 开启时生效；提醒各只发一次，防死循环）。
+        let policy = self.policy;
+        let mut acceptance_seen = false;
+        let mut contract_reminded = false;
+        let mut verify_reminded = false;
         // W9.4：逐轮思考留痕——流式旁路每轮覆写只留末轮，刷新重放看不到中间轮思考。
         // 各轮 reasoning 收集于此，随最终 assistant 事件持久化（轮次 + 文本）。
         let mut round_reasonings: Vec<(u32, String)> = Vec::new();
@@ -372,7 +377,53 @@ impl AgentLoopPlugin {
                 self.trace(env, &req.session_id, json!({"type": "error", "where": "llm.chat", "message": emsg})).await;
                 return json!({"ok": false, "error": err_val});
             }
+            let answer_text = resp.content.clone().unwrap_or_default();
+            if has_acceptance_marker(&answer_text) {
+                acceptance_seen = true;
+            }
+            // contract_first（默认关闭）：首个工具调用前要求验收清单；命中即放行，只拦一次。
+            if policy.contract_first && !contract_reminded && !acceptance_seen && !resp.tool_calls.is_empty() {
+                contract_reminded = true;
+                self.trace(
+                    env,
+                    &req.session_id,
+                    json!({"type": "policy", "where": "contract_first", "message": "缺少验收清单，已拦截首轮工具调用"}),
+                )
+                .await;
+                let reminder = MemoryMsg {
+                    role: "user".into(),
+                    content: Some(CONTRACT_REMINDER.into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    attachments: None,
+                };
+                self.observe(env, &req.session_id, &[reminder.clone()]).await;
+                messages.push(reminder);
+                continue;
+            }
             if resp.tool_calls.is_empty() {
+                // verify_before_final（默认关闭）：非平凡任务（有工具步骤或验收痕迹）最终答复前
+                // 需逐条核对验收清单；只提醒一次，答复后无论是否核对均收敛（防死循环）。
+                let trivial = steps.is_empty() && !acceptance_seen;
+                if policy.verify_before_final && !verify_reminded && !trivial && !has_acceptance_marker(&answer_text) {
+                    verify_reminded = true;
+                    self.trace(
+                        env,
+                        &req.session_id,
+                        json!({"type": "policy", "where": "verify_before_final", "message": "最终答复缺少验收核对，已提醒一次"}),
+                    )
+                    .await;
+                    let reminder = MemoryMsg {
+                        role: "user".into(),
+                        content: Some(VERIFY_REMINDER.into()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        attachments: None,
+                    };
+                    self.observe(env, &req.session_id, &[reminder.clone()]).await;
+                    messages.push(reminder);
+                    continue;
+                }
                 return self
                     .finish(
                         env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms,
@@ -440,6 +491,10 @@ impl AgentLoopPlugin {
                         }
                     }
                     steps.push(StepRecord { round: rounds, tool: tc.name.clone(), ms });
+                    if tc.name == "todo" {
+                        // 验收清单落 todo = 「清单已建立」，contract_first 后续轮次放行。
+                        acceptance_seen = true;
+                    }
                     if result.get("ok") != Some(&json!(true)) {
                         tool_failures += 1;
                     }

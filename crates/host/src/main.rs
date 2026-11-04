@@ -1,17 +1,17 @@
 //! react-agent 宿主：装配内核 → spawn guest → 注册（memory → llm-adapter → tools → agent-loop，
 //! provider 先探测）→ 按 `REACT_FRONTEND` 装配前端（repl / web）。
 //!
+//! 装配细节（插件清单、探测、bash 沙箱、技能工具预热）已抽到 `react_agent_host::assemble`：
+//! 默认 `HostSpec::from_env` 与改造前行为逐项一致；发行形态（rsi-agent）可替换 spec。
+//!
 //! 用法：
 //!   cargo run -p react-agent-host -- "一句话问题"     # 单轮
 //!   cargo run -p react-agent-host                    # REPL（默认前端）
 //!   REACT_FRONTEND=web cargo run -p react-agent-host # web 网关（默认 127.0.0.1:8710）
 
-use anyhow::{bail, Context};
-use agent_kernel_sdk::{Envelope, GlobalConfig, PluginId};
 use agent_kernel_kernel::Kernel;
-use react_agent_host::{config, config::HostConfig, frontend, manifests, spawn};
-use serde_json::{json, Value};
-use std::sync::Arc;
+use agent_kernel_sdk::GlobalConfig;
+use react_agent_host::{assemble::HostSpec, config, config::HostConfig, frontend};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -69,13 +69,15 @@ async fn main() -> anyhow::Result<()> {
     }
     std::env::set_var("AGENT_STREAM_DIR", &stream_dir);
 
+    // 装配规格（Phase 1 接缝）：默认 spec 与改造前行为逐项一致；发行形态可替换。
+    let spec = HostSpec::from_env(&cfg);
     // Kernel::new 本就返回 Arc<Kernel>
     let kernel = Kernel::new(GlobalConfig {
-        node_id: "react-agent".into(),
-        max_total_inflight: 32,
+        node_id: spec.node_id.clone(),
+        max_total_inflight: spec.max_total_inflight,
     });
 
-    assemble(&kernel, &cfg).await?;
+    react_agent_host::assemble::assemble_with(&kernel, &spec).await?;
 
     let session = std::env::var("SESSION_ID").unwrap_or_else(|_| "default".into());
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -92,248 +94,5 @@ async fn main() -> anyhow::Result<()> {
 
     kernel.stop();
     kernel.destroy().await;
-    Ok(())
-}
-
-/// 组装：并行 spawn + 注册 + 并行探测。memory/llm/tools/assets 互不依赖，串行装配曾让
-/// 最慢单项（llm 云端 ping 71s）拖满全程；并行后总时长 = 最慢单项。探测失败策略分层：
-/// memory/tools 为硬依赖（bail）；llm-adapter 进程存活即注册成功，云端 ping 不通仅 warn
-/// 降级（chat 时自然报错，web 设置可重配）；assets 本就是软依赖。
-async fn assemble(kernel: &Kernel, cfg: &HostConfig) -> anyhow::Result<()> {
-    let Some(node) = spawn::find_node() else {
-        bail!("node 未找到（--experimental-strip-types 需 >= 22.6）");
-    };
-    let Some(py) = spawn::find_interpreter() else {
-        bail!("python 未找到（guest 需要 grpcio；pip install grpcio httpx）");
-    };
-
-    // bash 沙箱探测（文件系统级，构造 tools env 前完成；15s 超时）
-    let mut tools_env = vec![("WORKSPACE_ROOT".into(), config::workspace_root())];
-    tools_env.extend(cfg.passthrough_env());
-    apply_bash_sandbox(&mut tools_env).await;
-
-    // ── 并行 spawn 四插件（互不依赖）──
-    let mem_script = cfg.plugins_dir.join("memory").join("memory_plugin.ts");
-    let mem_f = spawn::spawn_node_ts(
-        node,
-        &mem_script,
-        manifests::guest_manifest("memory", &["memory.session", "session.trace"], false),
-        &[],
-    );
-    let llm_script = cfg.plugins_dir.join("llm_adapter").join("llm_plugin.py");
-    // R1：Concurrent——abort op 必须能在流式 chat 进行中被并发受理（Serial = 插件级锁
-    // 排队到 chat 结束后，取消永远迟到）。安全性：Python guest gRPC 4 线程池天然并发；
-    // provider 均为请求时读 env 的无状态实现，configure 与 chat 的 env 读写竞争良性
-    // （最坏一次请求用旧/新模型，无跨调用可变态）。
-    let llm_env = cfg.llm_env();
-    let llm_f = spawn::spawn_python(
-        py,
-        &llm_script,
-        manifests::guest_manifest("llm-adapter", &["llm.chat"], true),
-        &llm_env,
-    );
-    let tools_script = cfg.plugins_dir.join("tools").join("tools_plugin.py");
-    // T6：tools 开 Concurrent——插件并发安全已审查（call 仅读 _ENABLED/池，GIL 原子；
-    // 子进程独立；mcp._ensure_running 持锁）。收益：P4 波内并行真实生效 + T7 abort 即时受理。
-    let tools_f = spawn::spawn_python(
-        py,
-        &tools_script,
-        manifests::guest_manifest("tools", &["tools.exec"], true),
-        &tools_env,
-    );
-    let mut assets_env = cfg.passthrough_env();
-    assets_env.push(("WORKSPACE_ROOT".into(), config::workspace_root()));
-    let assets_script = cfg.plugins_dir.join("assets").join("assets_plugin.py");
-    let assets_f = spawn::spawn_python(
-        py,
-        &assets_script,
-        manifests::guest_manifest("assets", &["assets.registry"], false),
-        &assets_env,
-    );
-    let (mem, llm, tools, assets) = tokio::join!(mem_f, llm_f, tools_f, assets_f);
-
-    let mem = mem.context("spawn memory(ts) 失败")?;
-    let llm = llm.context("spawn llm-adapter(py) 失败")?;
-    let tools = tools.context("spawn tools(py) 失败")?;
-    kernel.register(Arc::new(mem)).await;
-    kernel.register(Arc::new(llm)).await;
-    kernel.register(Arc::new(tools)).await;
-    match assets {
-        Ok(assets) => kernel.register(Arc::new(assets)).await,
-        Err(e) => tracing::warn!("spawn assets(py) 失败（软依赖，降级为无技能模式）: {e}"),
-    }
-
-    // ── 并行探测（带超时护栏：慢网络/挂死不得拖死启动）──
-    let llm_payload = json!({"op": "chat", "messages": [{"role": "user", "content": "ping"}]});
-    let p_mem = probe(kernel, "memory", json!({"op": "get", "session_id": "__probe__"}), "memory(ts)", 30);
-    let llm_label = format!("llm-adapter(py, provider={})", cfg.llm_provider);
-    let p_llm = probe(kernel, "llm-adapter", llm_payload, &llm_label, 120);
-    let tools_payload = json!({"op": "list"});
-    let p_tools = probe(kernel, "tools", tools_payload, "tools(py)", 30);
-    let assets_payload = json!({"op": "skills.list"});
-    let p_assets = probe(kernel, "assets", assets_payload, "assets(py)", 30);
-    let (r_mem, r_llm, r_tools, r_assets) = tokio::join!(p_mem, p_llm, p_tools, p_assets);
-
-    r_mem.context("memory 探测失败")?;
-    r_tools.context("tools 探测失败")?;
-    if let Err(e) = r_llm {
-        // 硬依赖判定收窄：guest 进程存活 = 依赖就位；云端联通性降级 warn（chat 时自然报错）
-        tracing::warn!("llm-adapter 云端 ping 未通过（启动继续，chat 时会报错，可在 web 设置重配）: {e}");
-    }
-    let assets_ok = r_assets.is_ok();
-    if let Err(e) = r_assets {
-        tracing::warn!("assets 探测失败（软依赖，降级为无技能模式）: {e}");
-    }
-
-    // R18（技能工具池预热）：池是 tools 进程内存态（装载≠启用），重启即空——技能 tab
-    // 的配套工具视图（tools.skill_tools）与对话清单都会空手而归。此处按注册表逐技能
-    // 静默重装（幂等：preset 装载即启用、用户技能经 TOOLS_ENABLED 延迟启用还原；与
-    // agent-loop 开局重装同款语义）。失败仅 warn 不阻断启动（chat 侧另有开局重装兜底）。
-    if assets_ok {
-        match warm_skill_tools(kernel).await {
-            Ok(n) if n > 0 => tracing::info!("技能工具池预热完成（{n} 个技能装载）"),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("技能工具池预热失败（不阻断启动，chat 侧开局会重试）: {e}"),
-        }
-    }
-
-    // 5. agent-loop（InProcess，硬依赖已全部就位）
-    kernel.register(react_agent_agent_loop::new(cfg.max_rounds)).await;
-    tracing::info!("agent-loop registered (max_rounds={})", cfg.max_rounds);
-    Ok(())
-}
-
-/// R18：技能工具池启动预热——逐技能 assets.load → tools.install（幂等，同 agent-loop
-/// 开局重装语义）。返回成功装载的技能数。
-async fn warm_skill_tools(kernel: &Kernel) -> anyhow::Result<usize> {
-    let list = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        kernel.dispatch(Envelope::new(PluginId::new("assets"), json!({"op": "skills.list"}))),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("skills.list 探测超时"))??;
-    let names: Vec<String> = list
-        .get("skills")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|s| s.get("name").and_then(Value::as_str).map(str::to_string))
-        .collect();
-    let mut warmed = 0usize;
-    for name in names {
-        let loaded = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            kernel.dispatch(Envelope::new(PluginId::new("assets"), json!({"op": "skills.load", "name": name}))),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("skills.load({name}) 超时"))??;
-        if loaded.get("ok") != Some(&json!(true)) {
-            continue;
-        }
-        let Some(path) = loaded
-            .get("tools_manifest")
-            .and_then(|m| m.get("path"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        else {
-            continue; // 纯文档技能无配套工具
-        };
-        let origin = loaded.get("origin").and_then(Value::as_str).unwrap_or("user");
-        let r = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            kernel.dispatch(Envelope::new(PluginId::new("tools"), json!({"op": "install", "path": path, "skill": name, "origin": origin}))),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("tools.install({name}) 超时"))??;
-        match r.get("ok") {
-            Some(&json!(true)) => warmed += 1,
-            other => tracing::warn!("技能工具预热装载失败（skill={name}）: {other:?}"),
-        }
-    }
-    Ok(warmed)
-}
-
-/// bash 沙箱装配（05 §2.1 宿主层 fail-closed）：
-/// 默认 BASH_SANDBOX=on —— 探测同目录 sandbox-run 助手，通过则向 tools 传 SANDBOX_HELPER；
-/// 探测失败/助手缺失/取值非法 → 把 bash 移出 TOOLS_ENABLED（拒绝执行，绝不静默降级为无沙箱直跑）；
-/// 仅 BASH_SANDBOX=off 显式豁免时无沙箱直跑（bash 描述如实声明）。
-async fn apply_bash_sandbox(tools_env: &mut Vec<(String, String)>) {
-    let mode = std::env::var("BASH_SANDBOX").unwrap_or_else(|_| "on".into());
-    let helper = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("sandbox-run.exe")));
-    match config::resolve_bash_sandbox(&mode, helper) {
-        config::BashSandbox::ExplicitOff => {
-            tracing::info!("bash 沙箱已显式关闭（BASH_SANDBOX=off）：bash 将以完整用户权限直跑");
-        }
-        config::BashSandbox::Sandboxed { helper } => match probe_sandbox(&helper).await {
-            Ok(()) => {
-                tracing::info!("bash 沙箱就绪（sandbox-run 受限令牌助手探测通过）");
-                tools_env.push(("SANDBOX_HELPER".into(), helper.to_string_lossy().into_owned()));
-            }
-            Err(e) => deny_bash(tools_env, &format!("沙箱助手探测失败: {e}")),
-        },
-        config::BashSandbox::Denied(reason) => deny_bash(tools_env, &reason),
-    }
-}
-
-fn deny_bash(tools_env: &mut Vec<(String, String)>, reason: &str) {
-    let idx = tools_env.iter().position(|(k, _)| k == "TOOLS_ENABLED");
-    let list: Vec<String> = match idx.and_then(|i| tools_env.get(i)) {
-        Some((_, v)) => v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect(),
-        None => config::ALL_TOOL_NAMES.iter().map(|s| s.to_string()).collect(),
-    };
-    if list.iter().any(|n| n == "bash") {
-        let filtered: Vec<String> = list.into_iter().filter(|n| n != "bash").collect();
-        let v = filtered.join(",");
-        match idx {
-            Some(i) => tools_env[i].1 = v,
-            None => tools_env.push(("TOOLS_ENABLED".into(), v)),
-        }
-        tracing::warn!(
-            "bash 沙箱不可用，已 fail-closed 将 bash 移出 TOOLS_ENABLED（{reason}）。如接受无沙箱直跑请设 BASH_SANDBOX=off"
-        );
-    } else {
-        tracing::warn!("bash 沙箱不可用（{reason}）；TOOLS_ENABLED 本就未含 bash，无需调整");
-    }
-}
-
-/// 沙箱助手探测：真实走一次受限令牌执行（cmd /c exit 0），15s 超时。
-async fn probe_sandbox(helper: &std::path::Path) -> anyhow::Result<()> {
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        tokio::process::Command::new(helper).arg("probe").output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("探测超时（15s）"))??;
-    if out.status.success() {
-        Ok(())
-    } else {
-        bail!(
-            "exit={:?} stderr={}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-    }
-}
-
-async fn probe(
-    kernel: &Kernel,
-    target: &str,
-    payload: Value,
-    label: &str,
-    timeout_secs: u64,
-) -> anyhow::Result<()> {
-    let r = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        kernel.dispatch(Envelope::new(PluginId::new(target), payload)),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("{label} 探测超时（>{timeout_secs}s）"))?
-    .map_err(|e| anyhow::anyhow!("{label} dispatch 失败: {e}"))?;
-    if r.get("ok") != Some(&json!(true)) {
-        bail!("{label} 探测失败: {r}");
-    }
-    tracing::info!("{label} 探测通过");
     Ok(())
 }
