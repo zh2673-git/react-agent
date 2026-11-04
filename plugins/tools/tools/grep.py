@@ -12,7 +12,7 @@ import os
 import re
 from pathlib import Path
 
-from . import ToolError, optional_int, require
+from . import ToolError, _PARAMS_ADJUSTED as _clamp_log, optional_int, require
 from .files import _NOISE_DIRS, _decode, _display, _guard
 
 _MAX_FILE_BYTES = 1024 * 1024
@@ -215,6 +215,9 @@ def _grep(args: dict) -> str:
             "请确认 pattern/glob/path，或该范围确无文本匹配]"
         )
     notes = []
+    if _clamp_log:  # O1：本调用窗口内的越界 clamp 定点透传——修正必须让模型看见
+        adj = ", ".join(f"{a['key']} {a['requested']}→{a['clamped_to']}" for a in _clamp_log)
+        notes.append(f"参数已自动修正: {adj}（越界自动取最近合法端点，无需改参重调）")
     if output_mode == "count":
         notes.append(f"{files_matched} 个文件命中（每文件计数，上限 {max_results}）")
     elif output_mode == "files_with_matches":
@@ -240,7 +243,7 @@ TOOLS = {
             "ignore_case (bool, default false), max_results (1-200, default 50), "
             "output_mode ('content' default | 'count' per-file match counts | 'files_with_matches' file list — "
             "use count/files_with_matches first to gauge scope, then narrow), "
-            "context_before / context_after (0-10, default 0: show surrounding lines per match, "
+            "context_before / context_after (0-10, values above 10 are auto-clamped to 10, default 0: show surrounding lines per match, "
             "rg-style 'path-ln- text', blocks separated by '--' — avoids a follow-up read_file), "
             "respect_gitignore (bool, default true). "
             "Output lines: path:lineno: text."
@@ -258,8 +261,8 @@ TOOLS = {
                     "enum": list(_OUTPUT_MODES),
                     "description": "content (default) | count | files_with_matches",
                 },
-                "context_before": {"type": "integer", "description": "context lines before each match (0-10)"},
-                "context_after": {"type": "integer", "description": "context lines after each match (0-10)"},
+                "context_before": {"type": "integer", "description": "context lines before each match (0-10, higher values auto-clamp to 10)"},
+                "context_after": {"type": "integer", "description": "context lines after each match (0-10, higher values auto-clamp to 10)"},
                 "respect_gitignore": {"type": "boolean", "description": "skip .gitignore'd files (default true)"},
             },
             "required": ["pattern"],

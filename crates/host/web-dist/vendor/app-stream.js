@@ -39,6 +39,18 @@ let processBox = null, processBody = null, processThink = null;
 let roundCards = []; // 本回合每轮流产生的答案卡；最终事件到达时中间卡收进过程框（严格模式必须声明）
 const subBoxes = new Map(); // R11 子代理实时框：key = sub 标签（"sub-1"），value = {box, body, think, text}
 
+// P7 会话重置集中化（stream 侧）：过去 events 的 connect(0) 跨模块手工逐变量清理，
+// 新增状态忘记登记就跨会话泄漏（streamBuf / roundCards 即漏网者）。本模块状态只由
+// 本模块的 reset 入口清——新增变量时在同处登记即可，不再依赖外部清单同步。
+function resetStreamState() {
+  streamSid = streamCard = streamBody = streamStats = null;
+  streamBuf.reasoning = "";
+  streamBuf.text = "";
+  processBox = processBody = processThink = null;
+  roundCards = [];
+  subBoxes.clear();
+}
+
 function ensureProcessBox() {
   if (processBox) return;
   processBox = el(`<details class="ev process" open><summary><span class="plabel">思考与工具</span><span class="chev">›</span></summary><div class="pbody"></div></details>`);

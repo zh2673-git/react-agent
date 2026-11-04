@@ -16,6 +16,7 @@ PRESETS: list[dict] = [
     {"id": "moonshot", "name": "月之暗面 Kimi", "base_url": "https://api.moonshot.cn/v1", "key_url": "https://platform.moonshot.cn/console/api-keys"},
     {"id": "dashscope", "name": "阿里百炼（兼容模式）", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "key_url": "https://bailian.console.aliyun.com/?apiKey=1"},
     {"id": "zhipu", "name": "智谱 GLM", "base_url": "https://open.bigmodel.cn/api/paas/v4", "key_url": "https://open.bigmodel.cn/usercenter/apikeys"},
+    {"id": "magpie", "name": "magpie 本地网关（免费额度）", "base_url": "http://127.0.0.1:3425/v1", "key_url": "", "key_hint": "magpie（本地网关任意令牌）"},
     {"id": "custom", "name": "自定义站点", "base_url": "", "key_url": ""},
 ]
 

@@ -7,16 +7,18 @@ list_dir 递归 + mtime + 排序 + 条目上限 + 噪音剪枝。写统一 newli
 保持文件原有 LF/CRLF 风格——修复旧版 edit/write 把 LF 文件改写成 CRLF 的隐性问题）。
 
 v6 核心写保护（2026-09-08，自扩展安全边界）：write_file/edit_file 追加「核心路径黑名单」
-——agent 自扩展只能走四条固定途径（SKILL.md / 技能 tools.json / plugins/tools/*.py 新
-文件 / config.json 的 mcp_servers），对 agent 自身运行体（crates 源树、memory/llm_adapter
-插件、内置工具实现、config.json、.git）的写入默认拒绝（fail-closed）。技能根目录（自扩展
-主通道）显式豁免。逃生舱：env ALLOW_CORE_WRITE=1（config.json tools.allow_core_write 持久
-通道映射，改后重启 host 生效）。诚实边界：bash 间接写不经此闸（靠 SYSTEM.md 纪律 + bash
-沙箱兜底）。
+——agent 自扩展只能走三条固定途径（SKILL.md / 技能 tools.json / config.json 的 mcp_servers），
+对 agent 自身运行体（crates 源树、memory/llm_adapter 插件、内置工具实现、config.json、.git）
+的写入默认拒绝（fail-closed）。技能根目录（自扩展主通道）显式豁免。v7 升级为前缀闸：env
+ALLOW_CORE_WRITE = 逗号分隔的路径前缀列表（config.json tools.allow_core_write 填数组，持久
+通道映射，改后重启 host 生效），命中前缀且不在 _CORE_NEVER_ALLOW（config.json、
+plugins/memory、.git 永不豁免）内才放行；空 / "0" / 布尔遗留 "1" 一律拒绝。诚实边界：
+bash 间接写不经此闸（靠 SYSTEM.md 纪律 + bash 沙箱兜底）。
 """
 
 import difflib
 import fnmatch
+import functools
 import os
 import re
 import threading
@@ -33,13 +35,14 @@ _MAX_LIST_ENTRIES = 5000
 
 # 递归遍历（list_dir recursive / grep）默认剪枝的噪音目录
 _NOISE_DIRS = frozenset(
-    {".git", "node_modules", "target", "__pycache__", ".venv", "venv", "dist", "build", ".idea"}
+    {".git", "node_modules", "target", "target-selfupdate", "__pycache__", ".venv", "venv", "dist", "build", ".idea"}
 )
 
 # ── 核心写保护（v6）：禁止 write_file/edit_file 触碰的路径（相对 WORKSPACE_ROOT，normcase
 # 前缀匹配）。原则：agent 的运行体（宿主源码、内核插件、工具实现、配置）不可自改；自扩展
 # 走白名单途径。skills root 单独豁免（SKILLS_DIR 或 plugins/assets/skills）。 ──
 _CORE_BLOCKLIST = (
+    "runtime",                      # RSI 发行形态：内嵌运行时快照（宿主/插件/内核 bindings）整体禁写
     "crates",                       # Rust 源树（host/agent-loop + web-dist 前端）
     "plugins/memory",               # 内核插件：trace 记忆
     "plugins/llm_adapter",          # 内核插件：模型适配
@@ -49,12 +52,46 @@ _CORE_BLOCKLIST = (
     "config.json",                  # 密钥与运行配置（防自改授权/密钥）
     ".git",                         # 版本库（防篡改历史/回退能力）
 )
-# 说明：plugins/tools 顶层不在黑名单——L2 自扩展通道（放新 .py 工具模块），
-# 仅内置模块名（files/bash/web/grep/symbols/mcp/__init__）在 _is_core_path 内单独保护。
+# 说明：plugins/tools 顶层不在黑名单——历史上是 L2 自扩展通道（放新 .py 工具模块），
+# 但本仓库 plugins/ 在 runtime/ 整树禁写区内，该通道实际不可达（已收口，见 SYSTEM.md）；
+# 仅内置模块名（files/bash/web/grep/symbols/mcp/todo/__init__）在 _is_core_path 内单独保护。
 
 
-def _core_write_allowed() -> bool:
-    return os.environ.get("ALLOW_CORE_WRITE", "").strip() == "1"
+# 永不豁免项（v7）：即使命中放行前缀也拒绝——密钥与运行配置、trace 记忆（随回滚撤销
+# 的对偶面：撤销不该抹掉记忆）、版本库（防篡改历史/回退能力）。
+_CORE_NEVER_ALLOW = (
+    "config.json",
+    "plugins/memory",
+    ".git",
+)
+
+
+def _core_write_prefixes() -> tuple[str, ...]:
+    """ALLOW_CORE_WRITE = 逗号分隔的工作区相对路径前缀列表；空/"0" → 空（默认关）。"""
+    raw = os.environ.get("ALLOW_CORE_WRITE", "").strip()
+    if not raw or raw in ("0", "1"):  # "1" 是 v6 布尔遗留，不再全解禁
+        return ()
+    return tuple(p.strip().replace("\\", "/").strip("/").lower() for p in raw.split(",") if p.strip())
+
+
+def _is_never_allow(rel_low: str) -> bool:
+    return any(rel_low == e or rel_low.startswith(e + "/") for e in _CORE_NEVER_ALLOW)
+
+
+def _core_write_allowed(real: Path) -> bool:
+    """v7 前缀闸：命中放行前缀且不在永不豁免项内才放行；空/未命中一律拒绝（fail-closed）。"""
+    prefixes = _core_write_prefixes()
+    if not prefixes:
+        return False
+    try:
+        rel = real.relative_to(workspace_root())
+    except ValueError:
+        return False
+    rel_low = os.path.normcase(str(rel)).replace("\\", "/")
+    for p in prefixes:
+        if rel_low == p or rel_low.startswith(p + "/"):
+            return not _is_never_allow(rel_low)
+    return False
 
 
 def _skills_root_real() -> Path:
@@ -88,15 +125,20 @@ def _is_core_path(real: Path) -> bool:
 
 
 def _guard_write(real: Path, path_str: str) -> Path:
-    """写入闸（write_file/edit_file 专用）：核心黑名单默认拒绝，ALLOW_CORE_WRITE=1 放行。"""
-    if _core_write_allowed():
-        return real
-    if _is_core_path(real):
+    """写入闸（write_file/edit_file 专用）：核心黑名单默认拒绝；env ALLOW_CORE_WRITE 为
+    逗号分隔前缀列表时，命中前缀且不在永不豁免项内的路径放行（v7 细粒度授权）。"""
+    if _is_core_path(real) and not _core_write_allowed(real):
+        rel = _display(real).replace("\\", "/").lower()
+        hit = next((p for p in _core_write_prefixes() if rel == p or rel.startswith(p + "/")), None)
+        extra = f"；授权前缀 '{hit}' 命中，但该路径属于永不豁免项" if hit else ""
         raise ToolError(
-            f"核心路径写入被拒绝: '{_display(real)}'——这是 agent 自身的运行体（宿主源码/内核"
+            f"核心路径写入被拒绝{extra}: '{_display(real)}'——这是 agent 自身的运行体（宿主源码/内核"
             "插件/内置工具/配置），自扩展只能走固定途径（skills 目录写 SKILL.md、技能目录放 "
-            "tools.json、plugins/tools/ 顶层放新工具 .py、config.json 声明 mcp_servers）。"
-            "确需修改核心请直接向用户说明，由用户自行修改或显式开启 ALLOW_CORE_WRITE=1。",
+            "tools.json、config.json 声明 mcp_servers）。"
+            "确需修改核心请直接向用户说明，由用户自行修改，或按路径授权：config.json "
+            'tools.allow_core_write 填前缀列表（如 ["runtime/crates/agent-loop"]，'
+            "config.json 与 plugins/memory 永不豁免），改后重启 host 生效；也可把我写好的 "
+            "scripts/patches/*.json 补丁由你执行 python scripts/apply-tool-patches.py 应用。",
             code="CORE_PROTECTED",
             field="path",
         )
@@ -289,6 +331,42 @@ def _line_candidates(text: str, needle: str, limit: int = 3) -> list[str]:
     return []
 
 
+def _ws_key(s: str) -> str:
+    """O2 白空间归一键：逐行 strip + 行内连续空白（含全角空格/NBSP）折一。
+
+    保留空行（行数对齐）——含空行的 old 也能定位；文件侧纯空白行同样折为空行。
+    """
+    out = []
+    for l in s.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        out.append(re.sub(r"[ \t\u00a0\u3000]+", " ", l.strip()))
+    return "\n".join(out)
+
+
+@functools.lru_cache(maxsize=64)
+def _ws_key_lines(text: str) -> tuple[str, ...]:
+    return tuple(_ws_key(l) for l in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+
+
+def _window_for(text: str, old: str) -> tuple[int, int] | None:
+    """O2：old 的白空间归一形态在文件中的唯一行区间（0 处或多处 → None，不猜）。
+
+    行数窗口 = old 的原始行数（空行参与对齐）；全文件行键一次性预计算（lru_cache），
+    窗口内逐行比对键。恰一处命中才返回 (lo, hi)；调用方用原文行做精确替换。
+    """
+    keys = _ws_key_lines(text)
+    okeys = tuple(_ws_key(l) for l in old.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+    n = len(okeys)
+    if n == 0 or n > len(keys):
+        return None
+    win: tuple[int, int] | None = None
+    for i in range(len(keys) - n + 1):
+        if keys[i : i + n] == okeys:
+            if win is not None:
+                return None  # 多处命中：无法唯一定位，维持原报错（保守，不猜）
+            win = (i, i + n)
+    return win
+
+
 def _edit_file(args: dict) -> dict:
     real = _guard_write(_guard(require(args, "path")), require(args, "path"))
     old = require(args, "old_string")
@@ -308,6 +386,37 @@ def _edit_file(args: dict) -> dict:
         if count:
             mode = "fuzzy"
     if count == 0:
+        # O2 白空间归一自愈（先于报错）：old 与文件的差异若只是空白形态（全角/半角、
+        # 行首尾空白、连续空格数），且在文件中**唯一**命中 → 就地用文件原文替换。
+        # trace 复盘：14 次编辑失败多为此类，原「近似位置提示→read→重试」两步路一步完成。
+        win = _window_for(text, old)
+        if win is not None:
+            lo, hi = win
+            real_old = "\n".join(text.replace("\r\n", "\n").replace("\r", "\n").split("\n")[lo:hi])
+            nl = "\r\n" if "\r\n" in text else "\n"
+            new_used = new.replace("\r\n", "\n").replace("\r", "\n")
+            if nl == "\r\n":
+                new_used = new_used.replace("\n", "\r\n")
+            new_text = (text.replace("\r\n", "\n").replace("\r", "\n")
+                        .replace(real_old, new_used, 1))
+            if "\r\n" in text:
+                new_text = re.sub(r"(?<!\r)\n", "\r\n", new_text)
+            before_raw = real.read_bytes()
+            diff = "\n".join(difflib.unified_diff(text.splitlines(), new_text.splitlines(), lineterm="", n=1))
+            if len(diff) > _DIFF_MAX_CHARS:
+                diff = diff[:_DIFF_MAX_CHARS] + "\n…[diff 过长已截断]"
+            _write_newline_safe(real, new_text, encoding=write_enc)
+            result = {
+                "path": _display(real),
+                "replacements": 1,
+                "match_mode": "whitespace",
+                "action": "edited",
+                "diff": diff,
+                "note": "old_string 空白形态与文件不一致，已按白空间归一唯一匹配就地替换（换行/行首尾/连续空白差异自动吸收）",
+            }
+            if (snap := _snapshot_change(before_raw, real.read_bytes())) is not None:
+                result["undo"] = snap
+            return result
         cands = _line_candidates(text, old)
         hint = ("；文件中近似位置: " + " | ".join(cands)) if cands else "；文件中无相似行（确认目标文件是否正确）"
         raise ToolError(

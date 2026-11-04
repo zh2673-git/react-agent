@@ -118,11 +118,7 @@ pub fn scrub_with(v: &mut Value, secrets: &[String]) {
     }
     match v {
         Value::String(s) => {
-            for sec in secrets {
-                if s.contains(sec.as_str()) {
-                    *s = s.replace(sec.as_str(), MASK);
-                }
-            }
+            *s = scrub_str(s, secrets);
         }
         Value::Object(m) => {
             for val in m.values_mut() {
@@ -136,6 +132,66 @@ pub fn scrub_with(v: &mut Value, secrets: &[String]) {
         }
         _ => {}
     }
+}
+
+/// 单串脱敏：**保留路径结构**，只对每个路径分量做密钥替换。
+///
+/// 背景（D6/C3）：路径是工具行动的依据。若把密钥替换进整串，含密钥的目录名会被抹成
+/// `«KEY_MASKED»/`，随后 list_dir 报 `NOT_FOUND`——模型拿到一个不可行动的名字，
+/// 既无法定位真目录，也无法判断这是「脱敏」还是「真不存在」。
+/// 分量级替换让路径骨架（分隔符 + 未命中分量）完整保留，密钥所在分量整体抹掉，
+/// 脱敏强度不降（密钥字符一个不漏），但错误消息与路径仍可辨认。
+fn scrub_str(s: &str, secrets: &[String]) -> String {
+    let hit = secrets.iter().any(|sec| s.contains(sec.as_str()));
+    if !hit {
+        return s.to_string();
+    }
+    let is_pathish = looks_like_path(s);
+    if !is_pathish {
+        // 非路径串：整体替换（保持原有语义，如命令输出里的密钥）
+        let mut out = s.to_string();
+        for sec in secrets {
+            out = out.replace(sec.as_str(), MASK);
+        }
+        return out;
+    }
+    // 路径串：按分隔符切分，逐分量替换后原样拼回（分隔符与空分量保留）
+    let mut out = String::with_capacity(s.len());
+    let mut seg = String::new();
+    for ch in s.chars() {
+        if ch == '/' || ch == '\\' {
+            out.push_str(&scrub_segment(&seg, secrets));
+            out.push(ch);
+            seg.clear();
+        } else {
+            seg.push(ch);
+        }
+    }
+    out.push_str(&scrub_segment(&seg, secrets));
+    out
+}
+
+/// 是否按路径处理（分量级替换）。**必须排除 URL**：URL 里 `/` 是分隔符但语义不是
+/// 路径分量（`https://x?key=SECRET` 整体替换才不破坏语义）。判据：
+/// - 含 `://` → URL，走整体替换；
+/// - 含 `/` 或 `\` 且**不含空白**（含空白的多是句子/日志，整体替换更自然）→ 路径。
+fn looks_like_path(s: &str) -> bool {
+    if s.contains("://") {
+        return false;
+    }
+    let has_sep = s.contains('/') || s.contains('\\');
+    has_sep && !s.chars().any(char::is_whitespace)
+}
+
+/// 单路径分量脱敏：命中则整个分量抹掉（不留残片，避免拼出可猜的部分明文）。
+fn scrub_segment(seg: &str, secrets: &[String]) -> String {
+    if seg.is_empty() {
+        return String::new();
+    }
+    if secrets.iter().any(|sec| seg.contains(sec.as_str())) {
+        return MASK.to_string();
+    }
+    seg.to_string()
 }
 
 #[cfg(test)]
@@ -166,6 +222,37 @@ mod tests {
         assert_eq!(v, json!({"a": "hello world"}));
     }
 
+    /// C3/D6：路径串必须保留骨架——含密钥的分量被抹，其余分量与分隔符原样保留。
+    /// 反例（旧行为）：密钥 "magpie" 命中整串 → 整个路径变 `«KEY_MASKED»`，工具报
+    /// NOT_FOUND，模型无法分辨「被脱敏」还是「真不存在」。
+    #[test]
+    fn scrub_path_keeps_structure_and_masks_only_hit_segment() {
+        let secrets = vec!["magpie".to_string()];
+        let mut v = json!({
+            "error": {"code": "NOT_FOUND", "message": "目录不存在: '_repo\\magpie\\sub'"}
+        });
+        scrub_with(&mut v, &secrets);
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(!msg.contains("magpie"), "密钥不得出现在输出: {msg}");
+        assert!(msg.contains(MASK), "命中分量应被抹: {msg}");
+        // 骨架保留：前缀目录与子目录仍在，模型可据此行动
+        assert!(msg.contains("_repo"), "未命中的前缀必须保留: {msg}");
+        assert!(msg.contains("sub"), "未命中的子目录必须保留: {msg}");
+        assert!(msg.contains('\\'), "分隔符必须保留: {msg}");
+    }
+
+    /// 非路径串（命令输出/URL）仍整体替换，脱敏强度不因路径优化而下降。
+    #[test]
+    fn scrub_non_path_string_still_replaces_inline() {
+        let secrets = vec!["magpie".to_string()];
+        let mut v = json!({"out": "downloading magpie-v1.2.zip now"});
+        scrub_with(&mut v, &secrets);
+        let s = v["out"].as_str().unwrap();
+        assert!(!s.contains("magpie"), "内联密钥必须被抹: {s}");
+        assert!(s.contains(MASK));
+        assert!(s.contains("downloading") && s.contains("now"), "非密钥文本保留: {s}");
+    }
+
     #[test]
     fn collect_skips_short_values_and_dedupes() {
         let mut out: Vec<String> = Vec::new();
@@ -182,10 +269,18 @@ mod tests {
         assert_eq!(out, vec!["long-key-1".to_string(), "long-key-2".to_string()]);
     }
 
+    /// CONFIG_FILE 未配置 / 指向不存在的路径 → 0（仅 env 兜底键参与收集，不 panic）。
+    ///
+    /// 必须显式指定一个**不存在**的路径：宿主任一实例运行时都会把 CONFIG_FILE 指到真实
+    /// config.json，此时 mtime 必然非 0——旧写法断言裸 `config_mtime()` 等于 0，
+    /// 结果「宿主在跑就红、不在跑就绿」，是典型的环境依赖型假红。
     #[test]
     fn config_mtime_is_zero_for_missing_file() {
+        let missing = std::env::temp_dir().join("rsi-agent-no-such-config-9f2c.json");
+        assert!(!missing.exists(), "前置：临时路径不应存在 {missing:?}");
+        std::env::set_var("CONFIG_FILE", &missing);
+        assert_eq!(config_mtime(), 0);
         std::env::remove_var("CONFIG_FILE");
-        // CONFIG_FILE 未配置/文件不存在 → 0（仅 env 兜底键参与收集，不 panic）
         assert_eq!(config_mtime(), 0);
     }
 

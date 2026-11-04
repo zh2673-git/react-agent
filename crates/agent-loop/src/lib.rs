@@ -111,16 +111,40 @@ pub fn has_acceptance_marker(text: &str) -> bool {
 const CONTRACT_REMINDER: &str = "[policy:contract_first] 先写验收清单再行动：请在不调用工具的情况下，用 todo 或文本列出本次任务的验收标准（逐条、可核对），然后再开始调用工具。";
 const VERIFY_REMINDER: &str = "[policy:verify_before_final] 最终答复前请逐条核对验收清单，并在答复中给出每条标准的满足情况（满足/不满足/原因）。";
 
-/// 各转发步的相对截止（A2：Envelope.deadline 为相对时长）。
+/// 各转发步的相对截止（A2：Envelope.deadline 为相对时长）。tools 闸可配（O3）：
+/// env `TOOLS_DEADLINE_SECS` 覆盖缺省 60s（<30s 回退），重构建/全仓扫描类命令按需放宽。
 /// LLM_DEADLINE=600s：深度思考模型长推理是常态（110s 时代被误伤）——单步上限放宽到
 /// 10 分钟覆盖全部商用推理模型流式思考；必须与 llm_adapter PROVIDER_DEADLINE=590s
 /// 配对（provider 先收敛 10s 报可重试 timeout，避免 gRPC abort 不中断 guest 线程导致
 /// 的涓流占坑，见 base.py 头注）；整轮预算 CHAT_BUDGET_SECS 缺省 900s 需 ≥ 单步闸，
 /// 否则长思考 + 工具轮会在轮边界被 K508 掐断。
 const MEM_DEADLINE: Duration = Duration::from_secs(5);
-const TOOLS_DEADLINE: Duration = Duration::from_secs(60);
+// O3：tools 闸可配——重构建/重索引/全仓扫描类命令 60s 常不够（活体 trace 实录 K502 ×3），
+// env `TOOLS_DEADLINE_SECS` 覆盖（<30s 视为误配回退 60，语义同 llm_step_deadline）。
+fn tools_deadline() -> Duration {
+    std::env::var("TOOLS_DEADLINE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s >= 30)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60))
+}
 const LLM_DEADLINE: Duration = Duration::from_secs(600);
 const ASSETS_DEADLINE: Duration = Duration::from_secs(5);
+
+/// LLM 单步 deadline 单一事实源（LOOP-P2/A4）：agent-loop 总闸与 llm_adapter 的
+/// PROVIDER_DEADLINE（= 总闸 - 10s 余量）同读 env `LLM_STEP_DEADLINE_SECS`（缺省 600），
+/// 配对关系由代码保证，不再依赖两侧注释互指人工同步（改其一漏其余 → 涓流占坑/K502
+/// 雪崩复发的历史不再可能）。env < 30s 视为误配回退缺省；CHAT_BUDGET_SECS（整轮预算）
+/// 仍独立配置，需 ≥ 本闸（文档约束不变）。
+fn llm_step_deadline() -> Duration {
+    std::env::var("LLM_STEP_DEADLINE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s >= 30)
+        .map(Duration::from_secs)
+        .unwrap_or(LLM_DEADLINE)
+}
 
 /// 工具结果回喂上限（字符数，PLAN R2）：防止单条大结果撑爆上下文与 memory。
 /// 0 = 禁用截断。可用 `TOOL_RESULT_LIMIT` 覆盖。
@@ -134,7 +158,14 @@ const DEFAULT_TEXT_ATTACH_CHARS: usize = 24000;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a capable agent working in a workspace. \
 Answer the user's request. When tools are provided and useful, call them (one batch per round); \
 after receiving tool results, continue reasoning until you can produce the final answer in plain text. \
-Presemble precise tool arguments: read before writing files, and prefer edit_file over rewriting whole files.";
+Presemble precise tool arguments: read before writing files, and prefer edit_file over rewriting whole files. \
+Efficiency discipline (these bound the tool budget, not the task): \
+(a) BATCH independent calls into one round — if two calls do not depend on each other's result, \
+issue them together instead of spending a round each. \
+(b) PREFER dedicated tools over shell: grep/symbols_search to find content or definitions, read_file to read, \
+list_dir to list; use bash only when a real shell is required (tests, git, build). \
+(c) CONVERGE, do not thrash: if two attempts at the same goal yield no new information, change strategy \
+instead of repeating the call with cosmetic variations.";
 
 pub struct AgentLoopPlugin {
     max_rounds: usize,
@@ -164,6 +195,13 @@ pub struct AgentLoopPlugin {
     /// 新 seed 取 `max(当前毫秒, floor+1)`——严格大于历史上任何已发 sid，跨回合
     /// 不碰撞语义在逐出后依然成立。
     sid_floor: AtomicU64,
+    /// 同会话并发闸（LOOP-P2/A1）：两个并发 chat 用同一 session_id 会互清取消标志、
+    /// 互踩 turn_starts 与流式 sid（低概率、高混淆度）。值是 per-session 的 tokio Mutex，
+    /// chat_body 入口 try_lock——拿不到即 409 拒绝，不排队不阻塞。
+    session_chats: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// memory.append 连续失败计数（LOOP-P2/A2）：持久层与内存工作集开始分叉的信号，
+    /// 成功即清零；达到阈值由关键写入点熔断本轮，防错位静默放大。
+    append_fails: AtomicU64,
 }
 
 /// 构造插件实例（`Arc<dyn Plugin>`）：策略钩子按 env 解析（缺省关闭）。
@@ -207,6 +245,8 @@ pub fn new_with_policy(max_rounds: usize, policy: LoopPolicy) -> PluginInstance 
         sid_seq: Mutex::new(std::collections::HashMap::new()),
         mirrors: Mutex::new(std::collections::HashMap::new()),
         sid_floor: AtomicU64::new(0),
+        session_chats: Mutex::new(std::collections::HashMap::new()),
+        append_fails: AtomicU64::new(0),
     })
 }
 
@@ -333,6 +373,22 @@ mod tests {
     use super::tools_exec::ObsPlan;
     use super::*;
 
+    // O3：env 互相污染防不住并发——三测合并串行跑（语义：缺省→覆盖→误配回退）
+    #[test]
+    fn tools_deadline_env_semantics() {
+        let saved = std::env::var("TOOLS_DEADLINE_SECS").ok();
+        std::env::remove_var("TOOLS_DEADLINE_SECS");
+        assert_eq!(tools_deadline(), Duration::from_secs(60)); // 缺省
+        std::env::set_var("TOOLS_DEADLINE_SECS", "120");
+        assert_eq!(tools_deadline(), Duration::from_secs(120)); // 覆盖生效
+        std::env::set_var("TOOLS_DEADLINE_SECS", "5");
+        assert_eq!(tools_deadline(), Duration::from_secs(60)); // 低于下限回退
+        match saved {
+            Some(v) => std::env::set_var("TOOLS_DEADLINE_SECS", v),
+            None => std::env::remove_var("TOOLS_DEADLINE_SECS"),
+        }
+    }
+
     #[test]
     fn extract_sources_dedupes_and_validates() {
         // R16：计划经遗留注册表解析（obs 未声明回落路径）+ 元数据直构路径各验一遍
@@ -447,6 +503,8 @@ mod tests {
             sid_seq: Mutex::new(std::collections::HashMap::new()),
             mirrors: Mutex::new(std::collections::HashMap::new()),
             sid_floor: AtomicU64::new(0),
+            session_chats: Mutex::new(std::collections::HashMap::new()),
+            append_fails: AtomicU64::new(0),
         };
         let s1 = p.next_sid("s-x");
         let s2 = p.next_sid("s-x");
@@ -496,19 +554,53 @@ mod tests {
         std::env::set_var("WORKSPACE_ROOT", r"C:\ws");
 
         // root 为空 → 不授权
-        assert!(AgentLoopPlugin::self_extension_section("").is_none());
+        assert!(AgentLoopPlugin::self_extension_section("", false).is_none());
         // skills 根在 workspace 外 → 不授权
-        assert!(AgentLoopPlugin::self_extension_section(r"D:\elsewhere\skills").is_none());
+        assert!(AgentLoopPlugin::self_extension_section(r"D:\elsewhere\skills", false).is_none());
         // skills 根在 workspace 内 → 授权段含路径与 write_file 指引
-        let section = AgentLoopPlugin::self_extension_section(r"C:\ws\skills").expect("in-workspace");
+        let section = AgentLoopPlugin::self_extension_section(r"C:\ws\skills", false)
+            .expect("in-workspace");
         assert!(section.contains(r"C:\ws\skills"));
         assert!(section.contains("write_file"));
         assert!(section.contains("Skill self-extension"));
+        // B2 按需注入：默认 brief 不含完整打包协议，full=true 才含
+        assert!(!section.contains("### Skill packaging with companion tools"), "brief 不得含长教程");
+        let full = AgentLoopPlugin::self_extension_section(r"C:\ws\skills", true).expect("full");
+        assert!(full.contains("### Skill packaging with companion tools"));
+        assert!(full.contains("tools.json") && full.contains("skill_install"));
+        assert!(full.len() > section.len(), "full 必须比 brief 长");
 
         match saved {
             Some(v) => std::env::set_var("WORKSPACE_ROOT", v),
             None => std::env::remove_var("WORKSPACE_ROOT"),
         }
+    }
+
+    /// B2 触发词判定：明确要求造技能才注入长教程，普通请求不触发。
+    #[test]
+    fn want_skill_build_detection() {
+        // 命中：名词 + 动作
+        assert!(AgentLoopPlugin::user_wants_skill_build("帮我做一个技能"));
+        assert!(AgentLoopPlugin::user_wants_skill_build("把这个工作沉淀成技能"));
+        assert!(AgentLoopPlugin::user_wants_skill_build("create a new skill for linting"));
+        assert!(AgentLoopPlugin::user_wants_skill_build("package this as a skill"));
+        // 不命中：无名词，或只有名词无动作
+        assert!(!AgentLoopPlugin::user_wants_skill_build("跑一下测试"));
+        assert!(!AgentLoopPlugin::user_wants_skill_build("读 specs/call-efficiency/tasks.md 继续"));
+        assert!(!AgentLoopPlugin::user_wants_skill_build("有哪些技能可用？"));
+    }
+
+    /// B1 效率约束：内置提示词必须含批量/专用工具/收敛三条，且不删原有纪律。
+    #[test]
+    fn default_prompt_has_efficiency_discipline() {
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("BATCH"), "缺少批量约束");
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("PREFER dedicated tools"), "缺少专用工具优先");
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("CONVERGE"), "缺少收敛约束");
+        // 原有质量纪律不得被效率约束挤掉
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("read before writing files"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("edit_file"));
+        // 效率约束必须声明「不缩减任务范围」，防模型以少做换少调
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("not the task"));
     }
 
     #[test]

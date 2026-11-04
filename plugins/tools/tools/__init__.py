@@ -28,6 +28,9 @@ def require(args: dict, key: str) -> str:
     return v
 
 
+_PARAMS_ADJUSTED: list[dict] = []  # O1：clamp 发生时的审计清单（本请求窗口内累加，调用方读后即清）
+
+
 def optional_int(args: dict, key: str, default: int, lo: int, hi: int) -> int:
     v = args.get(key, default)
     try:
@@ -35,5 +38,9 @@ def optional_int(args: dict, key: str, default: int, lo: int, hi: int) -> int:
     except (TypeError, ValueError):
         raise ToolError(f"参数 '{key}' 必须是整数，收到: {v!r}", code="BAD_ARG", field=key) from None
     if not lo <= v <= hi:
-        raise ToolError(f"参数 '{key}' 超出合法范围 [{lo}, {hi}]，收到: {v}", code="BAD_ARG", field=key)
+        # O1：越界不再硬拒绝（trace 复盘：同因重犯 5+ 次/轮，报错→改参→重调纯烧 token）——
+        # clamp 到最近合法端点就地继续；params_adjusted 模块级清单留给调用方透传（如 grep
+        # 结果前缀提示），确保「悄悄修正」可被模型与审计看见，不产生静默偏差。
+        v = max(lo, min(hi, v))
+        _PARAMS_ADJUSTED.append({"key": key, "requested": int(args.get(key, default)), "clamped_to": v, "range": [lo, hi]})
     return v

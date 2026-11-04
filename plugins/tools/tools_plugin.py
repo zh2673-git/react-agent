@@ -61,7 +61,7 @@ from pathlib import Path
 
 from agent_kernel.guest import serve
 
-from tools import ToolError
+from tools import ToolError, _PARAMS_ADJUSTED
 from tools import bash as bash_mod
 from tools import files as files_mod
 from tools import grep as grep_mod
@@ -684,6 +684,7 @@ class ToolsPlugin:
                 code="TOOL_DISABLED",
             )
         args = args_any
+        _PARAMS_ADJUSTED.clear()  # O1：每调用一窗口——上一调用的 clamp 记录不外溢（grep 读取的必是本调用）
         try:
             if not isinstance(args, dict):
                 return _err(f"args 必须是对象，收到: {type(args).__name__}", code="BAD_ARGS", field="args")

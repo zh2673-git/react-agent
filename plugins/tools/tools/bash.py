@@ -5,6 +5,17 @@
             助手缺失/令牌创建失败 → SANDBOX_FAILED 字段级错误，绝不回退无沙箱直跑；
   直跑路径：仅当 BASH_SANDBOX=off 显式豁免时（宿主不传 SANDBOX_HELPER），描述如实声明无沙箱。
 
+cwd 归一（rsi-agent 快照适配第 3 处）：子进程 cwd 一律走 `_shell_cwd()`——剥 `\\?\` 扩展长度
+前缀再校验可用性，不可用即 fail-closed。原因：宿主 instances.rs 用 `canonicalize()` 写
+WORKSPACE_ROOT 会带该前缀，而 Windows cmd.exe 拒绝 UNC 形态并**静默改在 C:\Windows 执行且
+exit=0**（错目录 + 越界写 + 追溯失效三重危害）。
+
+N3 输出解码：沙箱/直跑两侧统一 `_decode_output()`——UTF-8 优先，非法字节段以
+反斜杠十六进制（backslash-x-ff 形态）转义保留（原样可读，零信息丢失），不再按
+locale（中文 Windows 缺省 GBK）解码。模型无需再垫 `chcp 65001` 仪式；GBK 输出
+会以混合形态呈现（合法 UTF-8 序列正常解码，罕见重合序列呈现为可读字符——诚实
+边界，不影响命令执行与退出码判定）。
+
 W16 bash 文件追溯（B 方案，不禁写只留痕）：对「快照区」= WORKSPACE_ROOT −（噪音目录 /
 .stream / 产物目录 / MEMORY_DATA_DIR / .git）执行前 pre-copy、执行后逐文件比对，变更
 （新增/修改/删除）写 undo 快照并随结果返回 changes[]——agent-loop 转发为 op=bash 的
@@ -32,8 +43,38 @@ _SNAP_MAX_FILES = 4_000
 _CHANGES_MAX = 50
 
 # 助手退出码协议（sandbox-run）：0=已执行（stdout 单行 JSON）；2=用法；3=平台不支持；4=沙箱建立失败
-_SANDBOX_HELPER = os.environ.get("SANDBOX_HELPER", "").strip()
-_SANDBOXED = bool(_SANDBOX_HELPER)
+# 惰性读取（不再 import 期固化）：spawn 期 env 已固定，行为不变；可测试注入。
+def _sandbox_helper() -> str:
+    return os.environ.get("SANDBOX_HELPER", "").strip()
+
+
+# 沙箱描述随调用期助手存在性变化（不 import 期固化：宿主装配与运行期 env 可能不同）
+def _sandboxed() -> bool:
+    return bool(_sandbox_helper())
+
+def _shell_cwd() -> str:
+    """shell 子进程 cwd：WORKSPACE_ROOT 的「shell 可用」形态，fail-closed。
+
+    Windows `cmd.exe` 不认 `\\\\?\\` 扩展长度前缀（会打印
+    「UNC paths are not supported. Defaulting to Windows directory」并以
+    **exit=0 在 C:\\Windows 执行**——静默错目录 + 越界写 + 追溯失效）。
+    宿主 instances.rs 用 `canonicalize()` 写 WORKSPACE_ROOT 正好产出该前缀，
+    故在执行点归一：剥前缀、分隔符统一，再校验可用性；不可用即报错，
+    **绝不回落到系统目录**（工具声明的 cwd=WORKSPACE_ROOT 是硬契约）。
+    """
+    ws = str(workspace_root())
+    if ws.startswith("\\\\?\\UNC\\"):  # UNC 的扩展形态 → 普通 UNC
+        ws = "\\\\" + ws[len("\\\\?\\UNC\\"):]
+    elif ws.startswith("\\\\?\\"):
+        ws = ws[len("\\\\?\\"):]
+    ws = ws.replace("/", os.sep)
+    if not os.path.isdir(ws):
+        raise ToolError(
+            f"工作区不可作为 shell cwd: WORKSPACE_ROOT='{ws}' 不存在或不是目录。"
+            "bash 工具不会回落到系统目录执行（fail-closed）；请检查 WORKSPACE_ROOT 配置。",
+            code="BAD_WORKSPACE",
+        )
+    return ws
 
 
 def _trace_enabled() -> bool:
@@ -165,23 +206,31 @@ def _run_direct(command: str, timeout_ms: int) -> dict:
             command,
             shell=True,
             capture_output=True,
-            text=True,
             timeout=timeout_ms / 1000,
-            cwd=str(workspace_root()),
+            cwd=_shell_cwd(),
         )
     except subprocess.TimeoutExpired:
         return _timeout_result(timeout_ms)
-    output = (proc.stdout or "") + (proc.stderr or "")
+    # N3：不再用 text=True（locale 解码，中文 Windows 下 UTF-8 输出必乱码），
+    # 与沙箱路径同走 _decode_output（UTF-8 优先 + 非法字节转义）。
+    output = _decode_output((proc.stdout or b"") + (proc.stderr or b""))
     return _result(proc.returncode, False, output)
 
 
 def _run_sandboxed(command: str, timeout_ms: int) -> dict:
+    helper = _sandbox_helper()
+    if not helper:
+        raise ToolError(
+            "SANDBOX_HELPER 为空（沙箱模式已启用但助手路径缺失）；fail-closed，"
+            "不回退无沙箱执行；如接受直跑请设 BASH_SANDBOX=off",
+            code="SANDBOX_FAILED",
+        )
     try:
         proc = subprocess.run(
-            [_SANDBOX_HELPER, "exec", str(timeout_ms), command],
+            [helper, "exec", str(timeout_ms), command],
             capture_output=True,  # 助手结果走 stdout 单行 JSON；错误细节走 stderr
             timeout=timeout_ms / 1000 + 10.0,  # 助手自身挂死兜底（超时+10s 余量）
-            cwd=str(workspace_root()),
+            cwd=_shell_cwd(),
         )
     except subprocess.TimeoutExpired:
         # fail-closed：助手超限挂死视为沙箱边界不可信，不回退直跑
@@ -202,7 +251,7 @@ def _run_sandboxed(command: str, timeout_ms: int) -> dict:
         data = json.loads(proc.stdout.decode(errors="replace"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise ToolError(f"沙箱助手返回不可解析: {exc}", code="SANDBOX_FAILED")
-    output = base64.b64decode(data.get("output_b64", "")).decode(locale.getpreferredencoding(False), errors="replace")
+    output = _decode_output(base64.b64decode(data.get("output_b64", "")))
     return _result(data.get("exit_code"), bool(data.get("timeout")), output)
 
 
@@ -213,6 +262,52 @@ def _timeout_result(timeout_ms: int) -> dict:
         "truncated": False,
         "output": f"[timeout] 命令超过 {timeout_ms}ms 被终止。如需更长时间请分步执行或调大 timeout_ms（上限 {_MAX_TIMEOUT_MS}ms）",
     }
+
+
+def _decode_output(raw: bytes) -> str:
+    """N3 输出解码：UTF-8 优先，非法字节以转义序列保留（零信息丢失）。
+
+    旧逻辑按 locale.getpreferredencoding(False) 解码——中文 Windows 缺省 GBK，
+    工具链（git/python/rust）普遍吐 UTF-8 → 每次中文输出都是乱码，模型被迫
+    在命令前垫 `chcp 65001` 仪式（实测 46 会话 62 次）。新语义：strict UTF-8
+    成功即用；失败则**按首字节定长**逐段扫描——ASCII（<0x80）直出；首字节
+    C2-DF / E0-EF / F0-F4 分别按 2/3/4 字节成段试解码；首字节非法、或段解码
+    失败（含尾部截断）只转义当前字节再前进一个。任何分支指针必推进 ≥1：
+    不死循环，也不会把失败段之后的合法字节卷进失败窗口（定长窗扫法两病
+    皆犯——尾部 ASCII 被转义——由回归用例抓住后改为本算法）。诚实边界：
+    GBK 双字节几乎总不是合法 UTF-8（如「你」= C4 E3，E3 不可作续字节），
+    会以 backslash-x-NN 转义呈现——不假装解码成功，模型可按转义反推原始编码。
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    out: list[str] = []
+    i, n = 0, len(raw)
+    while i < n:
+        lead = raw[i]
+        if lead < 0x80:
+            out.append(chr(lead))
+            i += 1
+            continue
+        if 0xC2 <= lead <= 0xDF:
+            expect = 2
+        elif 0xE0 <= lead <= 0xEF:
+            expect = 3
+        elif 0xF0 <= lead <= 0xF4:
+            expect = 4
+        else:
+            out.append("\\x%02x" % lead)
+            i += 1
+            continue
+        chunk = raw[i : i + expect]
+        try:
+            out.append(chunk.decode("utf-8"))
+            i += expect
+        except UnicodeDecodeError:
+            out.append("\\x%02x" % lead)
+            i += 1
+    return "".join(out)
 
 
 def _result(exit_code, timeout: bool, output: str) -> dict:
@@ -229,9 +324,19 @@ def _result(exit_code, timeout: bool, output: str) -> dict:
 
 def _run_bash(args: dict) -> dict:
     command = require(args, "command")
+    # cmd.exe /c 只执行首行（换行即命令终止，且不尊重引号）：多行命令的其余行会被
+    # **静默丢弃且 exit_code 仍为 0**。静默截断比报错危险得多——模型会基于虚假成功
+    # 继续推理。故此处 fail-loud，把问题挡在入口。
+    if "\n" in command or "\r" in command:
+        raise ToolError(
+            "bash command 含换行符：cmd.exe /c 只执行首行，其余行会被静默丢弃（exit_code 仍为 0）。"
+            "请改用单行 + `&&` / `&` 串联，或拆成多次调用；python 多语句用 `;` 分隔。",
+            code="MULTILINE_UNSUPPORTED",
+            field="command",
+        )
     timeout_ms = optional_int(args, "timeout_ms", 30_000, 1_000, _MAX_TIMEOUT_MS)
     before = _scan_zone() if _trace_enabled() else None  # 执行前快照（pre-copy 内容缓存）
-    result = _run_sandboxed(command, timeout_ms) if _SANDBOXED else _run_direct(command, timeout_ms)
+    result = _run_sandboxed(command, timeout_ms) if _sandboxed() else _run_direct(command, timeout_ms)
     if before is not None:
         try:
             changes, cut = _diff_zone(*before)
@@ -244,22 +349,37 @@ def _run_bash(args: dict) -> dict:
     return result
 
 
-_DESCRIPTION = (
-    "Run a shell command in the workspace (cwd = WORKSPACE_ROOT) via a restricted-token sandbox helper "
+def _description() -> str:
+    """工具描述：沙箱有无随调用期 env 定形（诚实声明，不 import 期固化）。"""
+    return (
+        "Run a shell command in the workspace (cwd = WORKSPACE_ROOT) via a restricted-token sandbox helper "
         "(reduced privileges, admin groups deny-only; fail-closed). Large output keeps head 40KB + tail 20KB. "
-        "Args: command (required), timeout_ms (default 30000, max 60000)."
-        if _SANDBOXED
+        "Args: command (required), timeout_ms (default 30000, max 60000). "
+        "IMPORTANT: command must be a SINGLE line - a newline makes cmd.exe /c run only the first line "
+        "and silently drop the rest with exit_code=0; chain steps with && or & instead. "
+        "This tool is for running/building/testing, git, process and port queries - do NOT use it for "
+        "file operations (reading, writing, editing, searching, listing files); use the dedicated tools "
+        "(read_file/write_file/edit_file/grep/list_dir/symbols_search) instead."
+        if _sandboxed()
         else (
             "Run a shell command in the workspace (cwd = WORKSPACE_ROOT). "
             "Runs with full user permissions - NOT sandboxed (BASH_SANDBOX=off). "
             "Large output keeps head 40KB + tail 20KB. "
-            "Args: command (required), timeout_ms (default 30000, max 60000)."
+            "Args: command (required), timeout_ms (default 30000, max 60000). "
+            "IMPORTANT: command must be a SINGLE line - a newline makes cmd.exe /c run only the first line "
+            "and silently drop the rest with exit_code=0; chain steps with && or & instead. "
+            "Output is decoded as UTF-8 (non-UTF-8 bytes appear as backslash-x escapes) - do NOT prefix "
+            "commands with chcp 65001 or code-page env vars; they are unnecessary. "
+            "This tool is for running/building/testing, git, process and port queries - do NOT use it for "
+            "file operations (reading, writing, editing, searching, listing files); use the dedicated tools "
+            "(read_file/write_file/edit_file/grep/list_dir/symbols_search) instead."
         )
-)
+    )
+
 
 TOOLS = {
     "bash": {
-        "description": _DESCRIPTION,
+        "description": _description(),
         "parameters": {
             "type": "object",
             "properties": {"command": {"type": "string"}, "timeout_ms": {"type": "integer"}},

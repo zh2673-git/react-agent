@@ -205,7 +205,7 @@ impl AgentLoopPlugin {
                     src,
                     CAP_TOOLS,
                     json!({"op": "call", "name": tc.name, "args": tc.arguments, "session_id": session_id}),
-                    TOOLS_DEADLINE,
+                    tools_deadline(),
                 )
                 .await
             {

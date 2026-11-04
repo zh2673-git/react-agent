@@ -240,6 +240,11 @@ _READ_TTL_S = 600
 _READ_CACHE: dict[str, tuple[float, str]] = {}
 _READ_CACHE_MAX = 32
 _CACHEABLE_CHARS = 256 * 1024
+# O4：大文档缓存预算（trace 复盘：web_read 483 次/17.7%，>256K 的长文档此前完全绕过
+# 缓存，每次翻页都重新出网）。容量放宽到 1M 字符（4×32K 页/96 页），缓存字典总量
+# 8MB 封顶——超限整条拒存（宁缺勿炸），LRU 淘汰由 _cache_put 的既有循环承担。
+_CACHEABLE_CHARS_BIG = 1024 * 1024
+_READ_CACHE_TOTAL_BYTES = 8 * 1024 * 1024
 
 
 def _cache_get(url: str) -> str | None:
@@ -256,6 +261,10 @@ def _cache_get(url: str) -> str | None:
 def _cache_put(url: str, text: str) -> None:
     _READ_CACHE.pop(url, None)
     if len(text) <= _CACHEABLE_CHARS:
+        _READ_CACHE[url] = (time.monotonic(), text)
+    elif len(text) <= _CACHEABLE_CHARS_BIG:  # O4：大文档也可入缓存（256K~1M），翻页不再反复出网
+        if sum(len(t) for _ts, t in _READ_CACHE.values()) + len(text) > _READ_CACHE_TOTAL_BYTES:
+            return  # 总量预算超限：宁缺勿炸，退回旧行为（不缓存）
         _READ_CACHE[url] = (time.monotonic(), text)
     while len(_READ_CACHE) > _READ_CACHE_MAX:
         _READ_CACHE.pop(next(iter(_READ_CACHE)))

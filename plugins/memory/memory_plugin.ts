@@ -75,9 +75,22 @@ function loadIfAbsent(sessionId: string): Msg[] {
   let msgs = sessions.get(sessionId);
   if (msgs) return msgs;
   const file = sessionFile(sessionId);
+  let text = "";
   try {
-    msgs = JSON.parse(fs.readFileSync(file, "utf8")) as Msg[];
+    text = fs.readFileSync(file, "utf8");
   } catch {
+    /* 尚无会话文件：正常路径 */
+  }
+  if (text) {
+    try {
+      msgs = JSON.parse(text) as Msg[];
+    } catch (e) {
+      // P4：半文件/损坏——过去静默当空会话，数据丢失无告警。响亮提示但保持可用
+      // （配 persist 的 tmp+rename 原子写后，新数据不应再出现此路径）。
+      console.error(`[memory] 会话文件解析失败（可能为历史半文件），按空会话继续: ${file} (${e})`);
+      msgs = [];
+    }
+  } else {
     msgs = [];
   }
   sessions.set(sessionId, msgs);
@@ -94,7 +107,57 @@ function persist(sessionId: string, msgs: Msg[]): void {
     }
     return;
   }
-  fs.writeFileSync(file, JSON.stringify(msgs), "utf8");
+  // P4：原子写（tmp + rename）——writeFileSync 直写在崩溃/断电时可能留下半文件，
+  // 读侧解析失败会静默当空会话（整段会话记忆蒸发且无告警）。同目录 tmp 保证同盘 rename。
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(msgs), "utf8");
+  fs.renameSync(tmp, file);
+}
+
+// P4：trace 行索引（假分页治理）。trace.read 过去每次轮询（网关 300ms 一次）全文件重读
+// + 全行 JSON.parse（O(全文件)）；大 trace（5MB+）下每 300ms 一次全量解析纯烧 CPU。
+// sidecar 缓存 = {文件size, mtimeMs, 各事件行字节偏移}：两者与当前文件一致 → 按偏移
+// 随机直读所需页（O(页)）；文件有增长 → 全量重建一次并写回（生成期仍 O(N)，稳态 O(1)）。
+const traceIdx = new Map<string, { size: number; mtimeMs: number; offsets: number[] }>();
+
+function traceOffsets(file: string): number[] {
+  const st = fs.statSync(file);
+  const hit = traceIdx.get(file);
+  if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.offsets;
+  const offsets: number[] = [];
+  let offset = 0;
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    const t = line.trim();
+    if (t) {
+      try {
+        JSON.parse(t);
+        offsets.push(offset);
+      } catch {
+        /* 损坏行（半行写入容忍）：不进索引 */
+      }
+    }
+    offset += Buffer.byteLength(line + "\n", "utf8");
+  }
+  traceIdx.set(file, { size: st.size, mtimeMs: st.mtimeMs, offsets });
+  return offsets;
+}
+
+function readEventLine(file: string, off: number): unknown {
+  const fd = fs.openSync(file, "r");
+  try {
+    const len = Math.min(1 << 20, fs.fstatSync(fd).size - off); // 单事件上限 1MB（与分页字节预算同量级）
+    if (len <= 0) return null;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, off);
+    const t = buf.toString("utf8").split("\n")[0].trim();
+    try {
+      return JSON.parse(t);
+    } catch {
+      return null;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function err(message: string): { ok: false; error: { message: string } } {
@@ -245,25 +308,41 @@ export const memoryPlugin: Plugin = {
           return { ok: true, count: events.length };
         }
         if (op === "trace.read") {
-          // 只追加文件整体重读，按行切事件；after=N 返回第 N 条之后的事件（UI 增量拉取）
-          let text = "";
+          // P4：按索引偏移直读（traceOffsets 内部 size+mtime 命中缓存 / 未命中重建一次）。
+          // after=N 返回第 N 条之后的事件（UI 增量拉取）——语义与全量扫描版完全一致。
+          const file = traceFile(sessionId);
+          let offsets: number[] = [];
+          let total = 0;
           try {
-            text = fs.readFileSync(traceFile(sessionId), "utf8");
+            offsets = traceOffsets(file);
+            total = offsets.length;
           } catch {
             /* 尚无日志 → 空事件 */
           }
-          const all: unknown[] = [];
-          for (const line of text.split("\n")) {
-            const t = line.trim();
-            if (!t) continue;
-            try {
-              all.push(JSON.parse(t));
-            } catch {
-              /* 半行写入容忍：跳过损坏行 */
-            }
-          }
           const after = typeof payload.after === "number" && payload.after >= 0 ? Math.floor(payload.after) : 0;
-          return { ok: true, events: all.slice(after), next: all.length };
+          // 分页：一次响应必须远低于 kernel gRPC 解码上限（4MB）。整份大 trace（如 5MB
+          // 会话日志）一次性返回会触发 K700「decoded message length too large」——网关
+          // 每次轮询都报错，前端把错误帧当断线反复重连、feed 反复清空（页面持续闪烁）。
+          // 按「条数 + 字节」双预算切片，next 为已消费游标，网关多批拉取即可追平。
+          // 单条超大事件（极端情况）仍单独放行，避免游标不前进造成死循环。
+          const MAX_EVENTS = 800;
+          const MAX_BYTES = 1_000_000;
+          const events: unknown[] = [];
+          let bytes = 0;
+          let cursor = after;
+          while (cursor < total && events.length < MAX_EVENTS) {
+            const ev = readEventLine(file, offsets[cursor]);
+            if (ev === null) {
+              cursor++;
+              continue;
+            }
+            const size = Buffer.byteLength(JSON.stringify(ev), "utf8") + 1;
+            if (events.length > 0 && bytes + size > MAX_BYTES) break;
+            events.push(ev);
+            bytes += size;
+            cursor++;
+          }
+          return { ok: true, events, next: cursor };
         }
         return err(`unknown op: ${String(op)}`);
       }

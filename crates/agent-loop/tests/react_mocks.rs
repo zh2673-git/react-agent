@@ -936,23 +936,114 @@ async fn token_budget_exhaustion_stops_loop() {
 }
 
 #[tokio::test]
-async fn wall_clock_budget_expires_at_round_boundary() {
-    // T4 回归：单次 chat 墙钟超预算 → 轮次边界 K508 收敛（时长超限）。
+async fn budget_stop_emits_chat_summary_for_observability() {
+    // E7-C1 回归：预算硬停（K508）也必须补发 chat_summary——「被掐断」的回合
+    // 不能在效率画像里缺段，脚本要能区分「没跑」与「跑了但被预算截停」。
     let _env_guard = ENV_LOCK.lock().unwrap();
+    let saved = std::env::var("CHAT_TOKEN_BUDGET").ok();
+    std::env::set_var("CHAT_TOKEN_BUDGET", "10");
+
+    let mem_state = Arc::new(Mutex::new(vec![]));
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let llm_script = vec![
+        // r1：要调工具，本调用即用掉 12 tokens（> 预算 10）→ 下一轮开头硬停
+        json!({"ok": true, "content": null, "tool_calls": [{"id": "c1", "name": "calculator", "arguments": {}}], "model": "mock", "finish_reason": "tool_calls", "usage": {"input_tokens": 8, "output_tokens": 4}}),
+        // r2（不应到达）
+        json!({"ok": true, "content": "should not reach", "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+    ];
+    let kernel = boot(vec![
+        mock_memory_traced(mem_state.clone(), events.clone()),
+        mock_llm_capturing(llm_script, Arc::new(Mutex::new(vec![]))),
+        mock_tools(json!({"ok": true})),
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "burn tokens").await;
+    assert_eq!(r["ok"], json!(false), "{r}");
+    assert_eq!(r["error"]["code"], json!("K508"), "{r}");
+
+    let evs = events.lock().unwrap().clone();
+    let errs: Vec<&Value> = evs.iter().filter(|e| e["type"] == "error").collect();
+    assert!(!errs.is_empty(), "K508 出口必须有 error 事件在场: {evs:#?}");
+    let summary: Vec<&Value> = evs.iter().filter(|e| e["type"] == "chat_summary").collect();
+    assert_eq!(summary.len(), 1, "预算硬停后必须恰好一条 chat_summary: {evs:#?}");
+    let s = summary[0];
+    assert_eq!(s["stopped_by"], json!("tokens"), "停车原因必须可观测: {s}");
+    // 硬停实际发生在检查点②（工具波次结束后）——r1 已执行的 calculator 步骤如实计入：
+    // 画像的职责是「如实上报本回合发生了什么」，不是把成果清零。
+    assert_eq!(s["calls"], json!(1), "r1 已执行的工具步骤必须如实计入: {s}");
+    assert_eq!(s["steps"], json!(1), "steps 与 calls 同源（工具执行数）: {s}");
+    assert_eq!(s["rounds"], json!(1), "画像须如实上报已跑轮数: {s}");
+    assert_eq!(s["llm_calls"], json!(1), "画像须如实上报 LLM 调用数: {s}");
+
+    match saved {
+        Some(v) => std::env::set_var("CHAT_TOKEN_BUDGET", v),
+        None => std::env::remove_var("CHAT_TOKEN_BUDGET"),
+    }
+}
+
+#[tokio::test]
+async fn failed_exit_paths_still_emit_chat_summary() {
+    // E7-C2 回归：空答案（finish 的 K502）失败出口也要交 chat_summary（steps 如实上报）。
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mem_state = Arc::new(Mutex::new(vec![]));
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let llm_script = vec![
+        // r1：收敛（无工具调用），但 content 为空 → finish 判空答案 K502
+        json!({"ok": true, "content": null, "tool_calls": [], "model": "mock", "finish_reason": "stop"}),
+    ];
+    let kernel = boot(vec![
+        mock_memory_traced(mem_state.clone(), events.clone()),
+        mock_llm_capturing(llm_script, Arc::new(Mutex::new(vec![]))),
+        mock_tools(json!({"ok": true})),
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "empty answer").await;
+    assert_eq!(r["ok"], json!(false), "{r}");
+    assert_eq!(r["error"]["code"], json!("K502"), "{r}");
+
+    let evs = events.lock().unwrap().clone();
+    let summary: Vec<&Value> = evs.iter().filter(|e| e["type"] == "chat_summary").collect();
+    assert_eq!(summary.len(), 1, "空答案失败出口必须恰好一条 chat_summary: {evs:#?}");
+    let s = summary[0];
+    assert!(s["stopped_by"].is_null(), "非预算原因 stopped_by=null: {s}");
+    // N1a 空答案自愈（2026-11-04）：首答空 → nudge 续跑一轮（mock 脚本耗尽重复返回空）
+    // → K502。画像如实上报两轮两次调用——自愈成本可见，不掩盖。
+    assert_eq!(s["rounds"], json!(2), "画像须如实上报已跑轮数（含自愈续跑轮）: {s}");
+    assert_eq!(s["llm_calls"], json!(2), "画像须如实上报 LLM 调用数（含自愈续跑）: {s}");
+}
+
+#[tokio::test]
+async fn wall_clock_budget_soft_converges_instead_of_aborting() {
+    // T4 语义修正回归：墙钟到点**不得**丢弃本轮成果直接 K508。
+    // 旧行为（硬中止）的后果：任务没做完、工作也没了，用户只看到「预算耗尽」错误气泡。
+    // 新行为：转入强制收敛轮——仍调一次 LLM 但**不带工具**，交出「已完成 / 未完成」。
+    // 容忍锁污染：同文件其它用例 panic 时不应连带失败（env 守卫只防并发不防毒）
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let saved = std::env::var("CHAT_BUDGET_SECS").ok();
     std::env::set_var("CHAT_BUDGET_SECS", "0.2"); // 200ms
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
     let (c1, c2) = (calls.clone(), calls.clone());
+    let cap = captured.clone();
     let llm = MockPlugin::concurrent_async("llm-adapter", &["llm.chat"], move |_env| {
-        let c = c1.clone();
+        let (c, cap) = (c1.clone(), cap.clone());
+        let req = _env.payload.clone(); // BoxFut 要求 'static：进 async 块前拿走所有权
         Box::pin(async move {
+            cap.lock().unwrap().push(req); // 逐轮捕获完整请求（tools 与 messages 平级）
             let n = c.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
-                // 首轮 LLM 慢于预算（400ms > 200ms）
+                // 首轮 LLM 慢于预算（400ms > 200ms）——本轮工具成果必须被保留
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                return tool_call_resp(json!([{"id": "c", "name": "calculator", "arguments": {}}]));
             }
-            tool_call_resp(json!([{"id": "c", "name": "calculator", "arguments": {}}]))
+            // 收敛轮：模型正确响应 wrap-up 指令，给出部分成果说明
+            let mut resp = tool_call_resp(json!([]));
+            resp["content"] = json!("已完成 calculator 调用；任务未收尾，建议续做。");
+            resp["finish_reason"] = json!("stop");
+            resp
         })
     });
     let kernel = boot(vec![
@@ -963,10 +1054,76 @@ async fn wall_clock_budget_expires_at_round_boundary() {
     ])
     .await;
     let r = chat(&kernel, "slow round").await;
-    assert_eq!(r["ok"], json!(false), "{r}");
-    assert_eq!(r["error"]["code"], json!("K508"), "{r}");
-    assert!(r["error"]["message"].as_str().unwrap().contains("时长"), "{r}");
-    assert_eq!(c2.load(Ordering::SeqCst), 1, "预算耗尽后不得再调 LLM");
+
+    // ① 不再硬中止：任务成果被交还
+    assert_eq!(r["ok"], json!(true), "墙钟到点必须软收敛而非中止: {r}");
+    assert!(r["answer"].as_str().unwrap().contains("已完成"), "{r}");
+    // ② 本轮已执行的那个工具步骤仍在（成果没丢）
+    assert_eq!(r["steps"].as_array().unwrap().len(), 1, "本轮工具成果必须保留: {r}");
+    // ③ 只多调一次收敛 LLM，不会无限续命
+    assert_eq!(c2.load(Ordering::SeqCst), 2, "到点后仅允许一次收敛轮: {r}");
+
+    // ④ 收敛轮请求不带工具（否则模型会继续探索，预算形同虚设）
+    let cap = captured.lock().unwrap();
+    assert_eq!(cap.len(), 2, "应恰好两轮请求: {cap:#?}");
+    let last_req = &cap[1];
+    let tools = last_req.get("tools").cloned().unwrap_or(Value::Null);
+    let has_tools = tools.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+    assert!(!has_tools, "收敛轮不得携带工具: {tools:?}");
+    // ⑤ wrap-up 指令确实进了上下文
+    let text = last_req["messages"]
+        .as_array()
+        .map(|ms| {
+            ms.iter()
+                .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    assert!(text.contains("budget_wrap_up"), "必须注入 wrap-up 指令: {text}");
+
+    match saved {
+        Some(v) => std::env::set_var("CHAT_BUDGET_SECS", v),
+        None => std::env::remove_var("CHAT_BUDGET_SECS"),
+    }
+}
+
+#[tokio::test]
+async fn wall_clock_budget_without_answer_still_reports_progress() {
+    // T4 语义修正回归：收敛轮**没交出答案**时，也不能把成果整批丢掉——
+    // 用已记录的步骤自述进度（「宁可交进度报告，也不静默丢弃」）。
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved = std::env::var("CHAT_BUDGET_SECS").ok();
+    std::env::set_var("CHAT_BUDGET_SECS", "0.2");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c1 = calls.clone();
+    let llm = MockPlugin::concurrent_async("llm-adapter", &["llm.chat"], move |_env| {
+        let c = c1.clone();
+        Box::pin(async move {
+            let n = c.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+            // 无论第几轮都返回空答案 + 仍想调工具：模型完全没响应 wrap-up
+            tool_call_resp(json!([{"id": "c", "name": "calculator", "arguments": {}}]))
+        })
+    });
+    let kernel = boot(vec![
+        mock_memory(Arc::new(Mutex::new(vec![]))),
+        llm,
+        mock_tools(json!({"ok": true})),
+        agent_loop(8),
+    ])
+    .await;
+    let r = chat(&kernel, "slow round, model ignores wrap up").await;
+
+    assert_eq!(r["ok"], json!(true), "收敛轮无答案也要给进度报告: {r}");
+    let answer = r["answer"].as_str().unwrap();
+    assert!(answer.contains("自动收敛"), "{answer}");
+    assert!(answer.contains("calculator"), "报告须含已执行工具: {answer}");
+    assert!(answer.contains("下一步"), "报告须给续做建议: {answer}");
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "不得反复续命: {r}");
 
     match saved {
         Some(v) => std::env::set_var("CHAT_BUDGET_SECS", v),

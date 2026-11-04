@@ -60,6 +60,8 @@ class LlmAdapterPlugin:
             from presets import list_presets
 
             return list_presets(payload)
+        if op == "upstream.status":
+            return self._upstream_status()
         if op != "chat":
             return _err(f"unknown op: {op}", code="K400")
         name = payload.get("provider") or os.environ.get("LLM_PROVIDER", "mock")
@@ -128,6 +130,50 @@ class LlmAdapterPlugin:
             return fn(payload)
         except Exception as exc:  # noqa: BLE001
             return _err(f"{type(exc).__name__}: {exc}")
+
+    def _upstream_status(self) -> dict:
+        """上游网关状态（magpie 本地网关专用，通用 OpenAI 兼容端点降级为仅探活）。
+
+        - 探活：GET {base_url}/models（OpenAI 兼容标准端点，任何站点均可）；
+        - magpie 扩展：GET {base_url}/magpie/quotas + {base_url}/magpie/usage?period=30d
+          （magpie 把管理端点挂在 /v1 前缀下，与模型端点同级；失败静默为 None
+          ——非 magpie 站点无此端点）。
+        Bearer 令牌：OPENAI_API_KEY，缺省 "magpie"（本地网关任意令牌皆放行）。
+        任何异常均收敛为 {"up": False}——状态展示不抛错。
+        """
+        base = os.environ.get("LLM_BASE_URL", "").rstrip("/")
+        if not base:
+            return {"ok": True, "up": False, "note": "未配置 base_url"}
+        token = os.environ.get("OPENAI_API_KEY") or "magpie"
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            import httpx
+
+            with httpx.Client(timeout=4.0) as client:
+                models = None
+                try:
+                    r = client.get(f"{base}/models", headers=headers)
+                    if r.status_code == 200:
+                        data = r.json().get("data")
+                        models = len(data) if isinstance(data, list) else None
+                except Exception:  # noqa: BLE001 - 探活失败仅影响 up 标志
+                    pass
+                up = models is not None
+                quotas = usage = None
+                if up:
+                    try:
+                        rq = client.get(f"{base}/magpie/quotas", headers=headers)
+                        quotas = rq.json() if rq.status_code == 200 else None
+                    except Exception:  # noqa: BLE001 - 非 magpie 站点无此端点，静默
+                        pass
+                    try:
+                        ru = client.get(f"{base}/magpie/usage", headers=headers, params={"period": "30d"})
+                        usage = ru.json() if ru.status_code == 200 else None
+                    except Exception:  # noqa: BLE001
+                        pass
+                return {"ok": True, "up": up, "models": models, "quotas": quotas, "usage": usage}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": True, "up": False, "note": f"{type(exc).__name__}: {exc}"}
 
     def destroy(self) -> None:
         pass

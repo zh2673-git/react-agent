@@ -419,8 +419,10 @@ pub fn stop_instance(name: &str) -> Result<Value, String> {
     let dir = instance_dir(name);
     let mut meta = read_instance_meta(&dir).ok_or_else(|| format!("实例 {name} 不存在"))?;
     let pid = meta.get("pid").and_then(Value::as_u64).ok_or("instance.json 缺 pid")?;
+    // N2：/T 杀整棵进程树——host 直接子进程只有 guest 插件壳，python/node 的
+    // worker 都挂在下面；不带 /T 会孤儿化它们（端口/内存泄漏，下次 spawn 撞占）。
     let out = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
         .output()
         .map_err(|e| format!("taskkill 失败: {e}"))?;
     if !out.status.success() {

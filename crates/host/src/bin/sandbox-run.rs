@@ -5,7 +5,7 @@
 //!   sandbox-run exec <timeout_ms> <command>    # 受限令牌下经 cmd /c 执行，stdout 输出单行 JSON
 //!
 //! 成功（子进程已执行，无论其退出码）：exit 0 + stdout 单行 JSON：
-//!   {"exit_code":u32,"timeout":bool,"output_b64":"<base64>"}   （base64 由调用方按本地编码解码）
+//!   {"exit_code":u32,"timeout":bool,"output_b64":"<base64>"}   （base64 = 原始字节；解码语义在调用方 bash.py::_decode_output：UTF-8 优先，非法字节转义保留）
 //! 沙箱建立失败（fail-closed，绝不回退无沙箱执行）：
 //!   exit 3 = 平台不支持；exit 4 = 受限令牌创建/进程创建失败；exit 2 = 用法错误。错误细节走 stderr。
 

@@ -107,12 +107,41 @@ def _chat_with(endpoint: dict, payload: dict, provider_label: str) -> dict:
 def _chat_once(endpoint: dict, body: dict, provider_label: str) -> dict:
     import httpx
 
-    start = time.monotonic()
-    resp = httpx.post(f"{endpoint['base_url']}/chat/completions", json=body, headers=endpoint["headers"], timeout=httpx.Timeout(PROVIDER_DEADLINE, connect=10.0))
-    elapsed_ms = int((time.monotonic() - start) * 1000)
-    if resp.status_code >= 400:
-        return err_from_resp(provider_label, resp.status_code, resp.text)
-    data = resp.json()
+    # P3：provider 内幂等重试。过去一次 POST 定生死（429/5xx 直接落错误，重试全赖上游
+    # agent-loop 整轮 T1-T3，代价是整轮重来）。此处只重试「连接已建立」的单请求：
+    # POST /chat/completions 非流式在拿到响应前无已生成内容，重试安全；流式路径不经过
+    # 这里（流式中断含已外抛增量，重试会造成重复气泡，交给上游按轮处理）。
+    # 429 尊重 Retry-After（上限 5s）；指数退避 1s/2s；总预算仍受 PROVIDER_DEADLINE 约束
+    # （每次尝试独立计时，agent-loop 总闸兜底整轮）。
+    attempts = 3
+    last: dict | None = None
+    for attempt in range(attempts):
+        start = time.monotonic()
+        try:
+            resp = httpx.post(f"{endpoint['base_url']}/chat/completions", json=body, headers=endpoint["headers"], timeout=httpx.Timeout(PROVIDER_DEADLINE, connect=10.0))
+        except Exception as exc:  # noqa: BLE001 - httpx 连接异常（ConnectError 等）非 OSError；响应未到达，重试安全
+            last = err(f"{provider_label} 连接失败: {type(exc).__name__}: {exc}", code="LLM_TRANSIENT")
+        else:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            if resp.status_code < 400:
+                data = resp.json()
+                # 原成功路径主体（原样保留，仅包进循环提前返回）
+                return _chat_once_success(endpoint, body, provider_label, data, elapsed_ms)
+            last = err_from_resp(provider_label, resp.status_code, resp.text)
+            if last.get("error", {}).get("code") == "LLM_TRANSIENT" and attempt < attempts - 1:
+                retry_after = 1.0
+                try:
+                    retry_after = min(5.0, float(resp.headers.get("Retry-After", "1")) or 1.0)
+                except (TypeError, ValueError):
+                    retry_after = 1.0
+                time.sleep(retry_after if resp.status_code == 429 else float(2 ** attempt))
+                continue
+            return last
+    return last or err(f"{provider_label} 重试耗尽", code="LLM_TRANSIENT")
+
+
+def _chat_once_success(endpoint: dict, body: dict, provider_label: str, data: dict, elapsed_ms: int) -> dict:
+    """_chat_once 的成功响应归一化段（原实现原样提取，行为不变）。"""
     # 200 异常态防护：部分网关（限流/瞬时故障）会在 200 里返回非 chat 形态（null / {"error":...}），
     # 硬下标 choices 会崩成 'NoneType' object is not subscriptable——统一收敛为业务错误。
     if not isinstance(data, dict) or not data.get("choices"):

@@ -79,9 +79,11 @@ impl Plugin for MockPlugin {
 // ---- 场景 -------------------------------------------------------------------
 
 /// 冻结的 trace 事件 type 全集（新增类型必须先改这里 + 前端 render()，漏发即前端瞎）。
+/// `chat_summary`（D1）：每轮 chat 收敛时一条效率画像；前端不渲染（纯观测），
+/// 但同样冻结——避免后续新增类型绕过本闸。
 const FROZEN_EVENT_TYPES: &[&str] = &[
     "user", "assistant", "tool_call", "tool_result", "artifact", "sources", "file_change", "compaction",
-    "subagent", "skill_loaded", "skill_installed", "error", "retry",
+    "subagent", "skill_loaded", "skill_installed", "error", "retry", "chat_summary",
 ];
 
 #[tokio::test]

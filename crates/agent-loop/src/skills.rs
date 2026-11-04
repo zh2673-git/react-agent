@@ -41,7 +41,15 @@ impl AgentLoopPlugin {
     /// 技能附录（Discovery，07 §2.1）：assets 不可用/空列表 → 省略（不花 token）。
     /// skills.list 附带 root（08 §L1）：root ⊆ WORKSPACE_ROOT 时追加「技能自扩展」授权段——
     /// 模型可用 write_file 创建新技能（文件即注册表，list 每次重扫，下轮对话自动可见）。
-    pub(super) async fn skills_appendix(&self, src: &Envelope, cfg: &AgentLoopConfig) -> String {
+    ///
+    /// B2 按需注入：`want_skill_build` 由调用方按**本轮用户文本**判定（见
+    /// `user_wants_skill_build`）。为假时只注入极短授权段；为真时才注入完整打包教程。
+    pub(super) async fn skills_appendix(
+        &self,
+        src: &Envelope,
+        cfg: &AgentLoopConfig,
+        want_skill_build: bool,
+    ) -> String {
         let Ok(v) = self.call(src, CAP_ASSETS, json!({"op": "skills.list"}), ASSETS_DEADLINE).await else {
             return String::new();
         };
@@ -64,7 +72,7 @@ impl AgentLoopPlugin {
                 }
             }
         }
-        if let Some(section) = Self::self_extension_section(root) {
+        if let Some(section) = Self::self_extension_section(root, want_skill_build) {
             lines.push(section);
         }
         // 产物输出约定（方案 A）：给用户的成品文件统一落产物目录——模型不再把产物
@@ -73,16 +81,42 @@ impl AgentLoopPlugin {
             "## Artifact output\n- Files produced for the user (word/excel/ppt/html/markdown/images/…) must be written into `{}` (workspace-relative path). Do not scatter them into skill directories or the repo root. Mention the relative path of each artifact in your answer.",
             cfg.output_dir
         ));
+        // 反向约定（与上面那条成对出现才有约束力）：只讲「成品去哪」时，模型会把
+        // 探针/一次性脚本也算作「产物」写进产物目录。实测成因：那类脚本占 file_change
+        // 的 46%，且产物目录在 bash 快照排除区（写了连 undo 留痕都没有）。
+        lines.push(format!(
+            "- Intermediate files (probe / scratch / one-off analysis scripts) are NOT artifacts: do not write them into `{}`. Prefer reading files with the dedicated tools (grep / read_file / symbols_search); if a script is unavoidable, put it under `.scratch/` and delete it when done.",
+            cfg.output_dir
+        ));
         lines.join("\n")
+    }
+
+    /// 判定本轮用户文本是否明确要求「造技能/打包工具」——B2 按需注入的触发条件。
+    ///
+    /// 保守取词：宁可少注入（brief 已说明「有这个权力」），也不要每轮灌长教程。
+    /// 覆盖中英文常见表述；`skill`/`技能` 与「造/做/建/打包/新建/写一个」共现才算。
+    pub(super) fn user_wants_skill_build(user_text: &str) -> bool {
+        let t = user_text.to_lowercase();
+        let has_noun = t.contains("技能") || t.contains("skill");
+        if !has_noun {
+            return false;
+        }
+        ["造", "做", "建", "打包", "新建", "写一个", "生成", "创建", "封装", "沉淀", "整理成",
+         "create", "build", "make", "package", "author", "write a", "new"]
+            .iter()
+            .any(|kw| t.contains(kw))
     }
 
     /// L1 技能自扩展授权段（08 §三）：仅当 skills 根目录落在 WORKSPACE_ROOT 内（模型经
     /// write_file 可物理写入）时注入。这是授权声明而非新边界——真正的硬边界仍是
     /// 文件工具的越界拦截（提示词约束≠执行边界）。
-    /// R9 扩展：技能打包与安装引导——SKILL.md + tools.json（语言无关声明）+ 执行体后
-    /// 调 skill_install；preset 装载即启用，用户技能待界面确认后 load_skill 生效；
-    /// load_skill 自身亦完成装载（R9b），两条保留名路径殊途同归。
-    pub(super) fn self_extension_section(skills_root: &str) -> Option<String> {
+    ///
+    /// **按需注入（B2）**：默认只给一条极短的授权声明；完整的打包/安装教程
+    /// （`### Skill packaging with companion tools`，约 1.2 KB）仅在 `full=true` 时注入。
+    /// 依据：实测 `skills_appendix` 每轮都随 system prompt 重发，长教程对「不造技能」的
+    /// 绝大多数轮次是纯 token 开销，且会抬高模型的工具调用倾向（效率放大器 E2）。
+    /// `full=true` 由调用方在「用户本轮明确要求造技能/打包工具」时决定。
+    pub(super) fn self_extension_section(skills_root: &str, full: bool) -> Option<String> {
         if skills_root.is_empty() {
             return None;
         }
@@ -90,19 +124,28 @@ impl AgentLoopPlugin {
         if !path_within(skills_root, &ws) {
             return None;
         }
-        Some(
+        // 常驻段：只讲「你有这个权力」和最小落点，不讲打包协议
+        let brief = format!(
             "\n## Skill self-extension\n\
-             You can extend your own skills: use write_file to create `<skills-root>/<name>/SKILL.md` \
+             You can extend your own skills: use write_file to create `<root>/<name>/SKILL.md` \
              (directory name must equal the frontmatter `name`; frontmatter requires `name`, \
-             `description` and `origin: user` — the origin tag marks user-created skills, without \
-             it the skill is treated as factory-built and cannot be deleted later; the body holds \
-             execution guidance, optionally referencing `references/` files \
-             you also write). New/changed skills become visible in this catalog on the NEXT chat round — \
-             no reload call needed. Keep skills small and focused; invalid frontmatter is silently skipped.\n\n\
-             ### Skill packaging with companion tools\n\
-             A skill may ship its own tools in a language-agnostic way: write a `tools.json` into the \
-             skill directory (a JSON array; each item {\"name\",\"description\",\"parameters\",\
-             \"exec\":{\"cmd\":[...],\"cwd\"?}}), plus the executor programs in any language \
+             `description` and `origin: user` — without the origin tag the skill is treated as \
+             factory-built and cannot be deleted later). New/changed skills become visible in this \
+             catalog on the NEXT chat round — no reload call needed. Keep skills small and focused; \
+             invalid frontmatter is silently skipped.\n\
+             When the user asks you to build or package a skill, a skill may also ship its own tools \
+             (`tools.json` + an executor in any language, installed via the reserved `skill_install` tool).\n"
+        )
+        .replace("<root>", skills_root);
+        if !full {
+            return Some(brief);
+        }
+        // 按需段：完整打包/安装协议（仅当用户明确要造技能时注入）
+        Some(
+            brief
+                + "\n### Skill packaging with companion tools\n\
+             Write a `tools.json` into the skill directory (a JSON array; each item {\"name\",\"description\",\
+             \"parameters\",\"exec\":{\"cmd\":[...],\"cwd\"?}}), plus the executor programs in any language \
              (Python/Node/Rust binary/script — declare the exact command in exec.cmd). Executor protocol: \
              read one JSON {\"args\":{...}} from stdin, reply one JSON {\"ok\":true,\"result\":...} or \
              {\"ok\":false,\"error\":{\"code\",\"message\"}} on stdout. After writing the files, call the \
@@ -110,9 +153,7 @@ impl AgentLoopPlugin {
              enabled automatically on install and appear in your tool list immediately; user-created skills' \
              tools load into the pool but stay disabled until the user approves them in the settings UI \
              (Skills tab) — tell the user honestly instead of probing the environment. Declare tools only \
-             when the skill truly needs them.\n"
-                .replace("<skills-root>", skills_root)
-                + "\n",
+             when the skill truly needs them.\n",
         )
     }
 
@@ -147,7 +188,7 @@ impl AgentLoopPlugin {
             return vec![];
         }
         let payload = json!({"op": "skill_tools", "skills": skills});
-        match self.call(env, CAP_TOOLS, payload, TOOLS_DEADLINE).await {
+        match self.call(env, CAP_TOOLS, payload, tools_deadline()).await {
             Ok(v) => serde_json::from_value(v.get("tools").cloned().unwrap_or(Value::Null)).unwrap_or_default(),
             Err(e) => {
                 tracing::warn!(target: ID, "tools.skill_tools failed, proceeding without skill tools: {e}");
@@ -262,7 +303,7 @@ impl AgentLoopPlugin {
                 // fail-closed 装载（origin=preset 由 tools 侧装载即启用）
                 let origin = loaded.get("origin").and_then(Value::as_str).unwrap_or("user");
                 match self
-                    .call(env, CAP_TOOLS, json!({"op": "install", "path": path, "skill": name, "origin": origin}), TOOLS_DEADLINE)
+                    .call(env, CAP_TOOLS, json!({"op": "install", "path": path, "skill": name, "origin": origin}), tools_deadline())
                     .await
                 {
                     Ok(v) if v.get("ok") == Some(&json!(true)) => {
