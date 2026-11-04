@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "agent-kernel-conformance"
 version = "0.1.0"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.7#b5fdb7fc22a2d5b17a0c8756c603ef5dea21d116"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.8#0bc47207ff79c2c7f179776ad019dbbc6c6a3d1d"
 dependencies = [
  "agent-kernel-core",
  "agent-kernel-kernel",
@@ -18,7 +18,7 @@ dependencies = [
 [[package]]
 name = "agent-kernel-core"
 version = "0.1.7"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.7#b5fdb7fc22a2d5b17a0c8756c603ef5dea21d116"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.8#0bc47207ff79c2c7f179776ad019dbbc6c6a3d1d"
 dependencies = [
  "serde",
  "serde_json",
@@ -29,7 +29,7 @@ dependencies = [
 [[package]]
 name = "agent-kernel-kernel"
 version = "0.1.7"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.7#b5fdb7fc22a2d5b17a0c8756c603ef5dea21d116"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.8#0bc47207ff79c2c7f179776ad019dbbc6c6a3d1d"
 dependencies = [
  "agent-kernel-core",
  "agent-kernel-process",
@@ -52,7 +52,7 @@ dependencies = [
 [[package]]
 name = "agent-kernel-process"
 version = "0.1.7"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.7#b5fdb7fc22a2d5b17a0c8756c603ef5dea21d116"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.8#0bc47207ff79c2c7f179776ad019dbbc6c6a3d1d"
 dependencies = [
  "agent-kernel-core",
  "agent-kernel-sdk",
@@ -70,7 +70,7 @@ dependencies = [
 [[package]]
 name = "agent-kernel-sdk"
 version = "0.1.7"
-source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.7#b5fdb7fc22a2d5b17a0c8756c603ef5dea21d116"
+source = "git+https://github.com/zh2673-git/agent-kernel?tag=v0.1.8#0bc47207ff79c2c7f179776ad019dbbc6c6a3d1d"
 dependencies = [
  "agent-kernel-core",
  "anyhow",

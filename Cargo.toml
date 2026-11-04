@@ -11,11 +11,11 @@ edition = "2021"
 
 [workspace.dependencies]
 # 内核（发布版：git 依赖，锁定 v0.1.7 —— 优先级泳道（T8：System/Normal 双闸）+ call_capability_as trace/priority 贯穿（S1））
-agent-kernel-sdk = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.7" }
-agent-kernel-kernel = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.7", features = [
+agent-kernel-sdk = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.8" }
+agent-kernel-kernel = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.8", features = [
     "process",
 ] }
-agent-kernel-process = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.7" }
+agent-kernel-process = { git = "https://github.com/zh2673-git/agent-kernel", tag = "v0.1.8" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
