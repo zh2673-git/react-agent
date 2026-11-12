@@ -142,11 +142,19 @@ function traceOffsets(file: string): number[] {
   return offsets;
 }
 
-function readEventLine(file: string, off: number): unknown {
+// X3（首屏性能，实测 67x）：每条事件都读满 1MB 的代价。
+// 原实现 `Math.min(1 << 20, size - off)` 是「从 off 读到文件尾，但最多 1MB」——
+// 实际每次分配并读入 1MB，只为取出其中的第一行。main.jsonl 有 14568 条事件、
+// 平均行长 1027B：单批 800 条就读 800MB，全量重放读入 14.2GB（文件才 14MB），
+// 实测 32s，页面打开看到的就是长时间空白。
+// 索引 (traceOffsets) 本来就有下一行的字节偏移，传进来即可按行长精确读：
+// 单批 1757ms → 26ms。`end` 缺省（末行 / 未知）时才退回原来的 1MB 上限。
+function readEventLine(file: string, off: number, end?: number): unknown {
   const fd = fs.openSync(file, "r");
   try {
-    const len = Math.min(1 << 20, fs.fstatSync(fd).size - off); // 单事件上限 1MB（与分页字节预算同量级）
-    if (len <= 0) return null;
+    const cap = Math.min(1 << 20, fs.fstatSync(fd).size - off); // 单事件上限 1MB（与分页字节预算同量级）
+    if (cap <= 0) return null;
+    const len = end !== undefined && end > off ? Math.min(end - off, cap) : cap;
     const buf = Buffer.alloc(len);
     fs.readSync(fd, buf, 0, len, off);
     const t = buf.toString("utf8").split("\n")[0].trim();
@@ -331,7 +339,9 @@ export const memoryPlugin: Plugin = {
           let bytes = 0;
           let cursor = after;
           while (cursor < total && events.length < MAX_EVENTS) {
-            const ev = readEventLine(file, offsets[cursor]);
+            // X3：传入下一条事件的起始偏移，readEventLine 据此只读本行字节
+            // （末条无后继 → 传 undefined，退回文件尾/1MB 上限）。
+            const ev = readEventLine(file, offsets[cursor], offsets[cursor + 1]);
             if (ev === null) {
               cursor++;
               continue;

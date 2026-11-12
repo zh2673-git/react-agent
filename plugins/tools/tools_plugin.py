@@ -332,6 +332,12 @@ class ToolsPlugin:
             ]
             # §八 MCP 第三池：已启用工具常驻 list（全会话可见，agent-loop 清单注入零改动）；
             # all=true 视图附 enabled 与 mcp_server（host 配置视图按 mcp_tools op 取，勿混内置 tab）
+            # all=true 视图附 enabled 与 mcp_server（host 配置视图按 mcp_tools op 取，勿混内置 tab）
+            # G 轮：MCP 工具标 deferred——完整 JSON Schema **不进** agent-loop 的下发清单，
+            # 只在系统提示词里留一行名字；模型调 load_tools 报名后自下一轮起下发。
+            # 依据：外部 server 常一次挂十几件工具，而单轮真用得上的通常 1-2 件，
+            # 其余 schema 随每轮请求重发是纯 token 税（且与任务难度无关）。
+            # 技能工具不标：数量少（1-3 件）且刚 load_skill 就期待可见，藏起来会变成新坑。
             for name, e in _MCP_TOOLS.items():
                 if show_all or name in _ENABLED:
                     tools.append(
@@ -340,6 +346,7 @@ class ToolsPlugin:
                             "description": e["description"],
                             "parameters": e["parameters"],
                             "mcp_server": e["server"],
+                            "deferred": True,
                             **({"enabled": name in _ENABLED} if show_all else {}),
                         }
                     )

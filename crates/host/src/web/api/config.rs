@@ -514,6 +514,8 @@ mod tests {
     #[test]
     fn agent_config_applies_to_env_and_validates_numbers() {
         // P5/E1：agent 段热通道——合法键落 env、数值键轻校验、未知键忽略。
+        // F4：与 config.rs 的两条同类测试共享 MAX_ROUNDS / CHAT_TOKEN_BUDGET 等键
+        let _guard = crate::config::env_lock();
         let keys = ["MAX_ROUNDS", "CHAT_TOKEN_BUDGET", "AGENT_SYSTEM_PROMPT", "COMPACT_TRIGGER"];
         let saved: Vec<(String, Option<String>)> = keys.iter().map(|k| (k.to_string(), std::env::var(k).ok())).collect();
 

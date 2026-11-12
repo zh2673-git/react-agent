@@ -359,7 +359,12 @@ def _description() -> str:
         "and silently drop the rest with exit_code=0; chain steps with && or & instead. "
         "This tool is for running/building/testing, git, process and port queries - do NOT use it for "
         "file operations (reading, writing, editing, searching, listing files); use the dedicated tools "
-        "(read_file/write_file/edit_file/grep/list_dir/symbols_search) instead."
+        "(read_file/write_file/edit_file/grep/list_dir/symbols_search) instead. "
+        "The cwd is ALREADY the workspace root: never prefix commands with 'cd /d \"...\" &&' (redundant). "
+        "Paths inside the workspace are off-limits for file work: read/write/edit/search/list there MUST go "
+        "through the dedicated tools, never through powershell Get-Content/Set-Content/Get-ChildItem/Select-String. "
+        "Use bash for file access only when a path legitimately falls outside the workspace "
+        "(after the dedicated tool returns PATH_OUTSIDE_WORKSPACE), or for binary/archive operations."
         if _sandboxed()
         else (
             "Run a shell command in the workspace (cwd = WORKSPACE_ROOT). "
@@ -372,7 +377,12 @@ def _description() -> str:
             "commands with chcp 65001 or code-page env vars; they are unnecessary. "
             "This tool is for running/building/testing, git, process and port queries - do NOT use it for "
             "file operations (reading, writing, editing, searching, listing files); use the dedicated tools "
-            "(read_file/write_file/edit_file/grep/list_dir/symbols_search) instead."
+            "(read_file/write_file/edit_file/grep/list_dir/symbols_search) instead. "
+            "The cwd is ALREADY the workspace root: never prefix commands with 'cd /d \"...\" &&' (redundant). "
+            "Paths inside the workspace are off-limits for file work: read/write/edit/search/list there MUST go "
+            "through the dedicated tools, never through powershell Get-Content/Set-Content/Get-ChildItem/Select-String. "
+            "Use bash for file access only when a path legitimately falls outside the workspace "
+            "(after the dedicated tool returns PATH_OUTSIDE_WORKSPACE), or for binary/archive operations."
         )
     )
 

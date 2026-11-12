@@ -11,6 +11,7 @@ pub(super) fn task_spec() -> ToolSpec {
     ToolSpec {
         name: RESERVED_TASK.into(),
         obs: None,
+        deferred: None,
         description: "Delegate a self-contained subtask to a sub-agent (fresh session, same tools). \
 Returns only the final answer. Use for heavy research/exploration/summarization to keep this context clean."
             .into(),

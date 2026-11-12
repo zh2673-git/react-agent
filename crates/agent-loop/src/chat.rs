@@ -247,6 +247,64 @@ impl AgentLoopPlugin {
             }
         };
         let out = self.chat_run(env, &req).await;
+        // G 轮：回合交接（回填 + 终结）。
+        //
+        // 为什么放在包装层而不是 chat_run 内部：`chat_run` 有 20 个 return 出口
+        // （取消 / 预算硬停 / context 溢出 / LLM 失败 / 空答案 / 轮次耗尽…），
+        // 逐口补终结既容易漏，也会让每个出口都变长。这里只有一个出入口，
+        // 且 `chat_run` 已经把暂停写进了 turn 文件——包装层**读文件**即得真相，
+        // 不必让两个函数共享可变状态。
+        let mut out = out;
+        // 本轮事件已由 chat_run 全部写完，现在读到的 `next` 就是本轮终点。
+        // 失败按 0 → 退化为 `start_cursor`（补播会少给，但不会给错）。
+        let trace_next = self
+            .call(env, CAP_MEMORY, json!({"op": "trace.read", "session_id": req.session_id, "after": 0}), MEM_DEADLINE)
+            .await
+            .ok()
+            .and_then(|v| v.get("next").and_then(Value::as_u64));
+        let turn_meta = (|| {
+            let store = turn::TurnStore::open()?;
+            // chat_run 里建的 turn 是**最新一条非终结态**；按 started_at 倒序取第一条即可
+            // （同一会话有并发闸，不会有第二条 running）。
+            let turn_id = out
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    store
+                        .list_session(&req.session_id)
+                        .into_iter()
+                        .find(|t| !turn::is_terminal(t.get("status").and_then(Value::as_str).unwrap_or("")))
+                        .and_then(|t| t.get("turn_id").and_then(Value::as_str).map(str::to_string))
+                })?;
+            let mut turn = store.load(&turn_id)?;
+            let paused = out.get("paused").and_then(Value::as_bool) == Some(true)
+                || turn.get("status").and_then(Value::as_str) == Some("paused");
+            if !paused {
+                let ok = out.get("ok").and_then(Value::as_bool) == Some(true);
+                let end_cursor = trace_next
+                    .unwrap_or_else(|| turn.get("end_cursor").and_then(Value::as_u64).unwrap_or(0));
+                turn::mark_terminal(&mut turn, if ok { "done" } else { "failed" }, end_cursor);
+                store.save(&turn);
+            }
+            Some(turn)
+        })();
+        if out.is_object() {
+            match turn_meta {
+                Some(t) => {
+                    out["turn_id"] = t.get("turn_id").cloned().unwrap_or(Value::Null);
+                    out["turn_status"] = t.get("status").cloned().unwrap_or(Value::Null);
+                    out["start_cursor"] = t.get("start_cursor").cloned().unwrap_or(Value::Null);
+                    out["end_cursor"] = t.get("end_cursor").cloned().unwrap_or(Value::Null);
+                    if let Some(p) = t.get("pending").cloned().filter(|p| !p.is_null()) {
+                        out["pending"] = p;
+                    }
+                }
+                // 回合持久化不可用（无写权限/无目录）：**不加字段**。加 null 会让前端
+                // 以为「这轮没有 id」，而真相是「这套部署不支持补播」——两者处置不同。
+                None => {}
+            }
+        }
         self.cancels.lock().unwrap().remove(&req.session_id);
         // 空间卫生（A4）：会话级瞬态表逐出，防长驻进程无界增长。
         // turn_starts：fresh_artifact 仅回合内消费，chat 结束即失效可清；
@@ -271,6 +329,45 @@ impl AgentLoopPlugin {
             .lock()
             .unwrap()
             .insert(req.session_id.clone(), std::time::SystemTime::now());
+        // G 轮：回合对象。一次 chat 不再只是「一次阻塞调用」——它有一条可寻址的记录
+        // （`.rsi/turns/<turn_id>.json`），带 trace 游标区间。补播只读这一轮，
+        // 暂停则由本记录承接用户回答（三条边界见 turn.rs 模块注释）。
+        //
+        // `start_cursor` 取 `trace.read(after=0)` 的 `next`（= 已有事件条数）。
+        // 拿不到就按 0：补播会多给一些旧事件但不会漏——错在多给一侧用户能自己扫过去，
+        // 错在少给一侧就是静默丢内容。
+        let turn_store = turn::TurnStore::open();
+        let start_cursor = match self
+            .call(env, CAP_MEMORY, json!({"op": "trace.read", "session_id": req.session_id, "after": 0}), MEM_DEADLINE)
+            .await
+        {
+            Ok(v) => v.get("next").and_then(Value::as_u64).unwrap_or(0),
+            Err(_) => 0,
+        };
+        // 复用还是新建：给了 turn_id 且归属同会话才复用（防跨会话串回合）；
+        // 否则新建。归属校验不是洁癖——turn_id 来自前端，不校验就能读到别人的回合。
+        let mut turn = match req
+            .turn_id
+            .as_deref()
+            .filter(|id| turn::valid_turn_id(id))
+            .and_then(|id| turn_store.as_ref()?.load(id))
+        {
+            Some(t) if t.get("session_id").and_then(Value::as_str) == Some(req.session_id.as_str()) => t,
+            _ => turn::new_turn(&turn::new_turn_id(&req.session_id), &req.session_id, start_cursor),
+        };
+        // 暂停中的回答：先把 turn 从 paused 接回 running（拿到 tool_call_id），再跑。
+        // 接不回（状态不是 paused）= 确定性 K409——静默放行会让「回复了却没接上」
+        // 表现为「模型又开始重新规划」，那种最难查。
+        if let Some(rep) = req.tool_reply.as_ref() {
+            if turn::apply_reply(&mut turn, &rep.answer).is_none() {
+                return json!({"ok": false, "error": {"code": "K409",
+                    "message": format!("该回合当前状态为 '{}'，不接受回复（只有 paused 可接）",
+                        turn.get("status").and_then(Value::as_str).unwrap_or("?"))}});
+            }
+        }
+        if let Some(s) = turn_store.as_ref() {
+            s.save(&turn);
+        }
         // 用户消息先入记忆（持久化），随后拉取全量历史。
         // R3：文本附件拼入 content，图片附件走结构化字段（llm-adapter 按 provider 映射）。
         let user_msg = build_user_msg(&req.user_text, req.attachments.as_deref(), cfg.text_attach_limit);
@@ -313,6 +410,44 @@ impl AgentLoopPlugin {
                 return json!({"ok": false, "error": {"code": e.code(), "message": format!("memory.get failed: {e}")}});
             }
         }
+        // G 轮：暂停回答注入。用户答的那句话作为一条 user 消息进工作集——模型看到的是
+        // 「我问了、用户答了」，而不是一个孤立的 tool 结果（后者会让它重新规划、
+        // 把已有进度丢掉）。这就是「暂停而不是结束」与「结束再开新回合」的区别所在。
+        //
+        // 用 `req.tool_reply` 的存在与否判定，而不是看 turn 状态：turn 已在
+        // chat_body 里被接回 running（apply_reply 把它改了），这里判状态就永远为假。
+        if let Some(rep) = req.tool_reply.as_ref() {
+            let pending_q = turn::TurnStore::open()
+                .and_then(|s| req.turn_id.as_deref().and_then(|id| s.load(id)))
+                .and_then(|t| {
+                    t.get("pending")
+                        .and_then(|p| p.get("question"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let msg = MemoryMsg {
+                role: "user".into(),
+                content: Some(format!(
+                    "[用户回答（回合 {} 暂停中提问）]\n问题: {}\n回答: {}",
+                    req.turn_id.as_deref().unwrap_or(""),
+                    pending_q,
+                    rep.answer
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+                attachments: None,
+            };
+            // 两处都要写，缺一不可：
+            // ① memory（持久层）——否则下一轮历史缺这段；
+            // ② `messages`（本轮工作集）——第 ① 步只影响**下一次** perceive，
+            //    本轮模型根本看不到它。原实现只做了 ①，端到端用例实测
+            //    「回答消失」，模型于是重新规划。
+            if !self.observe(env, &req.session_id, &[msg.clone()]).await {
+                tracing::warn!(target: ID, session = %req.session_id, "暂停回答落库失败，本轮继续但历史会缺这段");
+            }
+            messages.push(msg);
+        }
 
         // 工具清单（每请求一次；失败视为无工具可用，模型直接作答）+ 保留名 task 声明
         let mut tools: Vec<ToolSpec> = match self.call(env, CAP_TOOLS, json!({"op": "list"}), tools_deadline()).await {
@@ -347,6 +482,48 @@ impl AgentLoopPlugin {
             }
             tools.extend(self.session_skill_tools(env, &loaded_skills).await);
         }
+
+        // G 轮：按需装载（deferred）分流。工具 schema 随**每一轮**请求重发，MCP 接一台
+        // server 就是十几件工具的完整 JSON Schema，而单轮真正用得上的通常只有 1-2 件。
+        // 此处把 deferred 工具挡在下发清单之外（`visible`），只留一行名字摘要进系统提示词；
+        // 模型调 load_tools 报名后，该工具的完整 schema 自下一轮起进入 `visible`。
+        //
+        // 为什么在技能工具装配**之后**做：`visible` 要一次建全，否则已加载技能的工具
+        // 会漏出清单（「装了却看不见」是本仓库踩过的老坑）。
+        // 为什么只挡 MCP：技能工具通常 1-3 件且刚 load_skill 就期待可见；MCP 才是
+        // 「多而少用」的形态。默认策略在 tools guest 侧声明（见 tools_plugin.py）。
+        let deferred_names: Vec<String> = tools
+            .iter()
+            .filter(|t| t.deferred == Some(true))
+            .map(|t| t.name.clone())
+            .collect();
+        let mut visible: Vec<ToolSpec> = tools
+            .iter()
+            .filter(|t| t.deferred != Some(true))
+            .cloned()
+            .collect();
+        if !deferred_names.is_empty() {
+            let spec = tools_defer::load_tools_spec();
+            tools.push(spec.clone());
+            visible.push(spec);
+            // 系统提示词在上面已经 format! 完，故此处追加而不重排构造顺序——改动面最小，
+            // 且摘要天然落在提示词末尾（紧邻工具区，模型的注意力位置更合理）。
+            let line = tools_defer::deferred_line(&deferred_names);
+            if let Some(sys) = messages.first_mut().and_then(|m| m.content.as_mut()) {
+                sys.push_str(&line);
+            }
+        }
+        // G 轮：ask_user 保留工具随清单下发（模型才看得见可调）。
+        //
+        // 门控 = 回合持久化可用：拿不到 turns 目录时暂停无处落盘，给了这个工具就是
+        // 给一个承诺不了的承诺（模型暂停后用户回复会被丢弃，且没有任何报错）。
+        if turn::TurnStore::open().is_some() {
+            let spec = turn::ask_user_spec();
+            tools.push(spec.clone());
+            visible.push(spec);
+        }
+        // G 轮：本轮是否命中 ask_user（问题文本 + 那条调用的 id）。None = 正常跑。
+        let mut paused_by_ask: Option<(String, String)> = None;
 
         let mut steps: Vec<StepRecord> = Vec::new();
         let mut rounds: u32 = 0;
@@ -411,7 +588,9 @@ impl AgentLoopPlugin {
             };
             // 收敛轮必须剥掉工具：手里还有工具，模型一定继续探索——预算就形同虚设。
             // 剥掉后它只剩「说话」这一个动作，被迫交出已完成/未完成。
-            let round_tools: Option<&[ToolSpec]> = if wrap_up.is_some() { None } else { Some(&tools[..]) };
+            // G 轮按需装载：下发 `visible`（deferred 工具不在其中）。若模型上一轮
+            // 调过 load_tools，清单已在本轮开头按报名并回 `visible`（见下方 loaded 并集）。
+            let round_tools: Option<&[ToolSpec]> = if wrap_up.is_some() { None } else { Some(&visible[..]) };
             let resp = match self
                 .plan_with_retry(env, &req.session_id, &mut messages, round_tools, stream, &cfg, &mut retries)
                 .await
@@ -579,11 +758,13 @@ impl AgentLoopPlugin {
                 if let Some(v) = self.check_cancel(env, &req.session_id).await {
                     return v;
                 }
-                let execs = group
-                    .iter()
-                    .map(|tc| self.act_exec(env, &req.session_id, req.depth, tc, budget_snap));
+                let execs = group.iter().map(|tc| {
+                    self.act_exec(env, &req.session_id, req.depth, tc, budget_snap, &deferred_names)
+                });
                 let done = futures::future::join_all(execs).await;
                 let mut newly: HashSet<String> = HashSet::new();
+                // G 轮：本波次里模型通过 load_tools 报名的工具名（自下一轮起下发 schema）
+                let mut newly_visible: Vec<String> = Vec::new();
                 for (tc, (result, ms)) in group.iter().zip(done) {
                     // R9/R9b：load_skill 或 skill_install 成功 → 已启用工具并入后续轮次清单
                     //（skill_loaded 事件已在 act_exec 内发出；HashSet 去重防重复并入）
@@ -595,6 +776,28 @@ impl AgentLoopPlugin {
                         {
                             if loaded_skills.insert(name.to_string()) {
                                 newly.insert(name.to_string());
+                            }
+                        }
+                    }
+                    // G 轮：ask_user 成功 → 记下问题与调用 id，波次末统一收敛为 paused。
+                    // 只记第一条：模型一轮里问两个问题是设计外的（第二个问题会随
+                    // 回合挂起丢失），记第一条至少保住一个。
+                    if paused_by_ask.is_none() && result.get("paused") == Some(&json!(true)) {
+                        if let Some(q) = result.get("question").and_then(Value::as_str) {
+                            let cid = result
+                                .get("tool_call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or(tc.id.as_str())
+                                .to_string();
+                            paused_by_ask = Some((q.to_string(), cid));
+                        }
+                    }
+                    // G 轮：load_tools 报名成功 → 这些名字的完整 schema 自下一轮起下发。
+                    // 与技能工具那条并集互不干扰（技能工具走 loaded_skills，这里走 visible）。
+                    if tc.name == RESERVED_LOAD_TOOLS && result.get("ok") == Some(&json!(true)) {
+                        if let Some(names) = result.get("loaded").and_then(Value::as_array) {
+                            for n in names.iter().filter_map(Value::as_str) {
+                                newly_visible.push(n.to_string());
                             }
                         }
                     }
@@ -621,8 +824,61 @@ impl AgentLoopPlugin {
                         attachments: None,
                     });
                 }
+                // G 轮：ask_user 命中 → 本回合**暂停**而不是结束。
+                //
+                // 判定放在波次末：同波次里可能还有别的工具在跑（并行），必须等它们
+                // 都收尾、结果都落库，回合才能安全挂起——否则那些结果会随回合收敛丢失。
+                // 收敛方式：写 `paused` + 问题与 tool_call_id 到 turn 文件，然后把
+                // assistant 的「问题」作为本回合最终答复返回（前端据此渲染提问卡）。
+                // **不进下一轮 LLM**：那会花一次钱再让模型自己说「我在等回答」。
+                if let Some((q, call_id)) = paused_by_ask.as_ref() {
+                    let end_cursor = self
+                        .call(env, CAP_MEMORY, json!({"op": "trace.read", "session_id": req.session_id, "after": 0}), MEM_DEADLINE)
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("next").and_then(Value::as_u64))
+                        .unwrap_or(start_cursor);
+                    if turn::mark_paused(&mut turn, q, call_id, end_cursor) {
+                        if let Some(s) = turn_store.as_ref() {
+                            s.save(&turn);
+                        }
+                        self.trace(
+                            env,
+                            &req.session_id,
+                            json!({"type": "turn_paused", "turn_id": turn.get("turn_id"), "question": q, "tool_call_id": call_id}),
+                        )
+                        .await;
+                        // 暂停不是失败：ok=true + paused=true，答案位放问题本身
+                        // （前端可直接渲染成提问卡，不必再拼一句「我在等你说」）。
+                        let mut out = json!({
+                            "ok": true,
+                            "answer": q,
+                            "paused": true,
+                            "turn_id": turn.get("turn_id"),
+                            "pending": turn.get("pending"),
+                            "rounds": rounds,
+                            "steps": steps,
+                            "session_id": req.session_id,
+                        });
+                        out["turn_status"] = json!("paused");
+                        out["end_cursor"] = json!(end_cursor);
+                        return out;
+                    }
+                }
                 if !newly.is_empty() {
-                    tools.extend(self.session_skill_tools(env, &newly).await);
+                    // 技能工具并集：tools 与 visible 同步（否则「装了却看不见」）
+                    let extra = self.session_skill_tools(env, &newly).await;
+                    tools.extend(extra.clone());
+                    visible.extend(extra);
+                }
+                // G 轮：load_tools 报名过的工具并入 visible（已在下发集里则跳过，防同名双份）
+                for n in newly_visible {
+                    if visible.iter().any(|t| t.name == n) {
+                        continue;
+                    }
+                    if let Some(spec) = tools.iter().find(|t| t.name == n).cloned() {
+                        visible.push(spec);
+                    }
                 }
             }
             // LOOP-P2/A2：每轮工具/观察结果必须落持久层，否则下一轮 perceive 的历史缺这段；

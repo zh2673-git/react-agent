@@ -52,8 +52,12 @@ impl AgentLoopPlugin {
         let mut sum_msgs: Vec<MemoryMsg> = vec![MemoryMsg {
             role: "system".into(),
             content: Some(
-                "Summarize the conversation history for an AI agent. Capture: the user's goal, decisions made, \
-facts learned, files/actions taken, and pending work. Be concise (<= 300 words). Output only the summary."
+                "Summarize the conversation history for an AI agent. Put a section titled '## PENDING (must do next)' \
+FIRST, listing: unfinished work, options already rejected (and why), and the single next action. Only then cover \
+the user's goal, verified facts (with file:line when known), files/actions taken, and decisions still in force. \
+Never drop a pending item even if it appeared early in the history, and never drop the reason a path was abandoned \
+(a re-derived wrong turn is worse than a longer summary). Omit pleasantries and restatement; length follows \
+necessity, not a fixed word cap. Output only the summary."
                     .into(),
             ),
             tool_calls: None,

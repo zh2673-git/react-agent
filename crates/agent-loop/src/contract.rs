@@ -31,6 +31,18 @@ pub struct ToolSpec {
     /// 取值（name/description/parameters），本字段对 LLM 线路不可见。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obs: Option<ToolObs>,
+    /// 按需装载（G 轮）：`Some(true)` = 该工具**不进下发的工具清单**，只在系统提示词里
+    /// 留一行名字摘要；模型调保留工具 `load_tools` 报过名之后才随清单下发。
+    ///
+    /// 为什么要有这个字段：工具 schema 随**每一轮**请求重发。MCP 每接一台 server 就是
+    /// 十几件工具的完整 JSON Schema，而单轮真正用得上的通常只有 1-2 件——其余是纯
+    /// token 税，且长会话里这笔开销与任务难度无关。
+    ///
+    /// 判据边界：只影响**下发**，不影响**调用**。模型凭记忆直接调一个 deferred 工具
+    /// 照样成功（tools.call 不看该标记）——「猜中即可用」，不惩罚直觉。
+    /// 缺省（未声明）→ 照常下发，既有工具行为零变化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<bool>,
 }
 
 /// R16 观测面声明（胸牌 schema）：声明工具结果中可被结构化观测的三类产物。
@@ -124,10 +136,29 @@ pub struct ChatReq {
     /// R3 用户附件（可选）：host 已做形状/条数/体量校验，此处仅透传。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<Attachment>>,
+    /// G 轮：回合寻址键（可选）。给了就复用该 turn（暂停后回复走这里），
+    /// 没给就新开一条。缺省 None 向后兼容所有既有调用方。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// G 轮：对 `ask_user` 暂停的回答。给了它就按 `tool_call_id` 接回同一回合，
+    /// 不重新装配工作集（这正是「暂停而不是结束」的收益）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_reply: Option<ToolReply>,
 }
 
 fn default_session() -> String {
     "default".into()
+}
+
+/// G 轮：对 `ask_user` 暂停的回答。
+///
+/// 为什么要 `tool_call_id` 而不是只给文本：回复必须作为**那一条 tool_call 的结果**
+/// 接回去，否则模型看到的是「一个没有对应调用的孤立 tool 消息」——严格函数调用协议
+/// 下直接报错，宽松协议下模型会重新规划、把已有进度丢掉。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolReply {
+    pub tool_call_id: String,
+    pub answer: String,
 }
 
 // ---- llm-adapter -----------------------------------------------------------

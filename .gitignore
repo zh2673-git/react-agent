@@ -28,3 +28,5 @@ plugins/tools/*
 !plugins/tools/tools/
 !plugins/tools/PLAN.md
 !plugins/tools/README.md
+# 测试运行产生的派生工作区（board/profile/turns 等，跑 cargo test 会在 crate 目录下生成）
+.rsi/

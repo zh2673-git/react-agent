@@ -116,6 +116,7 @@ pub(super) fn effective_result_limit(tool: &str, cfg: &AgentLoopConfig) -> usize
     }
     let mult = match tool {
         "read_file" => 4,                       // 2000 行级文件尽量一次读全
+        "web_read" => 4,                        // 网页正文一次读全；实测 50% 的网页结果被 1× 腰斩
         "grep" | "symbols_search" => 3,         // 命中块 / 引用清单不被腰斩
         _ => 1,
     };
@@ -148,9 +149,27 @@ impl AgentLoopPlugin {
         depth: u32,
         tc: &ToolCall,
         budget_snap: Option<(Option<u64>, Option<u64>)>,
+        deferred: &[String],
     ) -> (Value, u64) {
         let started = Instant::now();
-        let result = if tc.name == RESERVED_TASK {
+        let result = if tc.name == RESERVED_ASK_USER {
+            // G 轮：向用户提问并暂停回合。此处只**校验并回显**问题文本——真正的
+            // 暂停由 chat 侧在波次末判定（act_exec 单条工具不知道本轮还有没有别
+            // 的调用要跑，也不该知道：暂停是回合级决策，不是工具级副作用）。
+            // 返回 `paused: true` 作为 chat 侧的信号位。
+            let q = tc.arguments.get("question").and_then(Value::as_str).unwrap_or("").trim();
+            if q.is_empty() {
+                json!({"ok": false, "error": {"code": "K400", "field": "question",
+                    "message": "ask_user 需非空参数 {\"question\": str}（要问用户的问题）"}})
+            } else {
+                json!({"ok": true, "paused": true, "question": q, "tool_call_id": tc.id})
+            }
+        } else if tc.name == RESERVED_LOAD_TOOLS {
+            // G 轮：按需装载报名。结果只回名字——schema 下一轮随工具清单下发，回喂一遍
+            // 等于同一条信息花两遍 token（且 tool_result 另有 8000 字符回喂上限，大
+            // schema 会被腰斩成残缺 JSON，比不回更糟）。
+            tools_defer::load_tools_result(tc, deferred)
+        } else if tc.name == RESERVED_TASK {
             // 子代理委派（Phase 3-3）：全新会话复用 agent.chat 全链路，仅回传最终答案
             let task_text = tc.arguments.get("task").and_then(Value::as_str).unwrap_or("");
             if task_text.trim().is_empty() {

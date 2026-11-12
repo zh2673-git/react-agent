@@ -35,6 +35,8 @@ mod contract;
 mod secrets;
 mod skills;
 mod subagent;
+mod tools_defer; // G 轮：按需装载工具（deferred：schema 不进清单，load_tools 报名后下发）
+mod turn;        // G 轮：回合对象（turn_id + trace 游标区间 + paused 暂停态 + 补播视图）
 mod tools_exec;
 mod trace;
 
@@ -73,6 +75,14 @@ pub const RESERVED_TASK: &str = "task";
 /// （preset 装载即启用并视同已加载；用户技能进池待界面确认），trace `skill_installed`
 /// 事件供前端内联卡与一键启用。不下发 tools。
 pub const RESERVED_SKILL_INSTALL: &str = "skill_install";
+
+/// 保留工具名：按需装载报名（G 轮）——`ToolSpec.deferred` 的工具不进下发清单，
+/// 模型调本工具报过名之后，完整 schema 自下一轮起下发（见 tools_defer.rs）。不下发 tools。
+pub const RESERVED_LOAD_TOOLS: &str = "load_tools";
+
+/// 保留工具名：向用户提问并**暂停回合**（G 轮）——与「把问题写进最终答复然后结束」
+/// 的区别是回合不结束：用户回答后按 tool_call_id 接回同一条 tool 结果，工作集不重建。
+pub const RESERVED_ASK_USER: &str = "ask_user";
 
 /// RSI 策略钩子（Phase 1 接缝，**默认关闭**）：由 rsi-agent 的配置显式开启。
 /// - `contract_first`：非平凡任务的第一个工具调用前要求先写验收清单（可落 todo）；
@@ -359,6 +369,61 @@ impl Plugin for AgentLoopPlugin {
                     Ok(json!({"ok": true, "session_id": sid, "note": "取消信号已置位；当前轮完成后中断"}))
                 }
             }
+            // G 轮：回合补播。
+            //
+            // 为什么做成 op 而不是 host 路由：host 在核心禁写区（改它要走补丁且牵动
+            // 前端契约），而**补播本质是「读 turn 文件 + 算游标」**——纯读、无副作用，
+            // 放在插件里就是一行 dispatch；等前端真要接时再在 host 加薄路由即可。
+            // 返回游标区间而**不是事件本体**：事件由调用方经 `trace.read(after=…)`
+            // 分页拉（既有能力），于是补播不引入第二个事件通道，也就不可能与 trace 不一致。
+            "turn/replay" => {
+                let sid = env.payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+                let tid = env.payload.get("turn_id").and_then(Value::as_str).unwrap_or("");
+                let after = env.payload.get("after_seq").and_then(Value::as_u64).unwrap_or(0);
+                let Some(store) = turn::TurnStore::open() else {
+                    return Ok(json!({"ok": false, "error": {"code": "K500",
+                        "message": "回合目录不可用（RSI_TURNS_DIR / RSI_HOME / WORKSPACE_ROOT 均未解析出）"}}));
+                };
+                // turn_id 给了就精确定位；没给取该会话最近一条未终结的（前端刷新后
+                // 通常只知道 session_id，这是补播最常见的入口）。
+                let found = if tid.is_empty() {
+                    store.list_session(sid).into_iter().find(|t| {
+                        !turn::is_terminal(t.get("status").and_then(Value::as_str).unwrap_or(""))
+                    })
+                } else {
+                    store.load(tid)
+                };
+                match found {
+                    Some(t) if sid.is_empty() || t.get("session_id").and_then(Value::as_str) == Some(sid) => {
+                        Ok(turn::replay_view(&t, after))
+                    }
+                    Some(_) => Ok(json!({"ok": false, "error": {"code": "K403",
+                        "message": "该回合不属于此会话"}})),
+                    None => Ok(json!({"ok": false, "error": {"code": "K404",
+                        "message": "找不到可补播的回合（可能已收敛且超出保留上限）"}})),
+                }
+            }
+            // G 轮：列出一段会话的回合（前端「历史回合」列表与排障用）。
+            "turn/list" => {
+                let sid = env.payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+                let Some(store) = turn::TurnStore::open() else {
+                    return Ok(json!({"ok": false, "error": {"code": "K500", "message": "回合目录不可用"}}));
+                };
+                let items: Vec<Value> = store
+                    .list_session(sid)
+                    .into_iter()
+                    .map(|t| json!({
+                        "turn_id": t.get("turn_id"),
+                        "status": t.get("status"),
+                        "started_at": t.get("started_at"),
+                        "ended_at": t.get("ended_at"),
+                        "start_cursor": t.get("start_cursor"),
+                        "end_cursor": t.get("end_cursor"),
+                        "has_pending": t.get("pending").map(|p| !p.is_null()).unwrap_or(false),
+                    }))
+                    .collect();
+                Ok(json!({"ok": true, "session_id": sid, "count": items.len(), "turns": items}))
+            }
             other => Ok(json!({"ok": false, "error": {"code": "K400", "message": format!("unknown op: {other}")}})),
         }
     }
@@ -546,6 +611,29 @@ mod tests {
         assert!(!path_within(r"C:\ws2\skills", r"C:\ws"));
         // 完全无关
         assert!(!path_within(r"D:\other\skills", r"C:\ws"));
+    }
+
+    #[test]
+    fn effective_result_limit_scales_by_tool() {
+        // X2 回归锚：web_read 实测 50% 的网页结果曾落在 1× 被腰斩 → 现与 read_file 同档 4×
+        use crate::config::AgentLoopConfig;
+        use crate::tools_exec::effective_result_limit;
+        let saved = std::env::var("TOOL_RESULT_LIMIT").ok();
+        std::env::set_var("TOOL_RESULT_LIMIT", "8000");
+        let cfg = AgentLoopConfig::from_env(10);
+        assert_eq!(effective_result_limit("read_file", &cfg), 32_000);
+        assert_eq!(effective_result_limit("web_read", &cfg), 32_000);
+        assert_eq!(effective_result_limit("grep", &cfg), 24_000);
+        assert_eq!(effective_result_limit("symbols_search", &cfg), 24_000);
+        assert_eq!(effective_result_limit("bash", &cfg), 8_000);
+        // 0 = 禁用语义不变
+        std::env::set_var("TOOL_RESULT_LIMIT", "0");
+        let off = AgentLoopConfig::from_env(10);
+        assert_eq!(effective_result_limit("web_read", &off), 0);
+        match saved {
+            Some(v) => std::env::set_var("TOOL_RESULT_LIMIT", v),
+            None => std::env::remove_var("TOOL_RESULT_LIMIT"),
+        }
     }
 
     #[test]
