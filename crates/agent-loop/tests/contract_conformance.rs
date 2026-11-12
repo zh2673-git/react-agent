@@ -92,6 +92,9 @@ async fn scripted_chat_fulfills_all_wire_contracts() {
     let stream_dir = std::env::temp_dir().join("agent-loop-contract-stream");
     std::fs::create_dir_all(&stream_dir).unwrap();
     std::env::set_var("AGENT_STREAM_DIR", &stream_dir);
+    // 回合目录同样隔离：turns_root() 在三个 env 全空时回落 cwd，会把账写进仓库。
+    let turns_dir = std::env::temp_dir().join(format!("agent-loop-contract-turns-{}", std::process::id()));
+    std::env::set_var("RSI_TURNS_DIR", &turns_dir);
 
     let ops_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let trace_events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
@@ -331,6 +334,9 @@ async fn metadata_declared_tools_register_without_legacy_names() {
     let stream_dir = std::env::temp_dir().join("agent-loop-contract-stream");
     std::fs::create_dir_all(&stream_dir).unwrap();
     std::env::set_var("AGENT_STREAM_DIR", &stream_dir);
+    // 回合目录同样隔离：turns_root() 在三个 env 全空时回落 cwd，会把账写进仓库。
+    let turns_dir = std::env::temp_dir().join(format!("agent-loop-contract-turns-{}", std::process::id()));
+    std::env::set_var("RSI_TURNS_DIR", &turns_dir);
 
     let trace_events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
     let store: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));

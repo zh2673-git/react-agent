@@ -39,6 +39,7 @@ async fn compaction_triggers_summarize_and_loop_continues() {
     let ws_dir = std::env::temp_dir().join(format!("react-agent-cmp-ws-{}-{}", std::process::id(), nanos()));
     std::fs::create_dir_all(&ws_dir).expect("create workspace");
 
+    isolate_turns_dir();
     let kernel = fresh_kernel();
 
     // 1. memory（TS guest）—— memory.session + session.trace（事件日志）

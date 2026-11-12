@@ -125,3 +125,29 @@ pub fn expect_ok<'a>(v: &'a Value, label: &str) -> &'a Value {
     assert_eq!(v.get("ok"), Some(&serde_json::json!(true)), "{label}: {v}");
     v
 }
+
+/// 回合目录隔离（进程级幂等，调一次即可）。
+///
+/// 为什么必须做：agent-loop 的 `turns_root()` 在 `RSI_TURNS_DIR` / `RSI_HOME` /
+/// `WORKSPACE_ROOT` **全未设置**时回落到 `cwd/.rsi/turns`，而测试进程的 cwd 就是
+/// crate 目录——跑一次 `cargo test` 就往仓库里长几十个回合账，还被 .gitignore
+/// 掩盖成「看不见的脏」。这里把落点钉到临时目录，进程退出即弃。
+///
+/// 用 OnceLock 而不是每个用例各设一次：env 是进程全局的，多线程并行时各自设不同
+/// 目录会互相踩；全进程共用一个临时目录既无竞态，也不影响用例语义（用例之间本
+/// 就按 session_id 隔离）。
+pub fn isolate_turns_dir() {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!(
+            "react-agent-turns-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::env::set_var("RSI_TURNS_DIR", &d);
+        d
+    });
+}

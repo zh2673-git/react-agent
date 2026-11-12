@@ -40,6 +40,7 @@ async fn system_md_overrides_prompt_and_preset_skills_register() {
     // agent-loop（InProcess）从测试进程 env 读 WORKSPACE_ROOT → SYSTEM.md 生效
     std::env::set_var("WORKSPACE_ROOT", &ws_dir);
 
+    isolate_turns_dir();
     let kernel = fresh_kernel();
     let script = json!([
         {"ok": true, "content": "收敛", "tool_calls": [], "model": "mock", "finish_reason": "stop"},

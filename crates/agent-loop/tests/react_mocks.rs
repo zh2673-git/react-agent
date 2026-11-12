@@ -164,6 +164,9 @@ fn mock_llm_capturing(script: Vec<Value>, captured: Arc<Mutex<Vec<Vec<Value>>>>)
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 async fn boot(plugins: Vec<PluginInstance>) -> Arc<Kernel> {
+    // 每个用例都经 boot 起内核：回合目录在这里统一隔离一次即可（进程级幂等）。
+    // 否则 turns_root() 三档 env 全空时回落 cwd，cargo test 会往 crate 目录写账。
+    isolate_turns_dir();
     let kernel = Kernel::new(GlobalConfig { node_id: "test".into(), max_total_inflight: 32 });
     for p in plugins {
         kernel.register(p).await;
@@ -687,6 +690,32 @@ async fn concurrent_top_level_chats_both_can_delegate() {
 ///
 /// 本守卫只修「我这两条用例」的卫生：不依赖任何 env，且把可能被上游污染的
 /// 上下文/预算变量在入口处归零、在 Drop 里还原（含 panic 展开路径）。
+/// 回合目录隔离（进程级幂等，调一次即可）。
+///
+/// 为什么必须做：agent-loop 的 `turns_root()` 在 `RSI_TURNS_DIR` / `RSI_HOME` /
+/// `WORKSPACE_ROOT` **全未设置**时回落到 `cwd/.rsi/turns`，而测试进程的 cwd 就是
+/// crate 目录——跑一次 `cargo test` 就往仓库里长几十个回合账，还被 .gitignore
+/// 掩盖成「看不见的脏」。这里把落点钉到临时目录，进程退出即弃。
+///
+/// 用 OnceLock 而不是每个用例各设一次：env 是进程全局的，多线程并行时各自设不同
+/// 目录会互相踩；全进程共用一个临时目录既无竞态，也不影响用例语义（用例之间本
+/// 就按 session_id 隔离）。
+pub fn isolate_turns_dir() {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!(
+            "react-agent-turns-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::env::set_var("RSI_TURNS_DIR", &d);
+        d
+    });
+}
+
 struct EnvGuard(Vec<(&'static str, Option<String>)>);
 
 impl EnvGuard {

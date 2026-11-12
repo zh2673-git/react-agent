@@ -36,6 +36,7 @@ async fn task_delegates_to_subagent_and_denies_nesting() {
     let ws_dir = std::env::temp_dir().join(format!("react-agent-sub-ws-{}-{}", std::process::id(), nanos()));
     std::fs::create_dir_all(&ws_dir).expect("create workspace");
 
+    isolate_turns_dir();
     let kernel = fresh_kernel();
 
     let mem = spawn_node_ts(

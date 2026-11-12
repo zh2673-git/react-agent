@@ -37,6 +37,7 @@ async fn web_gateway_serves_chat_and_sse_replay() {
     let ws_dir = std::env::temp_dir().join(format!("react-agent-gw-ws-{}-{}", std::process::id(), nanos()));
     std::fs::create_dir_all(&ws_dir).expect("create workspace");
 
+    isolate_turns_dir();
     let kernel = fresh_kernel();
 
     let mem = spawn_node_ts(
@@ -151,6 +152,7 @@ async fn web_config_center_and_skills_crud() {
         std::env::remove_var(k);
     }
 
+    isolate_turns_dir();
     let kernel = fresh_kernel();
     let llm = spawn_python(
         py,
