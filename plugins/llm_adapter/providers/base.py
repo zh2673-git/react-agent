@@ -194,6 +194,38 @@ def norm(content, calls, model, finish_reason, reasoning=None, usage=None, elaps
     return out
 
 
+def require_inputs(payload: dict) -> list:
+    """embed 入参校验：input 必须是非空字符串数组（或单字符串）。
+
+    单独成函数而不是散在 provider 里：4 个 provider pack 共用同一套字段级错误，
+    错误码与文案才能一致（K400 = 请求侧确定性失败，重试无意义）。
+    """
+    raw = payload.get("input")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("embed 需要 input：非空字符串数组")
+    if not all(isinstance(x, str) for x in raw):
+        raise ValueError("embed 的 input 每项必须是字符串")
+    return raw
+
+
+def norm_embed(vectors, model, dim=None, usage=None) -> dict:
+    """归一化 embed 响应。
+
+    形状与 norm() 同风格（ok 打头、可选字段「有才写」）；vectors 一定是二维数组，
+    dim 由首条长度推出（provider 不报维度时也不猜错）。
+    """
+    if dim is None and vectors:
+        dim = len(vectors[0])
+    out = {"ok": True, "vectors": vectors, "model": model}
+    if dim is not None:
+        out["dim"] = dim
+    if usage:
+        out["usage"] = usage
+    return out
+
+
 def map_usage(u: dict | None) -> dict:
     """OpenAI 兼容 usage → 互斥不相交计数（与 deepseek-harness 的 mapUsage 同约定）。
 

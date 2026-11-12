@@ -1419,10 +1419,12 @@ async fn num_ctx_passthrough_follows_context_window() {
         captured.lock().unwrap().last().unwrap()
     );
 
-    // 窗口 4096 → num_ctx=4096
-    std::env::set_var("LLM_CONTEXT_TOKENS", "4096");
+    // 窗口 8192 → num_ctx=8192。取值须 > 系统提示自身估算/0.7（约 4620），
+    // 否则 tighten_for_context 在发请求前就以 CONTEXT_OVERFLOW 拦下本轮，
+    // 断言会误读到上一轮的 payload（与本用例要验的透传无关）。
+    std::env::set_var("LLM_CONTEXT_TOKENS", "8192");
     let _ = chat(&kernel, "q2").await;
-    assert_eq!(captured.lock().unwrap().last().unwrap()["num_ctx"], json!(4096));
+    assert_eq!(captured.lock().unwrap().last().unwrap()["num_ctx"], json!(8192));
 
     // 窗口 0（禁用）→ 不携带
     std::env::set_var("LLM_CONTEXT_TOKENS", "0");

@@ -311,6 +311,62 @@ def chat(payload: dict) -> dict:
     return _chat_with(resolve_openai(), payload, "openai")
 
 
+def embed(payload: dict) -> dict:
+    """OpenAI 兼容 /embeddings。走独立端点，不碰 chat 的 _build_body（形状不同）。"""
+    require_httpx()
+    import httpx
+
+    from .base import norm_embed, require_inputs
+
+    inputs = require_inputs(payload)
+    ep = resolve_embed()
+    body = {"model": payload.get("model") or ep["model"], "input": inputs}
+    # 逃生舱：EMBEDDING_EXTRA_BODY（JSON）整体合并——部分网关要 dimensions/encoding_format
+    extra = os.environ.get("EMBEDDING_EXTRA_BODY", "").strip()
+    if extra:
+        try:
+            body.update(json.loads(extra))
+        except ValueError:
+            print(f"[llm_adapter] EMBEDDING_EXTRA_BODY 不是合法 JSON，已忽略: {extra[:100]}", flush=True)
+    url = f"{ep['base_url']}/embeddings"
+    try:
+        resp = httpx.post(url, headers=ep["headers"], json=body, timeout=60.0)
+    except Exception as exc:  # noqa: BLE001
+        return err(f"embedding 请求失败: {type(exc).__name__}: {exc}")
+    if resp.status_code >= 400:
+        return err_from_resp("openai", resp.status_code, resp.text)
+    try:
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        return err(f"embedding 响应非法 JSON: {exc}")
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return err("embedding 响应缺少 data 数组")
+    # 按 index 排序：OpenAI 规范保证返回顺序，但网关实现未必，排序是零成本的稳健化
+    items = sorted(
+        [it for it in items if isinstance(it, dict) and isinstance(it.get("embedding"), list)],
+        key=lambda it: it.get("index", 0),
+    )
+    if not items:
+        return err("embedding 响应 data 为空")
+    return norm_embed(
+        [it["embedding"] for it in items],
+        data.get("model") or body["model"],
+        usage=data.get("usage") if isinstance(data.get("usage"), dict) else None,
+    )
+
+
+def resolve_embed() -> dict:
+    """embedding 端点解析：EMBEDDING_* 优先，缺省回落 LLM_*（同网关同密钥时零配置可用）。"""
+    base = os.environ.get("EMBEDDING_BASE_URL") or os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
+    key = os.environ.get("EMBEDDING_KEY") or os.environ.get("OPENAI_API_KEY", "")
+    return {
+        "base_url": base.rstrip("/"),
+        "model": os.environ.get("EMBEDDING_MODEL") or "text-embedding-3-small",
+        "headers": {"Authorization": f"Bearer {key}"} if key else {},
+    }
+
+
 def models(payload: dict) -> dict:
     require_httpx()
     import httpx
@@ -332,4 +388,10 @@ def models(payload: dict) -> dict:
     return {"ok": True, "models": ids}
 
 
-PROVIDER = {"name": "openai", "chat": chat, "models": models, "requires_env": ["OPENAI_API_KEY"]}
+PROVIDER = {
+    "name": "openai",
+    "chat": chat,
+    "models": models,
+    "embed": embed,
+    "requires_env": ["OPENAI_API_KEY"],
+}

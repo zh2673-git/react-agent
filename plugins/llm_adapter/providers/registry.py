@@ -23,6 +23,13 @@ def _validate(name: str, spec) -> None:
         raise TypeError(f"provider '{name}': chat 必须可调用")
     if len(inspect.signature(spec["chat"]).parameters) != 1:
         raise TypeError(f"provider '{name}': chat 签名必须为 chat(payload) -> dict")
+    # embed 是**可选**能力：不支持的 pack 缺这个键是合法的，不报错。
+    # 但一旦声明，签名必须与 chat 一致（payload -> dict），否则分派层会在运行期炸。
+    if "embed" in spec:
+        if not callable(spec["embed"]):
+            raise TypeError(f"provider '{name}': embed 必须可调用")
+        if len(inspect.signature(spec["embed"]).parameters) != 1:
+            raise TypeError(f"provider '{name}': embed 签名必须为 embed(payload) -> dict")
     if spec["name"] in PROVIDERS:
         raise TypeError(f"provider 重名: {spec['name']}")
 

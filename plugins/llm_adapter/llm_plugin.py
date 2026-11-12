@@ -60,6 +60,8 @@ class LlmAdapterPlugin:
             from presets import list_presets
 
             return list_presets(payload)
+        if op == "embed":
+            return self._embed(payload)
         if op == "upstream.status":
             return self._upstream_status()
         if op != "chat":
@@ -117,6 +119,25 @@ class LlmAdapterPlugin:
             os.environ[key_env] = api_key
             applied["api_key_set"] = True  # 明文绝不回显
         return {"ok": True, "applied": applied}
+
+    def _embed(self, payload: dict) -> dict:
+        """embedding 分派。provider pack 未实现 embed 时给字段级错误，不抛异常。
+
+        与 chat 不同：embedding 无流式、无 abort——它是短请求，中断没有意义。
+        """
+        name = payload.get("provider") or os.environ.get("LLM_PROVIDER", "mock")
+        provider = resolve(name)
+        if provider is None:
+            return _err(f"unknown provider: {name}（可用: {', '.join(sorted_providers())}）", code="K400")
+        fn = provider.get("embed")
+        if fn is None:
+            return _err(f"provider {name} 不支持 embed（该 pack 未实现）", code="K400")
+        try:
+            return fn(payload)
+        except ValueError as exc:
+            return _err(str(exc), code="K400")
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"{type(exc).__name__}: {exc}")
 
     def _models_list(self, payload: dict) -> dict:
         name = payload.get("provider") or os.environ.get("LLM_PROVIDER", "mock")
