@@ -102,7 +102,9 @@ impl AgentLoopConfig {
             text_attach_limit: env_num("TEXT_ATTACH_LIMIT", crate::DEFAULT_TEXT_ATTACH_CHARS, "文本附件内嵌上限"),
             budget: secs_opt(env_num("CHAT_BUDGET_SECS", 900.0f64, "chat 墙钟预算秒")),
             token_budget: num_opt(env_num("CHAT_TOKEN_BUDGET", 0u64, "chat token 预算")),
-            retry_attempts: env_num("LLM_RETRY_ATTEMPTS", 2u32, "瞬态重试次数").min(6),
+            // provider(openai_compat) 已有网关换号重试层；agent-loop 整轮重试默认降到 1，
+            // 避免 3x5=15 次上游重试叠加把 CPU/风扇打满。LLM_RETRY_ATTEMPTS 可覆盖。
+            retry_attempts: env_num("LLM_RETRY_ATTEMPTS", 1u32, "瞬态重试次数").min(6),
             retry_base_ms: env_num("LLM_RETRY_BASE_MS", 500u64, "重试退避基数毫秒"),
             context_window,
             stream_dir: std::env::var_os("AGENT_STREAM_DIR")

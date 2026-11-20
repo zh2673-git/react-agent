@@ -67,7 +67,8 @@ fn agent_config_view() -> Value {
         "tool_result_limit": env_num("TOOL_RESULT_LIMIT", 8000),
         "budget_secs": env_num("CHAT_BUDGET_SECS", 300),
         "token_budget": env_num("CHAT_TOKEN_BUDGET", 0),
-        "retry_attempts": env_num("LLM_RETRY_ATTEMPTS", 2),
+        // 与 agent-loop 默认一致（retry_attempts=1）。
+        "retry_attempts": env_num("LLM_RETRY_ATTEMPTS", 1),
         "retry_base_ms": env_num("LLM_RETRY_BASE_MS", 500),
         "llm_context_tokens": env_num("LLM_CONTEXT_TOKENS", 0),
     })
