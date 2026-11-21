@@ -179,6 +179,33 @@ fn media_config_view(cfg: &Value) -> Value {
     })
 }
 
+/// external_channels 段回显视图：对每个通道段里的敏感字段
+/// （client_secret/token/key/api_key/password）只回 key_set + key_tail，绝不回明文；
+/// 非敏感字段原样回显。这是通用外部通道扩展点：宿主不绑定任何具体 IM 平台，
+/// 通道段与字段名都由消费方定义。
+fn external_channels_view(cfg: &Value) -> Value {
+    let mut channels = cfg.get("external_channels")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    const SECRET_FIELDS: &[&str] = &["client_secret", "token", "key", "api_key", "password"];
+    for section in channels.values_mut() {
+        let Some(obj) = section.as_object_mut() else { continue; };
+        for k in SECRET_FIELDS {
+            if let Some(v) = obj.get(*k).and_then(Value::as_str) {
+                let redacted = if v.is_empty() {
+                    json!({"key_set": false})
+                } else {
+                    let tail: String = v.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+                    json!({"key_set": true, "key_tail": tail})
+                };
+                obj.insert((*k).to_string(), redacted);
+            }
+        }
+    }
+    json!(channels)
+}
+
 /// GET /api/config：llm 视图（config.json > env 缺省；key 只回 key_set + 尾 4 位，绝不回明文）
 /// + tools 全集视图（list all=true，含未启用项，各项附 enabled）+ skills 计数。
 pub(crate) async fn get_config(stream: &mut TcpStream, kernel: &Kernel) -> anyhow::Result<()> {
@@ -339,6 +366,7 @@ pub(crate) async fn get_config(stream: &mut TcpStream, kernel: &Kernel) -> anyho
                 "skills_count": skills_count,
                 "agent": agent_config_view(),
                 "media": media_config_view(&cfg),
+                "external_channels": external_channels_view(&cfg),
                 "instance_name": std::env::var("REACT_INSTANCE_NAME").unwrap_or_default(),
             },
         }),
@@ -358,14 +386,17 @@ pub(crate) async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[
     let tools = req.get("tools").filter(|v| v.is_object());
     let agent = req.get("agent").filter(|v| v.is_object());
     let media = req.get("media").filter(|v| v.is_object());
+    // external_channels：通用外部通道配置段（IM 网关等消费方使用），只落盘不热应用。
+    // 字段由消费方定义；host 只对已知基础类型做轻校验，避免无效持久化。
+    let external_channels = req.get("external_channels").filter(|v| v.is_object());
     // §八 MCP：仅持久通道（server 子进程生命周期归 tools 插件 init/destroy，无热通道）。
     // PUT 落盘 config.json mcp_servers，改后需重启 host 生效。
     let mcp_servers = req.get("mcp_servers").filter(|v| v.is_object());
-    if llm.is_none() && tools.is_none() && agent.is_none() && mcp_servers.is_none() && media.is_none() {
+    if llm.is_none() && tools.is_none() && agent.is_none() && mcp_servers.is_none() && media.is_none() && external_channels.is_none() {
         return json_resp(
             stream,
             400,
-            bad_request("body 需含 llm / tools / agent / mcp_servers / media 对象", None),
+            bad_request("body 需含 llm / tools / agent / mcp_servers / media / external_channels 对象", None),
         )
         .await;
     }
@@ -454,6 +485,46 @@ pub(crate) async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[
         }
         cfg["media"] = cur;
     }
+    // external_channels merge：通用段只落盘；只接受已知基础类型字段，空串/null 不覆盖既有值，
+    // 未知字段保持兼容（原样写入），由消费方自行解释。只回写不生效，消费方下次读取时生效。
+    if let Some(external) = external_channels.and_then(|e| e.as_object().cloned()) {
+        for (section, spec) in external {
+            let Some(spec_obj) = spec.as_object() else { continue; };
+            let mut cur = cfg.get("external_channels")
+                .and_then(|v| v.get(&section))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            for (k, v) in spec_obj {
+                let bad = match v {
+                    Value::Null => false,
+                    Value::String(_) | Value::Bool(_) | Value::Number(_) => false,
+                    _ => true,
+                };
+                if bad {
+                    return json_resp(
+                        stream,
+                        400,
+                        json!({"ok": false, "error": {"code": "K400", "message": format!("external_channels.{} 只接受 string/bool/number/null", k)}}),
+                    )
+                    .await;
+                }
+            }
+            if let Some(cur_obj) = cur.as_object_mut() {
+                for (k, v) in spec_obj {
+                    let empty = v.as_str().map(str::is_empty).unwrap_or(false);
+                    if !v.is_null() && !empty {
+                        cur_obj.insert(k.clone(), v.clone());
+                    }
+                }
+            } else {
+                cur = json!(spec_obj);
+            }
+            if !cfg.get("external_channels").map(|v| v.is_object()).unwrap_or(false) {
+                cfg["external_channels"] = json!({});
+            }
+            cfg["external_channels"][&section] = cur;
+        }
+    }
     // §八 MCP merge：按 server 名合并声明（command/cwd 未传则保留原值；env 逐键合并，
     // 前端提交空串环境变量值 = 保持已有 key 不动）。只落盘，重启由持久通道生效。
     if let Some(mcp) = mcp_servers.and_then(|m| m.as_object().cloned()) {
@@ -511,6 +582,55 @@ pub(crate) async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_channels_view_redacts_secrets_only() {
+        let cfg = serde_json::json!({
+            "external_channels": {"im": {
+                "enabled": true,
+                "host_base": "http://127.0.0.1:8710",
+                "client_id": "app-id",
+                "client_secret": "super-secret-1234",
+                "token": "tk",
+                "api_key": "ak",
+                "password": "pw",
+                "custom_field": "plain-value"
+            }}
+        });
+        let view = external_channels_view(&cfg);
+        let im = view.get("im").unwrap();
+        assert_eq!(im["enabled"], true);
+        assert_eq!(im["client_id"], "app-id");
+        assert_eq!(im["custom_field"], "plain-value");
+        let sec = im["client_secret"].as_object().unwrap();
+        assert_eq!(sec["key_set"], true);
+        assert_eq!(sec["key_tail"], "1234");
+        assert!(sec.get("super-secret-1234").is_none());
+        assert_eq!(im["token"].as_object().unwrap()["key_tail"], "tk");
+        assert_eq!(im["api_key"].as_object().unwrap()["key_tail"], "ak");
+        assert_eq!(im["password"].as_object().unwrap()["key_tail"], "pw");
+    }
+
+    #[test]
+    fn external_channels_view_redacts_all_sections() {
+        let cfg = serde_json::json!({
+            "external_channels": {
+                "im": {"token": "sec-im-token"},
+                "webhook": {"api_key": "sec-hook-key", "url": "https://example.test/h"}
+            }
+        });
+        let view = external_channels_view(&cfg);
+        assert_eq!(view["im"]["token"]["key_tail"], "oken");
+        assert_eq!(view["webhook"]["api_key"]["key_tail"], "-key");
+        assert_eq!(view["webhook"]["url"], "https://example.test/h");
+    }
+
+    #[test]
+    fn external_channels_view_missing_is_empty() {
+        let cfg = serde_json::json!({"llm": {}});
+        let view = external_channels_view(&cfg);
+        assert!(view.as_object().unwrap().is_empty());
+    }
 
     #[test]
     fn agent_config_applies_to_env_and_validates_numbers() {

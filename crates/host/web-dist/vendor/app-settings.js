@@ -5,7 +5,7 @@ $("gear").onclick = () => { drawer.classList.add("open"); loadConfig(); loadSkil
 $("dclose").onclick = () => drawer.classList.remove("open");
 document.querySelectorAll("#drawer .tabs button").forEach((b) => b.onclick = () => {
   document.querySelectorAll("#drawer .tabs button").forEach((x) => x.classList.toggle("on", x === b));
-  for (const t of ["llm", "tools", "skills", "agent"]) $("tab-" + t).hidden = t !== b.dataset.tab;
+  for (const t of ["llm", "tools", "skills", "agent", "channels"]) $("tab-" + t).hidden = t !== b.dataset.tab;
 });
 
 function flash(id, ok, msg) {
@@ -58,6 +58,9 @@ async function loadConfig() {
     $("media-vid-query").value = mv.query_url ?? "";
     // W19 站点默认参数回显（对象 → JSON 串）
     $("media-vid-extra").value = mv.extra && typeof mv.extra === "object" ? JSON.stringify(mv.extra) : "";
+    // 外部通道通用扩展点：整段回显为 JSON（敏感字段已是掩码），留空 = 未配置
+    const chEl = $("channels-json");
+    if (chEl) chEl.value = Object.keys(c.external_channels ?? {}).length ? JSON.stringify(c.external_channels, null, 2) : "";
     // 组头状态徽章（pcnt 位）：配置一眼可见
     $("llm-cnt").textContent = c.llm.model || c.llm.provider || "未配置";
     $("media-img-cnt").textContent = mi.base_url ? "已配置" : "未配置";
@@ -623,3 +626,24 @@ async function reveal(target, name, flashId) {
   } catch (e) { flash(flashId, false, e.message); }
 }
 $("llm-reveal").onclick = () => reveal("config", null, "llm-flash");
+
+// ── 外部通道通用扩展点：整段 JSON → PUT external_channels（后端只接受 string/bool/number，敏感字段留空/掩码对象不改）──
+$("channels-save").onclick = async () => {
+  const raw = $("channels-json").value.trim();
+  if (!raw) { flash("channels-flash", false, "内容为空，未保存"); return; }
+  let ext;
+  try { ext = JSON.parse(raw); } catch (e) { flash("channels-flash", false, "JSON 解析失败: " + e.message); return; }
+  if (!ext || typeof ext !== "object" || Array.isArray(ext)) { flash("channels-flash", false, "必须是 JSON 对象"); return; }
+  // 敏感字段回显为 {key_set,key_tail} 掩码对象：这类值表示"未改动"，从提交中剔除（留空=不修改）
+  const isMask = (v) => v && typeof v === "object" && !Array.isArray(v) && Object.prototype.hasOwnProperty.call(v, "key_set");
+  for (const sec of Object.values(ext)) {
+    if (!sec || typeof sec !== "object" || Array.isArray(sec)) continue;
+    for (const k of Object.keys(sec)) if (isMask(sec[k])) delete sec[k];
+  }
+  if (!Object.keys(ext).length) { flash("channels-flash", true, "无改动，已跳过保存"); loadConfig(); return; }
+  try {
+    await api("PUT", "/api/config", { external_channels: ext });
+    flash("channels-flash", true, "已保存（消费方下次读取生效）");
+    loadConfig();
+  } catch (e) { flash("channels-flash", false, e.message); }
+};

@@ -46,6 +46,7 @@
     <button data-tab="tools">工具</button>
     <button data-tab="skills">技能</button>
     <button data-tab="agent">Agent</button>
+    <button data-tab="channels">外部通道</button>
   </div>
   <div class="body">
     <div id="tab-llm">
@@ -130,6 +131,12 @@
       <div class="field"><label>system_prompt（自定义系统提示词，留空 = 用内置组装链）</label><textarea id="agent-system-prompt" style="min-height:110px" spellcheck="false"></textarea></div>
       <div class="row"><button class="btn" id="agent-save">保存</button><span class="flash" id="agent-flash"></span></div>
       <p class="hint">PROMPT 具名模板仍由 REPL /prompt 管理；预算耗尽以 K508 收敛（时长/token 分开提示），子代理继承衰减后的剩余预算；上下文超限以 CONTEXT_OVERFLOW 收敛（发送前逐级收紧 → 仍超限即失败，provider 终审超限则降级重试一次）。</p>
+    </div>
+    <div id="tab-channels" hidden>
+      <p class="hint">通用外部通道配置（如 IM 网关等消费方）。JSON 对象形式，每个键为一个通道段；值仅接受字符串/布尔/数字。敏感字段（client_secret/token/key/api_key/password）回显为掩码，留空字符串或 null 表示不修改已有值。保存后由消费方下次读取生效。</p>
+      <div class="field"><label>external_channels（JSON 对象）</label><textarea id="channels-json" style="min-height:220px" spellcheck="false" placeholder='{"im":{"enabled":true,"host_base":"http://127.0.0.1:8710"}}'></textarea></div>
+      <div class="row"><button class="btn" id="channels-save">保存</button><span class="flash" id="channels-flash"></span></div>
+      <p class="hint">这是宿主通用扩展点，不绑定具体平台；具体字段名由消费方（网关）定义。</p>
     </div>
   </div>
 </aside>
