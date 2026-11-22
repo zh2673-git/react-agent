@@ -33,6 +33,85 @@ def _strip_tags(s: str) -> str:
     return _WS_RE.sub(" ", html_mod.unescape(_TAG_RE.sub("", s))).strip()
 
 
+# ---- 搜索质量增强（零付费依赖；模型/第三方库存在才启用，否则启发式降级） ------------
+
+# 查询发散：把口语化/多意图 query 拆成多个检索子查询。纯字符串切分，不调用 LLM。
+_SPLIT_RE = re.compile(r"\s*(?:[,，;；、]|\s+(?:和|与|以及|vs|versus|or|OR)\s+|\s*\?\s*|\s+)\s*")
+_STOP = {"的", "了", "吗", "呢", "啊", "the", "a", "an", "of", "to", "and", "or", "in", "on", "for"}
+
+
+def _query_variants(query: str) -> list[str]:
+    """返回 [原始 query, 子查询...]；只在明显多意图时发散，避免无谓多检索。"""
+    parts = [p.strip() for p in _SPLIT_RE.split(query) if p.strip()]
+    parts = [p for p in parts if len(p) >= 3 and p.lower() not in _STOP]
+    # 有效片段 <2 不发散；过短片段直接丢弃而非连坐整组
+    if len(parts) < 2:
+        return [query]
+    out = [query]
+    for p in parts[:4]:  # 最多 4 个子查询，控制出网成本
+        if p != query and p not in out:
+            out.append(p)
+    return out
+
+
+def _token_hits(query: str, text: str) -> float:
+    """query 词在文本中的覆盖率（0~1），作为无模型时的相关性代理。"""
+    toks = [t for t in re.findall(r"[\w\u4e00-\u9fff]{2,}", query.lower()) if t not in _STOP]
+    if not toks:
+        return 0.0
+    hay = text.lower()
+    return sum(1.0 for t in toks if t in hay) / len(toks)
+
+
+def _dedup_results(results: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    out = []
+    for r in results:
+        key = (r.get("url") or "").split("#", 1)[0].rstrip("/")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+def _cross_encoder_rank(query: str, results: list[dict]) -> list[dict] | None:
+    """若 flashrank 且模型已缓存则做真重排；否则返回 None 走启发式。绝不联网下载。"""
+    if not results:
+        return None
+    try:
+        from pathlib import Path
+        # flashrank 默认缓存目录 /tmp/<model>；存在才初始化，避免触发下载
+        cache = Path(__import__("tempfile").gettempdir()) / "ms-marco-TinyBERT-L-2-v2"
+        if not cache.exists():
+            return None
+        from flashrank import Ranker, RerankRequest  # type: ignore
+        ranker = Ranker(log_level="ERROR")
+        passages = [{"id": i, "text": (r.get("title", "") + " " + r.get("snippet", ""))} for i, r in enumerate(results)]
+        ranked = ranker.rerank(RerankRequest(query=query, passages=passages))
+        by_id = {i: results[i] for i in range(len(results))}
+        return [by_id[int(x["id"])] for x in ranked if int(x["id"]) in by_id]
+    except Exception:  # noqa: BLE001 - 重排是增强项，失败绝不阻断搜索
+        return None
+
+
+def _heuristic_rank(query: str, results: list[dict]) -> list[dict]:
+    """按 query 词覆盖率打分，标题权重高于摘要；稳定排序保原引擎序作为 tiebreak。"""
+    scored = []
+    for i, r in enumerate(results):
+        title_hit = _token_hits(query, r.get("title", ""))
+        snip_hit = _token_hits(query, r.get("snippet", ""))
+        score = title_hit * 0.65 + snip_hit * 0.35
+        scored.append((score, i, r))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [r for _s, _i, r in scored]
+
+
+def _rerank(query: str, results: list[dict]) -> list[dict]:
+    results = _dedup_results(results)
+    return _cross_encoder_rank(query, results) or _heuristic_rank(query, results)
+
+
 def _throttle(engine: str) -> None:
     now = time.monotonic()
     wait = _COOLDOWN_S - (now - _last_call.get(engine, 0.0))
@@ -209,9 +288,8 @@ def _backend_chain() -> list[str]:
     return chain
 
 
-def _web_search(args: dict) -> dict:
-    query = require(args, "query")
-    max_results = optional_int(args, "max_results", 5, 1, 10)
+def _search_once(query: str, max_results: int) -> tuple[list[dict], str, list[str]]:
+    """对单个 query 跑引擎故障转移链，返回 (results, engine, tried)。"""
     chain = _backend_chain()
     tried = []
     for engine in chain:
@@ -223,15 +301,43 @@ def _web_search(args: dict) -> dict:
             _throttle(engine)
             results = fn(query, max_results)
             if results:
-                return {"query": query, "engine": engine, "region": _region(), "results": results}
+                return results, engine, tried
             tried.append(f"{engine}: 0 条结果")
         except Exception as exc:  # noqa: BLE001 - 单引擎失败降级下一引擎
             tried.append(f"{engine}: {type(exc).__name__}: {exc}")
-    hint = (
-        "所有搜索引擎都失败了。可选：1) 检查网络连通性；2) 设置 SEARCH_BACKEND 指定单一引擎调试；"
-        "3) 配置免费额度后端（BAIDU_API_KEY 每日 100 次 / TAVILY_API_KEY 每月 1000 次）或付费 BOCHA_API_KEY。"
-    )
-    raise ToolError("搜索引擎链全部失败。已试: " + " | ".join(tried) + "。" + hint, code="SEARCH_ALL_ENGINES_FAILED")
+    return [], "", tried
+
+
+def _web_search(args: dict) -> dict:
+    query = require(args, "query")
+    max_results = optional_int(args, "max_results", 5, 1, 10)
+    all_results: list[dict] = []
+    engines: list[str] = []
+    all_tried: list[str] = []
+    for q in _query_variants(query):
+        results, engine, tried = _search_once(q, max_results)
+        all_tried.extend(tried)
+        if results:
+            all_results.extend(results)
+            if engine and engine not in engines:
+                engines.append(engine)
+    if not all_results:
+        hint = (
+            "所有搜索引擎都失败了。可选：1) 检查网络连通性；2) 设置 SEARCH_BACKEND 指定单一引擎调试；"
+            "3) 配置免费额度后端（BAIDU_API_KEY 每日 100 次 / TAVILY_API_KEY 每月 1000 次）或付费 BOCHA_API_KEY。"
+        )
+        raise ToolError("搜索引擎链全部失败。已试: " + " | ".join(all_tried) + "。" + hint, code="SEARCH_ALL_ENGINES_FAILED")
+    deduped = _dedup_results(all_results)
+    ce = _cross_encoder_rank(query, deduped)
+    ranked = (ce if ce is not None else _heuristic_rank(query, deduped))[:max_results]
+    return {
+        "query": query,
+        "variants": _query_variants(query),
+        "engine": "+".join(engines),
+        "region": _region(),
+        "ranked_by": "cross_encoder" if ce is not None else "heuristic",
+        "results": ranked,
+    }
 
 
 # ---- web_read：Jina 区域镜像优先，失败回退本地直抓（含 URL 缓存 + 字符分页，v3） ----
@@ -281,11 +387,31 @@ def _jina_read(url: str) -> str:
     return text
 
 
+_BOILER_SELECTORS = "script,style,noscript,nav,header,footer,aside,form,iframe,.nav,.menu,.sidebar,.header,.footer,.advert,.ad,.cookie-banner"
+
+
 def _direct_read(url: str) -> str:
     status, body = _http_get(url, timeout=_TIMEOUT)
     page = body.decode("utf-8", errors="replace")
-    page = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", page)
-    text = _strip_tags(page)
+    # trafilatura（装了才用）：正文抽取质量最高
+    try:
+        import trafilatura  # type: ignore
+        text = trafilatura.extract(page, include_comments=False, include_tables=False) or ""
+        if len(text.strip()) >= 32:
+            return text
+    except Exception:  # noqa: BLE001 - 未安装/失败则降级 bs4
+        pass
+    # bs4 结构化清洗：优先 <article>/<main>，删 boilerplate 节点
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+        soup = BeautifulSoup(page, "html.parser")
+        for tag in soup.select(_BOILER_SELECTORS):
+            tag.decompose()
+        root = soup.find("article") or soup.find("main") or soup.body or soup
+        text = _WS_RE.sub(" ", root.get_text(" ")).strip()
+    except Exception:  # noqa: BLE001 - 无 bs4 时退回原正则去标签
+        page = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", page)
+        text = _strip_tags(page)
     if len(text.strip()) < 32:
         raise RuntimeError("正文过短（可能是动态渲染页或非 HTML）")
     return text
