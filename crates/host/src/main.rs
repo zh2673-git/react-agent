@@ -26,6 +26,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // rsi-agent 内嵌布局（runtime/kernel + 上级 skills/config.json）：裸 `cargo run` 时
+    // 自动补齐 AGENT_KERNEL_REPO / SKILLS_DIR / CONFIG_FILE / WORKSPACE_ROOT 等锚点，
+    // 与 run.cmd 等价（显式 env 最优先）。非内嵌布局（react-agent 快照）不触发。
+    if config::apply_rsi_layout_defaults() {
+        tracing::info!("检测到 rsi-agent 内嵌布局，已锚定运行环境（仓库根: {}）", config::workspace_root());
+    }
+
     // config.json（08 §2.2 持久通道）：启动时应用为 env，spawn 下发复用既有机制
     let applied = config::apply_config_file_to_env();
     if applied > 0 {

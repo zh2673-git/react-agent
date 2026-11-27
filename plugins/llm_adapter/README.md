@@ -23,7 +23,9 @@
 → {"ok":true,"content":str|null,"tool_calls":[{"id","name","arguments":object}],
    "model":str,"finish_reason":str,
    // 追加可选字段：缺省即 provider 未提供，旧消费者无感知
-   "reasoning"?:str, "usage"?:{...}, "elapsed_ms"?:int}
+   "reasoning"?:str, "usage"?:{...}, "elapsed_ms"?:int, "http_attempts"?:int}
+// http_attempts：本次请求实际发出的 HTTP 尝试次数（provider 内部重试已计入）；
+//   仅 openai_compat（唯一带重试循环）上报，其余缺省不写 = 未上报（指标落 null，非 0）。
 → {"ok":false,"error":{"code","message"}}
 //   HTTP ≥ 400 经 err_from_resp 归一化（base.py）：响应体命中「上下文超限」特征
 //   （ollama exceed_context_size_error / OpenAI context_length_exceeded / Anthropic prompt is too long）
@@ -53,14 +55,26 @@
 
 // models.list
 {"op":"models.list","provider"?} → {"ok":true,"models":[str],"models_meta"?}
-// models_meta 为可选扩展（ollama 独有）：[{"name","ctx_limit"?}]，ctx_limit 来自 native
-// /api/show 的 <family>.context_length（模型原生上下文窗口），取不到省略键；其他 provider 不带。
+// models_meta 为可选扩展，与 models 同序、按需带键：[{"name","platform"?,"display_name"?,"ctx_limit"?,"route"?}]
+//  - platform：模型所属平台。openai 兼容端点取 /v1/models 每项的 owned_by（聚合成网关时即来源平台，
+//    如 trae-cn / qoder / opencode-zen），缺省退化为 id 前缀；前端「按平台分组折叠」只靠它，零硬编码。
+//  - ctx_limit：原生上下文窗口（ollama 取 /api/show 的 <family>.context_length；openai 兼容端取
+//    context_length / context_window），取不到省略键。
+//  - display_name：人类可读名（openai 兼容端的 display_name），与 id 相同则省略。
+//  - route：值为 "auto" 时表示网关路由组模型（auto/<slug>）：UI 单列一个「auto（路由组）」栏，
+//    不与平台组混列——owned_by 只表示它默认落到的平台，不是分组归属。
+// 无任何可补充字段的 provider（mock / anthropic 静态清单）整个键省略，前端按「无 meta」降级。
 
 // presets.list（站点预设清单，L6）
 {"op":"presets.list"} → {"ok":true,"presets":[{"id","name","base_url","key_url"}]}
 // OpenAI 兼容站点预设（ModelScope / 硅基流动 / OpenRouter 等），数据源 presets.py（纯数据，
 // 非 provider pack）。前端「站点」下拉一键切换 = 选站填 base_url + per-site key（localStorage
 // 记忆）→ 保存走 configure 热应用，零重启。增改站点 = 改 presets.py 数据。
+
+// provider.capabilities（P5 能力声明，只读）
+{"op":"provider.capabilities","provider"?} → {"ok":true,"provider":str,"capabilities":{能力名:bool}}
+// 返回该 pack 声明的 capabilities（缺失回空 dict = 未知）；仅供 UI/选路读取，运行期分派仍看
+// chat/embed 是否可调用。能力键：stream / tools / images / embed / models（ollama 另有 num_ctx）。
 ```
 
 ## 新增一个 provider（标准步骤）
@@ -68,11 +82,19 @@
 1. 新建 `providers/<name>.py`，暴露模块级常量：
 
    ```python
-   PROVIDER = {"name": "<name>", "chat": chat, "models": models, "requires_env": [...]}
+   PROVIDER = {
+       "name": "<name>", "chat": chat, "models": models,
+       "requires_env": [...],
+       # 可选：声明式能力表（{能力名: bool}），缺失 = 未知
+       "capabilities": {"stream": True, "tools": True, "images": False, "embed": False, "models": True},
+   }
    ```
 
    - `chat(payload) -> dict` 签名**必须只有一个参数**（`registry._validate` 会校验）。
    - 异常直接抛出，由分派层兜底成 `{"ok":false,...}`。
+   - `capabilities`（可选）：`{能力名: bool}` 扁平 dict（值必须 bool，`registry._validate` 校验）；
+     缺失 = 能力未知。仅供 UI/选路读，运行期分派仍看 chat/embed 可调用性。键：
+     `stream` / `tools` / `images` / `embed` / `models`（ollama 另有 `num_ctx`）。
 2. 缺 env 在 `chat` 内自行报错（`requires_env` 只是文档）。
 3. `registry` 在导入期自动发现——**不需要改 `llm_plugin.py`**。
 4. 若引入新的环境变量，同步更新：
@@ -94,6 +116,19 @@ provider 优先级：**请求 `payload["provider"]` > 环境变量 `LLM_PROVIDER
 
 ollama 另有传输通道开关 `OLLAMA_ENDPOINT`：`native`（缺省，走原生 `/api/chat`，
 支持 per-request `options.num_ctx` 与 NDJSON 流式）| `v1`（回退 OpenAI 兼容层 `/v1`）。
+## provider 能力（capabilities）
+
+各 pack 在 `PROVIDER["capabilities"]` 声明能力表（可选，缺失 = 未知）：
+
+| provider | stream | tools | images | embed | models | 额外 |
+|---|---|---|---|---|---|---|
+| openai | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| anthropic | ✗ | ✓ | ✓ | ✗ | ✓ | 单次 POST 无流式 |
+| ollama | ✓ | ✓ | ✓ | ✗ | ✓ | `num_ctx`（原生窗口） |
+| mock | ✓ | ✓ | ✗ | ✓ | ✓ | |
+
+`registry._validate` 校验形状（dict，值为 bool）；`provider.capabilities` op 可只读查询。
+声明只服务 UI / 选路，不改变运行期分派（仍看 chat / embed 是否可调用）。
 
 ## 流式旁路
 

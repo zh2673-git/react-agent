@@ -71,8 +71,11 @@ fn providers() -> Vec<PluginInstance> {
         MockPlugin::simple("memory", &["memory.session"], |env| {
             match env.payload.get("op").and_then(Value::as_str) {
                 Some("get") => json!({"ok": true, "messages": []}),
-                Some("append") | Some("summarize") | Some("trace.append") | Some("trace.read") => {
-                    json!({"ok": true, "messages": [], "events": []})
+                // P1：trace.meta / session.skills 是只读汇总接口，返回形状与其余 session op
+                // 同构（ok + 空集合）——本用例只验「出生证明」，不放行即 K400 假失败。
+                Some("append") | Some("summarize") | Some("trace.append") | Some("trace.read")
+                | Some("trace.meta") | Some("session.skills") => {
+                    json!({"ok": true, "messages": [], "events": [], "skills": [], "end_cursor": 0})
                 }
                 _ => json!({"ok": false, "error": {"code": "K400", "message": "bad op"}}),
             }

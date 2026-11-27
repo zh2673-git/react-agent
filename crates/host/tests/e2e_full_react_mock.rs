@@ -34,14 +34,7 @@ async fn full_react_loop_with_mock_llm_and_real_guests() {
 
     isolate_turns_dir();
     let kernel = fresh_kernel();
-        // hermetic: host machines may set WORKSPACE_ROOT/CONFIG_FILE/SKILLS_DIR as user-level
-    // env (rsi distribution injects them); the InProcess agent-loop reads the test process
-    // env, so explicitly clear them to restore the original precondition. Removal only -
-    // benign race if sibling tests in this binary set them concurrently.
-    for k in ["WORKSPACE_ROOT", "CONFIG_FILE", "SKILLS_DIR"] {
-        std::env::remove_var(k);
-    }
-let ws_env = [("WORKSPACE_ROOT", ws_dir.to_string_lossy().into_owned())];
+    let ws_env = [("WORKSPACE_ROOT", ws_dir.to_string_lossy().into_owned())];
 
     // 1. memory（TS）
     let mem = spawn_node_ts(

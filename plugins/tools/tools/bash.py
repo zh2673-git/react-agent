@@ -96,43 +96,85 @@ def _excluded_roots() -> list[str]:
     return out
 
 
-def _in_snapshot_zone(rel: str, excluded: list[str]) -> bool:
-    """rel（'/' 分隔相对路径）是否属于快照区。"""
-    real = os.path.normcase(os.path.join(str(workspace_root()), rel.replace("/", os.sep)))
+def _in_snapshot_zone(path: str, excluded: list[str]) -> bool:
+    """`path` 是否属于快照区（= 未被 excluded 覆盖）。可传相对路径或绝对路径。
+
+    绝对路径调用时不再重解析工作区根：`workspace_root()` 每次调用都做
+    `Path.resolve()`（实测 ~0.14ms），逐文件调用 23496 次即 ~3.4s——这是 bash
+    执行前后两次遍历的主要成本之一（见 `_scan_zone`）。
+    """
+    if not os.path.isabs(path):
+        path = os.path.join(str(workspace_root()), path.replace("/", os.sep))
+    real = os.path.normcase(path)
     return not any(real == e or real.startswith(e + os.sep) for e in excluded)
 
 
 def _scan_zone(with_content: bool = True) -> tuple[dict[str, tuple[int, int]], dict[str, bytes] | None]:
-    """遍历快照区：返回 (stat 清单 rel->(mtime_ns,size), 内容缓存或 None=超限/未请求)。"""
+    """遍历快照区：返回 (stat 清单 rel->(mtime_ns,size), 内容缓存或 None=超限/未请求)。
+
+    P6 性能：`os.walk` + 逐文件 `_in_snapshot_zone()` 改为 `os.scandir` 显式栈 +
+    **遍历期剪枝**。三处成本被消掉（本机实测 23496 个快照区内文件）：
+      · 排除目录（outputs / .stream / memory data / 噪音目录）在**下钻前**剪掉，
+        不再走进去再逐文件丢弃（原实现白扫约 21500 个文件）；
+      · `workspace_root()` 由「每文件一次」提到「每次扫描一次」（Path.resolve 有
+        syscall）；
+      · 目录项类型取 scandir 的 DirEntry（Windows 来自 FindFirstFile，零额外 syscall）。
+    实测 with_content 11.0s→0.50s、stat-only 11.3s→0.45s，清单逐字节一致。
+    bash 每次调用会跑两遍（执行前 with_content + 执行后 stat-only），故每次调用
+    省下约 21s。
+
+    内容缓存另加一条剪枝：`_UNDO_MAX_BYTES`（2MB）以上的文件**永不**会有 undo 快照
+    （`_snapshot_change` 直接返回 None），故不再 pre-copy 其字节——省的是纯浪费的读取。
+    清单里仍记录其 (mtime,size)，变更仍可见，只是无 before 字节。
+
+    语义与 `os.walk(followlinks=False)` 对齐：目录符号链接不下钻（防环）。
+    """
     ws = str(workspace_root())
     excluded = _excluded_roots()
     manifest: dict[str, tuple[int, int]] = {}
     content: dict[str, bytes] | None = {} if with_content else None
     total = 0
-    for dirpath, dirnames, filenames in os.walk(ws):
-        dirnames[:] = [d for d in dirnames if d not in _NOISE_DIRS and not d.startswith(".")]
-        for name in filenames:
-            full = os.path.join(dirpath, name)
-            rel = os.path.relpath(full, ws).replace("\\", "/")
-            if not _in_snapshot_zone(rel, excluded):
-                continue
-            try:
-                st = os.stat(full)
-            except OSError:
-                continue
-            manifest[rel] = (st.st_mtime_ns, st.st_size)
-            if content is not None:
-                if total + st.st_size > _SNAP_MAX_BYTES or len(content) >= _SNAP_MAX_FILES:
-                    content = None  # 超限：放弃内容缓存，退化为 stat 清单比对
-                else:
-                    try:
-                        with open(full, "rb") as f:
-                            b = f.read()
-                    except OSError:
-                        b = None
-                    if b is not None:
-                        content[rel] = b
-                        total += len(b)
+    stack = [ws]
+    while stack:
+        try:
+            it = os.scandir(stack.pop())
+        except OSError:
+            continue  # 目录在遍历中消失/无权限：静默跳过（与原实现一致）
+        with it:
+            for entry in it:
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    continue
+                if not _in_snapshot_zone(entry.path, excluded):
+                    continue
+                if is_dir:
+                    if entry.is_symlink():
+                        continue  # 对齐 os.walk(followlinks=False)：目录链接不下钻
+                    if entry.name in _NOISE_DIRS or entry.name.startswith("."):
+                        continue
+                    stack.append(entry.path)
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                rel = os.path.relpath(entry.path, ws).replace("\\", "/")
+                manifest[rel] = (st.st_mtime_ns, st.st_size)
+                if content is not None:
+                    if total + st.st_size > _SNAP_MAX_BYTES or len(content) >= _SNAP_MAX_FILES:
+                        content = None  # 超限：放弃内容缓存，退化为 stat 清单比对
+                    elif st.st_size > _UNDO_MAX_BYTES:
+                        continue  # 超 undo 上限：不可能有 undo 快照，读字节纯浪费
+                    else:
+                        try:
+                            with open(entry.path, "rb") as f:
+                                b = f.read()
+                        except OSError:
+                            b = None
+                        if b is not None:
+                            content[rel] = b
+                            total += len(b)
     return manifest, content
 
 
@@ -334,6 +376,14 @@ def _run_bash(args: dict) -> dict:
             code="MULTILINE_UNSUPPORTED",
             field="command",
         )
+    # cd 前缀容错（实测：提示词与工具描述都已明写「cwd 已是工作区根，禁止 cd 前缀」，
+    # 但今日 7711 次 bash 调用里仍有 7196 次（93%）以 `cd` 开头——指令在长提示词里
+    # 权重不足，靠「服从」不可靠）。故在执行层**静默剥掉**前导 cd：
+    #   cd /d "D:\...\repo" && cmd   →   cmd
+    # 只处理**前导** cd（不碰命令中间的 cd），剥完若为空则保持原样（不静默执行空命令）。
+    # helper 定义在文件末尾——插在 `_run_bash` 之前会打断内置 P1 补丁的锚点连续性，
+    # 造成两条补丁来回震荡（apply 两次即重复插入）。
+    command = _strip_leading_cd(command)
     timeout_ms = optional_int(args, "timeout_ms", 30_000, 1_000, _MAX_TIMEOUT_MS)
     before = _scan_zone() if _trace_enabled() else None  # 执行前快照（pre-copy 内容缓存）
     result = _run_sandboxed(command, timeout_ms) if _sandboxed() else _run_direct(command, timeout_ms)
@@ -400,3 +450,44 @@ TOOLS = {
         "run": _run_bash,
     },
 }
+
+
+def _strip_leading_cd(command: str) -> str:
+    """剥掉命令的**前导** `cd <dir> &&` / `cd <dir> &`（cwd 已是工作区根，这段是冗余）。
+
+    只动开头的一层 cd：命令中间的 `cd`（如 `cd sub && ls`）不动——那是在切子目录，
+    语义上确实需要。剥完若命令为空则原样返回（由调用方报错，不静默执行空命令）。
+
+    实测依据：今日 bash 调用 7711 次中 7196 次（93%）以 cd 开头，每次多带 ~30–50 token，
+    且在长会话里被反复重发（放大进 cache_read）。
+    """
+    s = command.strip()
+    for _ in range(2):  # 允许 `cd a && cd b && cmd`（最多剥两层）
+        if not s.lower().startswith("cd "):
+            break
+        rest = s[3:].lstrip()
+        if rest.startswith("/d "):
+            rest = rest[3:].lstrip()
+        if rest.startswith('"'):
+            end = rest.find('"', 1)
+            if end < 0:
+                break
+            after = rest[end + 1:].lstrip()
+        elif rest.startswith("'"):
+            end = rest.find("'", 1)
+            if end < 0:
+                break
+            after = rest[end + 1:].lstrip()
+        else:
+            idx = rest.find(" ")
+            if idx < 0:
+                after = ""
+            else:
+                after = rest[idx:].lstrip()
+        if after.startswith("&&"):
+            s = after[2:].lstrip()
+        elif after.startswith("&"):
+            s = after[1:].lstrip()
+        else:
+            break
+    return s or command

@@ -27,6 +27,8 @@
 {"op":"summarize","session_id","summary","keep_last"?} → {"ok":true,"count":int}
 {"op":"trace.append","session_id","events":[Event]}    → {"ok":true,"count":int}
 {"op":"trace.read","session_id","after"?}              → {"ok":true,"events":[Event],"next":int}
+{"op":"trace.meta","session_id"}                       → {"ok":true,"exists":bool,"size":int,"mtime_ms":num,"total_events":int,"end_cursor":int}
+{"op":"session.skills","session_id"}                   → {"ok":true,"skills":[str],"total_events":int}
 {"op":"rollback","session_id","upto_user_index":int}   → {"ok":true,"removed_messages":int,"removed_events":int}
 ```
 
@@ -50,7 +52,16 @@
 ## trace 语义（改这里要小心——UI 依赖它）
 
 - **只追加、不可变**。
-- `trace.read` 整体重读文件后按行切事件；`after=N` 返回第 N 条之后的事件，`next` 是新游标（UI 增量拉取）。
+- `trace.read` 走 `traceOffsets` 行偏移索引 + `readEventLine` 精确读行（不再整体重读/全量解析）：文件
+  `size`+`mtime` 命中缓存即按偏移直读所需页。`after=N` 返回第 N 条之后的事件，`next` 是**本页已消费
+  游标**（UI 增量拉取），受 800 条/约 1MB 双预算分页，**不是** trace 总末尾。
+- `trace.meta` 才提供**真实末尾绝对游标**：`total_events` = 完整有效事件数（`traceOffsets().length`，
+  跳过损坏行），`end_cursor` 同值；另附 `exists`/`size`/`mtime_ms`。缺 trace 文件时返回
+  `{ok:true, exists:false, total_events:0, end_cursor:0}`（**不是失败**）。服务端编排层（agent-loop）
+  的回合游标必须用它，不能拿 `trace.read` 首页的 `next` 冒充总末尾——短 trace 下二者恰好相等，
+  长 trace（>800 条）会漏算。
+- `session.skills` 扫描**完整** trace（逐条 `readEventLine`，非仅首页），返回去重后的已加载技能
+  （`type==="skill_loaded"` 且 `skill` 非空），供 agent-loop 恢复会话级技能作用域。
 - 容忍半行 / 损坏行：解析失败的行跳过，不整体失败（写入中途被读到是正常情况）。
 - **trace 是 UI 的唯一持久化事件源**：浏览器 SSE（`crates/host/src/frontend.rs` 的 `sse_events`）
   就是轮询 `trace.read`，`after=0` 起全量重放 = 刷新恢复。
@@ -60,7 +71,10 @@
 ## summarize（上下文压缩）
 
 - 由 `agent-loop` 在历史超过 `COMPACT_TRIGGER`（默认 40 条，`0` = 禁用）时调用。
-- 结果 = 一条压缩标记消息 + 最近 `keep_last` 条（默认 10）。
+- 结果 = （可选）唯一的规范化 system + 一条压缩标记消息 + 最近 `keep_last` 条（默认 10）。
+- **system 保留（M3）**：不假定 system 在 `msgs[0]`（持久化历史里的 system 可能位于任意位置）；全历史
+  **最多保留一个** system（取最后一条、空内容视为无），置于压缩标记之前，绝不留多个——多个 system
+  会与 agent-loop 的动态 system 冲突。与 agent-loop 的 system 规范化同规则。
 - **防撕裂**：切片后丢弃开头的孤儿 `tool` 消息（其 `assistant(tool_calls)` 载体已被裁掉），
   否则历史里会出现没有归属的 tool 结果，模型会困惑。
 

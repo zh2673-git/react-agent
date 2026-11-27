@@ -8,29 +8,44 @@
 </head>
 <body>
 <aside class="sidebar" id="sidebar">
-  <div class="brand"><span class="logo">R</span><span>react-agent</span><span class="inst-badge" id="inst-badge" hidden></span></div>
-  <button class="newchat" id="newchat">＋ 新建对话</button>
-  <button class="newchat win" id="btn-newwin" title="新建独立窗口：绑定另一个工作区，独立会话/回滚/配置（多实例并行）">▣ 新窗口</button>
-  <div class="sess-label">会话</div>
-  <div class="sessions" id="sessions"></div>
+  <div class="brand"><span class="logo">R</span><span>rsi-agent</span><span class="inst-badge" id="inst-badge" hidden></span></div>
+
+  <!-- C 轮：左栏改为布局驱动的章节装配（任务 / 指标 / 灵感，顺序由 kind 钉死）。
+       章节清单来自 .rsi/board.json 的 layout.sections（scripts/board.py layout 可读写），
+       前端只认三类 kind + 封闭枚举参数——插件化指加章节不改前端，有约束指
+       能加的东西是白名单，不是任意 DOM（见 docs/self-evolution/02 文档）。 -->
+  <div id="board-sections"></div>
+
+  <div class="sec-foot">
+    <button class="newchat win" id="btn-newwin" title="新建独立窗口：绑定另一个工作区，独立会话/回滚/配置（多实例并行）">▣ 新窗口</button>
+  </div>
 </aside>
 
 <div class="main">
   <header>
-    <button class="toggle" id="toggle" title="折叠/展开会话栏">☰</button>
-    <span class="title">react-agent <small id="session-tag">session: -</small><small id="ws-tag" title="当前工作区（文件工具/文件树/产物的根）"></small></span>
+    <button class="toggle" id="toggle" title="折叠/展开左侧看板">☰</button>
+    <span class="title">rsi-agent <small id="ws-tag" title="当前工作区（文件工具/文件树/产物的根）"></small></span>
     <span class="spacer"></span>
     <span class="dot" id="conn"></span>
     <span class="status" id="status"></span>
+    <button class="treebtn" id="btn-board" title="任务看板：摊开看人财物 / 计划 / 验收 / 分解（Esc 关闭）">▤ 看板</button>
     <button class="treebtn" id="btn-tree" title="工作区文件树（只读预览/下载）">📁 文件</button>
     <button class="gear" id="gear" title="配置中心：LLM / 工具 / 技能 / Agent">⚙ 设置</button>
   </header>
-  <div id="stream"><div class="wrap" id="feed"></div></div>
+  <div id="stream">
+    <div id="lanes" hidden aria-label="车道切换"></div>
+    <div class="wrap" id="feed"></div>
+  </div>
   <footer>
+    <div id="queue-box" hidden>
+      <div class="qhead"><span>待发指令（Enter 排队；行内 ⏭ 立即执行 / ↑ 上移 / ✎ 编辑 / ⧉ 复制 / × 删除）</span><span id="queue-count"></span><button class="btn ghost" id="queue-toggle" type="button">隐藏</button></div>
+      <div id="queue-list"></div>
+    </div>
     <div class="atts" id="atts" hidden></div>
     <div class="composer">
       <button id="attach" class="attach" title="附加图片或文本文件（最多 4 个，单个 ≤2MB）">📎</button>
-      <textarea id="input" placeholder="输入消息，Enter 发送（Shift+Enter 换行；可直接粘贴图片）"></textarea>
+      <textarea id="input" placeholder="输入消息，Enter 发送 / 排队（Shift+Enter 换行；Alt+Enter 插队；可直接粘贴图片）"></textarea>
+      <!-- Q5：⏭ 插队键已移除（composer 恢复为纯「停止」）；拦截能力下放到待发队列行内，Alt+Enter 仍可插队 -->
       <button id="stop" hidden style="background: var(--card-2); color: var(--text);">停止</button>
       <button id="send">发送</button>
       <input type="file" id="file" multiple hidden
@@ -45,10 +60,45 @@
     <button data-tab="llm" class="on">LLM</button>
     <button data-tab="tools">工具</button>
     <button data-tab="skills">技能</button>
+    <button data-tab="memory" title="画像与记忆：agent 对「你是谁」「这个域怎么做事」的结论">记忆</button>
     <button data-tab="agent">Agent</button>
+    <button data-tab="im" title="手机 IM 远程控制：钉钉 / QQ 机器人把消息转给本机 Agent（需先启动 im-gateway）">IM 通道</button>
+    <button data-tab="publish" title="内容分发：一份稿件发到小红书 / B站 / 视频号 / 公众号">分发</button>
     <button data-tab="channels">外部通道</button>
   </div>
   <div class="body">
+    <!-- F3：能力总览（设置抽屉的「目录页」）─────────────────────────────────────
+         用户原话：「技能、工具、记忆、agent 与用户这种画像在 UI 上如何设计得更科学合理」。
+         病灶不是「页签太多」，而是**没有一条主线**：五个页签平铺，用户看不出
+         「哪些是我做的决定、哪些是系统现在的状态、哪些是它记住了关于我的事」。
+         主线按「谁做的决定」分三类——这一分类同时是它们在上下文里的注入方式的差异：
+           · 你决定（LLM / 工具白名单 / Agent 参数）——每轮按你的配置执行
+           · 它带的牌（技能 / 技能工具 / MCP）——决定它能做什么，装载 ≠ 启用
+           · 它记得的事（画像 / 域 / 观察）——每轮进上下文，影响它怎么理解你
+         总览是只读的目录，点一行跳到对应页签；不给它加配置项——目录就做目录的事。 -->
+    <div class="ov" id="cap-overview">
+      <div class="ov-title">能力总览</div>
+      <div class="ov-cols">
+        <div class="ov-col">
+          <div class="ov-h">你决定的</div>
+          <button class="ov-row" data-goto="llm"><span class="ov-k">模型</span><span class="ov-v" id="ov-llm">—</span></button>
+          <button class="ov-row" data-goto="tools"><span class="ov-k">工具白名单</span><span class="ov-v" id="ov-tools">—</span></button>
+          <button class="ov-row" data-goto="agent"><span class="ov-k">运行参数</span><span class="ov-v" id="ov-agent">—</span></button>
+        </div>
+        <div class="ov-col">
+          <div class="ov-h">它带的牌</div>
+          <button class="ov-row" data-goto="skills"><span class="ov-k">技能</span><span class="ov-v" id="ov-skills">—</span></button>
+          <button class="ov-row" data-goto="tools"><span class="ov-k">技能工具 / MCP</span><span class="ov-v" id="ov-pool">—</span></button>
+        </div>
+        <div class="ov-col">
+          <div class="ov-h">它记得的事</div>
+          <button class="ov-row" data-goto="memory"><span class="ov-k">画像</span><span class="ov-v" id="ov-mem">—</span></button>
+          <button class="ov-row" data-goto="memory"><span class="ov-k">当前域</span><span class="ov-v" id="ov-dom">—</span></button>
+        </div>
+      </div>
+      <p class="ov-note">左列是你能定死的；中列决定它能干什么；右列决定它怎么理解你——
+        写错右列比不写更糟（每轮都生效），所以那页只给看不给写。</p>
+    </div>
     <div id="tab-llm">
       <!-- 三区独立折叠：文本/生图/生视频各自填写、各自保存（样式与工具池分组同款 poolhead collapsible） -->
       <div class="poolhead collapsible"><span class="chev">▾</span><span class="plabel">文本模型（对话）</span><span class="pcnt" id="llm-cnt"></span></div>
@@ -65,11 +115,63 @@
           <select id="llm-site" style="flex:1"></select>
           <a id="llm-site-key-url" class="site-link" href="#" target="_blank" rel="noopener" hidden>申请 key ↗</a>
         </div>
-        <div class="field"><label>model</label><select id="llm-model" style="flex:1"></select><input id="llm-model-custom" placeholder="自定义模型名" style="flex:1; display:none"><button type="button" class="btn ghost" id="llm-fetch-models">拉取模型</button></div>
+        <!-- P7：模型选择器（常驻 chips + 平台分组折叠 + 搜索）。
+             原生 <select id="llm-model"> 保留在 DOM 里作为唯一真值（curModelName / rgCatalogHas /
+             MutationObserver / 自动同步都读它），但由 CSS 隐藏——152 项平铺下拉正是要解决的问题。 -->
+        <div class="field"><label>model（当前生效）</label>
+          <div class="row" style="gap:8px; flex-wrap:wrap">
+            <span class="mpick-cur" id="llm-model-cur">未选择</span>
+            <button type="button" class="btn ghost" id="llm-fetch-models">拉取模型</button>
+            <select id="llm-model"></select>
+            <input id="llm-model-custom" placeholder="自定义模型名" style="flex:1; display:none">
+          </div>
+        </div>
+        <p class="hint" id="llm-model-sync" hidden style="margin-top:-2px"></p>
+        <div class="field"><label>常用模型（点一下就切换）</label>
+          <div class="chips" id="mpick-pins"></div>
+          <p class="hint" style="margin:6px 0 0">常用清单存在本机浏览器（localStorage），刷新与重启 host 都还在；在下面点 ☆ 加入、点 ✕ 移出，最多 24 个。</p>
+        </div>
+        <div class="field"><label>全部模型（按平台分组，可折叠 / 搜索）</label>
+          <input id="mpick-q" placeholder="搜索：模型名或平台，如 deepseek / trae-cn / auto">
+          <div class="mpick-groups" id="mpick-all"></div>
+        </div>
         <div class="field"><label>base_url</label><input id="llm-base" placeholder="https://api.deepseek.com/v1"></div>
         <div class="field"><label>api_key</label><input id="llm-key" type="password" autocomplete="off"></div>
         <div class="row"><button class="btn" id="llm-save">保存</button><button class="btn ghost" id="llm-reveal" title="在文件管理器中定位 config.json">📂 源文件</button><span class="flash" id="llm-flash"></span></div>
+        <!-- 上游本地网关（magpie）：base_url 为本机回环时可见——状态灯 + 一键启动 + 积分行 -->
+        <div class="field" id="upstream-field" hidden>
+          <label>本地网关</label>
+          <span class="up-state" id="upstream-state">检测中…</span>
+          <button type="button" class="btn ghost" id="upstream-start" hidden>一键启动</button>
+        </div>
+        <p class="hint" id="upstream-quotas" hidden style="margin-top:-2px"></p>
+        <div class="field" id="upstream-checkin-field" hidden>
+          <label>账号签到</label>
+          <span id="upstream-login-btns"></span>
+          <button type="button" class="btn" id="upstream-checkin">一键领取积分</button>
+          <span class="up-state" id="checkin-state">账号状态：检测中…</span>
+        </div>
+        <p class="hint" id="upstream-checkin-log" hidden style="margin-top:-2px"></p>
         <p class="hint">保存即热生效（env 更新 + 落盘 config.json）。api_key 留空 = 不修改；回显只显示尾 4 位。不清楚怎么填？直接在对话里问（如「XX 站怎么配」），我会调研该站点文档并给出可粘贴的配置。</p>
+      </div>
+      <!-- P2-D：路由组（Magpie auto 组）管理 ─────────────────────────────────────
+           为什么需要这一块：模型下拉里的 `auto/<model>` 不是「模型」，而是网关里的
+           一个**路由组**（成员是若干真实模型，网关按 routing 策略挑一个）。组不存在时
+           模型能选却调不通——用户无从判断是「模型下线」还是「组没建」。
+           这里只调 Host 的 /api/routegroups*；Host 再用 Command::args 调 Magpie CLI。
+           前端不拼 shell：组名/模型名里带引号或空格就会变成命令注入面。 -->
+      <div class="poolhead collapsible" id="rg-head"><span class="chev">▾</span><span class="plabel">路由组（auto 组）</span><span class="pcnt" id="rg-cnt"></span></div>
+      <div class="poolbody" id="sec-routegroups">
+        <p class="hint"><code>auto/&lt;model&gt;</code> 是网关路由组：成员是真实模型，网关按 routing 策略挑一个。组有两套 id——内部 id 是规范化的 <code>auto-&lt;slug&gt;</code>，public 尾段保留原始大小写/下划线/点号，两者不能互相反推，所以下面都显示出来；删除/恢复一律按内部 id 精确指向，避免误删内置组。</p>
+        <div id="rg-list"><p class="hint">展开后读取…</p></div>
+        <div class="ov" id="rg-missing" hidden></div>
+        <div class="poolhint" id="rg-form-title">新建组</div>
+        <div class="field"><label>组名</label><input id="rg-name" placeholder="MiniMax M3.1 Flash"></div>
+        <div class="field"><label>成员模型（Ctrl/⌘ 点选多选；必须是网关目录里的真实模型 id）</label><select id="rg-members" multiple size="8"></select></div>
+        <div class="field"><label>routing（网关挑成员的策略）</label><select id="rg-routing"></select></div>
+        <div class="field"><label>stays（会话粘性）</label><select id="rg-stays"></select></div>
+        <div class="field" id="rg-auto-field"><label>auto 目标（选填：填裸模型名 → 建成 public <code>auto/&lt;model&gt;</code>）</label><input id="rg-auto" placeholder="minimax-m3.1-flash"></div>
+        <div class="row"><button class="btn" id="rg-create">新建组</button><button class="btn ghost" id="rg-cancel" hidden>取消编辑</button><button class="btn ghost" id="rg-reload">刷新</button><span class="flash" id="rg-flash"></span></div>
       </div>
       <div class="poolhead collapsible"><span class="chev">▾</span><span class="plabel">生图模型</span><span class="pcnt" id="media-img-cnt"></span></div>
       <div class="poolbody" id="sec-media-img">
@@ -96,6 +198,18 @@
       <p class="hint">勾选启用工具（整体替换白名单，保存即热生效）；点击条目展开配置详情，再点收起。三池组头可整体收起/展开；「MCP 外接」各服务组内含工具勾选与 API Key 配置。</p>
       <div id="tools-list"></div>
       <div class="row"><button class="btn" id="tools-save">保存</button><button class="btn ghost" id="tools-reveal" title="打开 plugins/tools 目录（内置工具源码）">📂 源文件</button><span class="flash" id="tools-flash"></span></div>
+      <!-- T-13：GitHub 登录态。刻意不放「一键登录」按钮：gh auth login 是阻塞式
+           交互命令，host 代跑会挂到超时（实测 K502）。这里只做两件事——
+           ① 显示当前是否已登录（读 gh 已有凭据，不碰 token）；
+           ② 未登录时给一行可复制命令，用户粘到终端跑完再点「重新检测」。 -->
+      <div class="field" style="margin-top:16px">
+        <label>GitHub（提交 / 推送用）</label>
+        <div id="git-auth-box" class="hint">检测中…</div>
+        <div class="row">
+          <button class="btn ghost" id="git-auth-refresh">重新检测</button>
+          <span class="flash" id="git-auth-flash"></span>
+        </div>
+      </div>
     </div>
     <div id="tab-skills" hidden>
       <div class="row" style="margin-bottom:12px"><button class="btn ghost" id="skill-new">＋ 新建技能</button><button class="btn ghost" id="skills-reveal" title="打开技能根目录（plugins/assets/skills）">📂 源文件</button></div>
@@ -111,9 +225,57 @@
         <p class="hint">frontmatter 需含 name（与目录名一致）与非空 description。保存后下轮对话自动可见；模型也可在对话中用 write_file 自建技能（技能自扩展）。</p>
       </div>
     </div>
+    <div id="tab-memory" hidden>
+      <!-- F2：记忆页。三块自上而下 = 三层记忆的作用范围由近到远：
+           ① 画像（长期结论，每轮注入）② 域（同一条结论在不同场合的不同版本）
+           ③ 观察（原始记录，进 prompt 时只取最近几条）。
+           底部说明「这里只读只删」——UI 讲清自己的权限边界，用户才不会以为「这里能加一条」。 -->
+      <p class="hint" style="margin-top:0">
+        这里是 agent 记住的关于你的结论（<code>.rsi/profile.json</code>），每轮都会进上下文。
+        写错一条比不写更糟，所以：<b>这里能看、能删，不能手写新增</b>——新增由观察产生
+        （对话里发现的规律由我记下），你删掉错的即可。
+      </p>
+      <div class="mem-bar">
+        <span class="mem-stat" id="mem-stat">读取中…</span>
+        <button class="btn ghost" id="mem-refresh" title="重新读取 .rsi/profile.json">⟳ 刷新</button>
+        <button class="btn ghost" id="mem-reveal" title="在文件管理器中定位 profile.json">📂 源文件</button>
+      </div>
+      <div id="mem-body"></div>
+    </div>
+    <div id="tab-im" hidden>
+      <p class="hint">手机 IM 远程控制本机 Agent。在钉钉/QQ 里 @机器人 发消息，消息转到本机会话并回复。凭据只保存在本机 config.json；密码框留空 = 不修改，回显只显尾 4 位。配置保存后需启动 <code>im-gateway</code>（见 README）才会真正连上平台。</p>
+      <div class="field"><label><input type="checkbox" id="im-enabled"> 启用外部 IM 通道</label></div>
+      <div class="field"><label>Host 地址（im-gateway 回调本机的地址）</label><input id="im-host-base" placeholder="http://127.0.0.1:8710"></div>
+      <div class="field"><label><input type="checkbox" id="im-enable-dingtalk"> 启用钉钉 Stream 机器人</label></div>
+      <div class="field"><label>钉钉 Client ID（AppKey）</label><input id="im-dt-id" placeholder="ding..."></div>
+      <div class="field"><label>钉钉 Client Secret（AppSecret，留空不修改）</label><input id="im-dt-secret" type="password" placeholder="留空不修改"></div>
+      <div class="field"><label><input type="checkbox" id="im-enable-qq"> 启用 QQ 官方机器人</label></div>
+      <div class="field"><label>QQ Bot AppID</label><input id="im-qq-appid" placeholder="数字 AppID"></div>
+      <div class="field"><label>QQ Bot Token（留空不修改）</label><input id="im-qq-token" type="password" placeholder="留空不修改"></div>
+      <div class="field"><label>允许的用户 ID（逗号分隔，空 = 不限制；生产建议配置）</label><input id="im-allow-users" placeholder="user1,user2"></div>
+      <div class="field"><label>允许的会话/群 ID（逗号分隔，空 = 不限制）</label><input id="im-allow-chats" placeholder="chat1,chat2"></div>
+      <div class="field"><label>单条回复最大字符数</label><input id="im-max-chars" type="number" min="1" placeholder="4000"></div>
+      <div class="field"><label>单轮最长等待秒数</label><input id="im-timeout" type="number" min="1" step="0.5" placeholder="300"></div>
+      <div class="row"><button class="btn" id="im-save">保存 IM 配置</button><span class="flash" id="im-flash"></span></div>
+    </div>
+    <div id="tab-publish" hidden>
+      <p class="hint">内容分发：一份稿件发到多个平台。这里的开关是「允许发到哪里」；真正发出前还会干跑一次让你看清单。</p>
+      <div id="pub-status" class="ov"></div>
+      <div id="pub-list"></div>
+      <p class="hint" style="margin-top:10px">浏览器自动化平台（小红书 / B站 / 视频号 / 抖音）依赖开源项目 social-auto-upload（MIT）的 <code>sau</code> 命令；先在终端装好并 <code>sau xiaohongshu login --account 你的别名</code> 登录一次。公众号走官方 API，填 AppID/AppSecret 即可。</p>
+      <div class="field">
+        <label>默认账号别名（对应 sau --account）</label>
+        <input id="pub-account" placeholder="creator">
+      </div>
+      <p class="hint">公众号发布不可撤回：默认只建<b>草稿</b>，你在后台预览排版后再点发布。勾「直接发布」才会一步发出。</p>
+      <div class="row" style="gap:8px;display:flex;align-items:center;margin-top:10px">
+        <button id="pub-save" class="primary">保存分发配置</button>
+        <span id="pub-flash" class="flash"></span>
+      </div>
+    </div>
     <div id="tab-agent" hidden>
       <p class="hint">agent-loop 运行参数（保存即下轮对话生效 + 落盘 config.json）。0 的语义见各标签。</p>
-      <div class="field"><label>max_rounds（单次对话最大轮次）</label><input id="agent-max-rounds" type="number" min="1" max="64"></div>
+      <div class="field"><label>max_rounds（单次对话最大轮次）</label><input id="agent-max-rounds" type="number" min="1" max="10000"></div>
       <div class="field"><label>产物输出目录（agent 产出的成品文件统一写入此目录，工作区内相对路径）</label><input id="agent-output-dir" placeholder="outputs"></div>
       <div class="field"><label>budget_secs（单次对话总时长预算，秒，支持小数；0=不限）</label><input id="agent-budget-secs" type="number" min="0" step="0.5"></div>
       <div class="field"><label>token_budget（单次对话 token 预算，input+output 累计；0=不限）</label><input id="agent-token-budget" type="number" min="0"></div>
@@ -141,6 +303,20 @@
   </div>
 </aside>
 
+<!-- D 轮：看板弹窗（对标「任务看板是一个标签，点进去是一个活的界面」）。
+     与侧栏同源：章节清单照样来自 .rsi/board.json 的 layout.sections，弹窗只换壳不换数据，
+     标签页按 kind 出（任务 / 指标 / 灵感），不新增可配置维度。 -->
+<div class="board-win" id="board-win" hidden>
+  <div class="bw-panel">
+    <div class="bw-top">
+      <div class="bw-tabs" id="bw-tabs"></div>
+      <button class="bw-close" id="bw-close" title="关闭（Esc）">✕</button>
+    </div>
+    <div class="bw-root" id="bw-root"></div>
+    <div class="bw-foot2" id="board-win-foot"></div>
+  </div>
+</div>
+
 <div class="modal-mask" id="win-modal" hidden>
   <div class="modal">
     <div class="mhead">▣ 新建窗口（独立实例）</div>
@@ -161,10 +337,14 @@
 <!-- W17 迭代八拆分（原 app.js 单文件 → 五模块，vendor/ 前缀复用既有白名单规则零 Rust 改动；defer 按文档序执行）。
      顺序约束：events 顶层立即调用 api()/connect()（api 声明在 settings）→ settings 必须先于 events；
      settings/files 顶层仅赋值与 let 声明，无立即调用，故 core → stream → files → settings → events 安全。 -->
+<!-- D 轮修正：五个模块各被引入过两次（历史补丁叠加所致）。defer 会按文档序执行两次，
+     顶层 const/let（runState / $ / feed / …）重复声明直接 SyntaxError → 整个前端白屏。 -->
+<script src="/vendor/q-session.js" defer></script>
 <script src="/vendor/app-core.js" defer></script>
 <script src="/vendor/app-stream.js" defer></script>
 <script src="/vendor/app-files.js" defer></script>
 <script src="/vendor/app-settings.js" defer></script>
 <script src="/vendor/app-events.js" defer></script>
+<script src="/vendor/app-board.js" defer></script>
 </body>
 </html>

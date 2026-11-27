@@ -27,6 +27,10 @@
 //! 跨插件调用封装与跨模块共享的常量/小工具。
 
 mod budget;
+mod queue;   // Q 轮 Phase 3：服务端显式队列（全局有界状态，不动插件结构体）
+mod board_ctx; // C 轮：任务看板上下文装载（@引用 + 在办任务摘要，只读 .rsi/board.json）
+mod profile_ctx; // D 轮：习惯画像装载（.rsi/profile.json 的有界摘要，只读；写口是 scripts/profile.py）
+mod memory_ctx; // G 轮：记忆 L2 时间轴（.rsi/memory/L3/index.json 的元数据，只读；写口是 scripts/memory_consolidate.py）
 mod chat;
 mod compaction;
 mod config;
@@ -39,6 +43,22 @@ mod tools_defer; // G 轮：按需装载工具（deferred：schema 不进清单�
 mod turn;        // G 轮：回合对象（turn_id + trace 游标区间 + paused 暂停态 + 补播视图）
 mod tools_exec;
 mod trace;
+
+/// 进程级 env 是共享可变状态（`cargo test` 多测同进程并行跑）。
+///
+/// 实测过的伤害：S 轮新增的 `routing_hint_declares_three_tiers_and_tie_break` 与既有的
+/// `task_board_section_requires_cli_and_scales_by_flag` 都要 `set_var("RSI_HOME")`，
+/// 两个线程交错时后者读到前者布置的空目录 → 提示段为空 → 既有用例红。
+/// 这类红有个恶劣特征：**换个跑法就绿**（单线程跑不复现），于是最容易被当成 flaky 忽略，
+/// 而它每次在 CI 上的结论都是随机的。
+///
+/// v12：锁必须**跨模块**共用。`board_ctx::tests` 与本文件的测试都改
+/// `RSI_HOME` / `WORKSPACE_ROOT`，各自持有自己的 `ENV_LOCK` 等于没加锁——实测：
+/// 单包跑 `-p react-agent-agent-loop --lib` 全绿，`--workspace --lib` 时
+/// `board_follows_rsi_home_not_workspace` 读到本文件用例留下的 `RSI_HOME` 而红。
+/// 锁的粒度要覆盖它保护的状态，而不是「看起来相关的那几个用例」。
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use contract::{Attachment, ChatReq, LlmChatResp, MemoryMsg, StepRecord, ToolCall, ToolObs, ToolObsChanges, ToolSpec};
 
@@ -58,8 +78,15 @@ pub const ID_ASSETS: &str = "assets";
 
 /// capability 寻址（K2，内核 v0.1.4）：跨插件调用按能力寻址，提供者可被同名/异名
 /// 实现替换而本 crate 零改动。memory 侧所有 session 域操作（get/append/summarize/
-/// trace.append/trace.read）统一寻址 `memory.session`——与本插件 manifest 硬依赖
-/// 声明一致（声明什么就寻址什么，消除"用了未声明的 capability"的旧不一致）。
+/// trace.append/trace.read/trace.meta/session.skills）统一寻址 `memory.session`——与本插件
+/// manifest 硬依赖声明一致（声明什么就寻址什么，消除"用了未声明的 capability"的旧不一致）。
+///
+/// 后两个 op 是 P1 修复引入的**只读汇总**接口，专治「分页接口当总长度用」这一类 bug：
+/// - `trace.meta` → `{ok, exists, size, mtime_ms, total_events, end_cursor}`：真实末尾
+///   绝对游标（= trace 完整有效事件数）。`trace.read.next` 是**分页消费位置**，单页
+///   ≤800 条 / 约 1MB，长 trace 上恒等于首页边界，绝不能当回合终点（见 chat.rs 三处）。
+/// - `session.skills` → `{ok, skills, total_events}`：会话级已加载技能集合（扫完整
+///   trace 去重），替代编排层逐页重放 `skill_loaded`（只读首页必漏长会话）。
 pub const CAP_MEMORY: &str = "memory.session";
 pub const CAP_LLM: &str = "llm.chat";
 pub const CAP_TOOLS: &str = "tools.exec";
@@ -212,6 +239,36 @@ pub struct AgentLoopPlugin {
     /// memory.append 连续失败计数（LOOP-P2/A2）：持久层与内存工作集开始分叉的信号，
     /// 成功即清零；达到阈值由关键写入点熔断本轮，防错位静默放大。
     append_fails: AtomicU64,
+    /// P4b 任务级累计花费账：外层键 = 根会话 id（`budget_root`），内层键 = 该任务下每条
+    /// 调用链的会话 id（顶层即根会话 id，子代理为其 sub_session），值 = 该链已消耗 token。
+    ///
+    /// 为什么需要它（改前必读）：修复前 `budget_snap` 只把「父链当前剩余」传给子代理，
+    /// 于是**同一父轮的多个子代理各自看到同一份剩余**——N 个子代理并发跑，实际可超支
+    /// N 倍，token 预算闸在最贵的场景（扇出探索）里彻底失真。任务账把「整条链已花多少」
+    /// 变成显式事实，派发时按「总额 − 全体已花」切分，超支被结构性封住。
+    spent: Mutex<std::collections::HashMap<String, std::collections::HashMap<String, u64>>>,
+}
+
+impl AgentLoopPlugin {
+    /// P4b 记账：写入某条调用链在本任务内的累计花费。
+    ///
+    /// 语义是**绝对值覆盖**（调用方传该链的 `usage.total()`，不是增量）：同一
+    /// (root, session) 只保留最新值，重复调用幂等；不同链互不覆盖，求和即任务总额。
+    fn record_spent(&self, root: &str, session: &str, spent: u64) {
+        let mut m = self.spent.lock().unwrap();
+        m.entry(root.to_string()).or_default().insert(session.to_string(), spent);
+    }
+
+    /// P4b：本任务全体成员（父链 + 所有子代理）已花 token 总额。
+    /// 派发子代理时用它算「总额 − 已花」，从而让兄弟子代理分食同一份剩余。
+    fn task_spent(&self, root: &str) -> u64 {
+        self.spent
+            .lock()
+            .unwrap()
+            .get(root)
+            .map(|m| m.values().copied().fold(0u64, |a, b| a.saturating_add(b)))
+            .unwrap_or(0)
+    }
 }
 
 /// 构造插件实例（`Arc<dyn Plugin>`）：策略钩子按 env 解析（缺省关闭）。
@@ -237,8 +294,8 @@ pub fn new_with_policy(max_rounds: usize, policy: LoopPolicy) -> PluginInstance 
         // Serial 会让 cancel dispatch 在 per-plugin 锁后排队到 chat 结束之后（取消永远迟到）。
         semantics: Semantics::Concurrent,
         priority: 1,
-        // 8 = 并发 chat 槽位 + cancel 通道余量（cancel 不应被满载 chat 挤掉）。
-        max_inflight: Some(8),
+        // Q 轮：槽位可配（缺省保持 8 / 32；非法值 fail-closed 回退缺省）。
+        max_inflight: Some(std::env::var("AGENT_MAX_INFLIGHT").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n >= 2 && *n <= 128).unwrap_or(8)),
         fuel_limit: None,
         host_timeout_ms: None,
         epoch_interval_ms: None,
@@ -257,6 +314,7 @@ pub fn new_with_policy(max_rounds: usize, policy: LoopPolicy) -> PluginInstance 
         sid_floor: AtomicU64::new(0),
         session_chats: Mutex::new(std::collections::HashMap::new()),
         append_fails: AtomicU64::new(0),
+        spent: Mutex::new(std::collections::HashMap::new()),
     })
 }
 
@@ -298,6 +356,30 @@ impl AgentLoopPlugin {
         format!("{session_id}-r{n}")
     }
 
+    /// Q 轮 Phase 3：显式入队。当前会话空闲 → 立即 spawn pump；有在途 chat →
+    /// 由 chat_body 出口（闸释放后）spawn；steer 且在运行中 → 进轮次边界注入缓冲。
+    fn queue_enqueue(&self, env: &Envelope) -> Value {
+        let sid = env.payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+        let text = env.payload.get("user_text").and_then(Value::as_str).unwrap_or("");
+        if sid.is_empty() || text.trim().is_empty() {
+            return json!({"ok": false, "error": {"code": "K400", "message": "queue/enqueue 需 session_id + user_text"}});
+        }
+        let target = env.payload.get("target").and_then(Value::as_str).unwrap_or("followup");
+        if !matches!(target, "followup" | "steer") {
+            return json!({"ok": false, "error": {"code": "K400", "message": "target 只能是 followup 或 steer"}});
+        }
+        let atts = env.payload.get("attachments").cloned();
+        match queue::enqueue(sid, text.to_string(), atts, target) {
+            Ok((id, position)) => {
+                if let Some(host) = self.host.get() {
+                    queue::try_spawn(host, sid);
+                }
+                json!({"ok": true, "queued": true, "id": id, "position": position, "target": target})
+            }
+            Err(e) => json!({"ok": false, "error": {"code": "K400", "message": e}}),
+        }
+    }
+
     /// 跨插件调用便捷封装（K2 寻址契约 + S1 贯穿，v0.1.7 消费）：按 capability 寻址，
     /// 复用内核 dispatch 全链（B5 快照 / B2 panic 隔离 / B4 背压 / deadline 竞争全部继承）。
     ///
@@ -336,6 +418,26 @@ impl Plugin for AgentLoopPlugin {
         let op = env.payload.get("op").and_then(|v| v.as_str()).unwrap_or("");
         match op {
             "chat" => Ok(self.chat_body(&env).await),
+            // Q 轮 Phase 3：显式队列 op 面（纯追加；裸并发 chat 仍走上面的 K409 闸）。
+            // 队列项经 host.call_plugin 派发，与裸 chat 共用同一 per-session 闸，
+            // 但由单消费者 pump 串行化——「显式队列」不推翻「隐式排队」旧裁决。
+            "queue/enqueue" => Ok(self.queue_enqueue(&env)),
+            "queue/status" => Ok(json!({ "ok": true, "session_id": env.payload.get("session_id").and_then(Value::as_str).unwrap_or(""), "status": queue::status(env.payload.get("session_id").and_then(Value::as_str).unwrap_or("")) })),
+            "queue/remove" => {
+                let sid = env.payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+                let id = env.payload.get("id").and_then(Value::as_str).unwrap_or("");
+                Ok(json!({"ok": queue::remove(sid, id), "removed": id}))
+            }
+            "queue/interrupt" => {
+                let sid = env.payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+                if sid.is_empty() {
+                    Ok(json!({"ok": false, "error": {"code": "K400", "message": "interrupt 需 session_id"}}))
+                } else {
+                    let n = queue::clear(sid);
+                    self.cancels.lock().unwrap().insert(sid.to_string());
+                    Ok(json!({"ok": true, "session_id": sid, "cleared": n, "note": "取消信号已置位；队列已清空（前端可把待发项退回编辑器）"}))
+                }
+            }
             "cancel" => {
                 // P2/T1：置位取消标志。Concurrent 语义保证本调用不被在途 chat 的锁阻塞。
                 let sid = env.payload.get("session_id").and_then(Value::as_str).unwrap_or("");
@@ -428,6 +530,7 @@ impl Plugin for AgentLoopPlugin {
         }
     }
     fn destroy(&self) -> KernelResult<()> {
+        queue::destroy();   // Q 轮：init/destroy 成对，清空进程内队列状态
         Ok(())
     }
 }
@@ -437,6 +540,8 @@ mod tests {
     use super::chat::build_user_msg;
     use super::tools_exec::ObsPlan;
     use super::*;
+
+    use crate::ENV_LOCK; // v12：跨模块共用一把锁，见 crate 根注释
 
     // O3：env 互相污染防不住并发——三测合并串行跑（语义：缺省→覆盖→误配回退）
     #[test]
@@ -570,6 +675,7 @@ mod tests {
             sid_floor: AtomicU64::new(0),
             session_chats: Mutex::new(std::collections::HashMap::new()),
             append_fails: AtomicU64::new(0),
+            spent: Mutex::new(std::collections::HashMap::new()),
         };
         let s1 = p.next_sid("s-x");
         let s2 = p.next_sid("s-x");
@@ -678,6 +784,349 @@ mod tests {
         assert!(!AgentLoopPlugin::user_wants_skill_build("有哪些技能可用？"));
     }
 
+    /// C 轮：@引用抽取器必须只认合法 ID 形状（`T-YYYYMMDD-NN`），且去重保序——
+    /// 松匹配会把「@Tomorrow」误当引用，紧匹配会漏掉真实引用，两个方向都有代价。
+    #[test]
+    fn extract_refs_shape_and_order() {
+        use super::board_ctx::extract_refs;
+        let text = "看 @T-20261107-01 和 @I-20261107-02，再说 @T-20261107-01";
+        assert_eq!(
+            extract_refs(text),
+            vec!["T-20261107-01".to_string(), "I-20261107-02".to_string()]
+        );
+        // 非引用：缺日期段 / 段长不符 / 前缀非 T|I / 无 @
+        for bad in ["@T-2026-01", "@X-20261107-01", "@T-2026110-01", "@T-20261107-1", "T-20261107-01"] {
+            assert!(extract_refs(bad).is_empty(), "不应命中: {bad}");
+        }
+        // 三位序号（>99 后的形状）
+        assert_eq!(extract_refs("@T-20261107-100"), vec!["T-20261107-100".to_string()]);
+        assert!(extract_refs("").is_empty());
+    }
+
+    /// C 轮：引用渲染的三种结局（命中 / 全缺失 / 无引用）。纯函数入参 = 不碰进程环境，
+    /// 与既有 WORKSPACE_ROOT 相关测试零串扰（初版用 set_var 版本实测红过）。
+    #[test]
+    fn render_refs_three_outcomes() {
+        use super::board_ctx::{render_open_tasks, render_refs};
+        let board = json!({
+            "version": 1,
+            "tasks": [
+                {
+                    "id": "T-20261107-01", "title": "评价体系", "status": "doing", "priority": "P1",
+                    "goal": "把自证换成证据",
+                    "plan": [{"step": "契约", "status": "completed"},
+                             {"step": "执行器", "status": "in_progress"}],
+                    "acceptance": ["eval 能跑"],
+                    "checks": [{"id": "c1", "kind": "cmd", "name": "pytest", "status": "pass"}],
+                    "evaluation": {"verdict": "pass", "pass": 1, "fail": 0, "skip": 0},
+                    "resourcing": {"model": "current", "effort": "large", "skills": ["project-dev"]},
+                    "artifacts": ["docs/x.md"],
+                    "progress": {"done": 1, "total": 2, "note": "契约已定"}
+                },
+                {
+                    "id": "T-20261107-02", "title": "收尾项", "status": "done", "priority": "P2",
+                    "progress": {"done": 2, "total": 2, "note": ""}
+                }
+            ],
+            "inspirations": [
+                {"id": "I-20261107-01", "text": "看板要有约束", "tags": ["ui"],
+                 "status": "open", "tasks": []}
+            ]
+        });
+
+        // ① 命中引用：任务与灵感都渲染，含计划/验收/检查结论/人财物/产物
+        let hit = render_refs("看 @T-20261107-01 和 @I-20261107-01", &board);
+        assert!(hit.contains("Board references"), "缺 header: {hit}");
+        assert!(hit.contains("评价体系") && hit.contains("progress=1/2"), "任务正文缺失: {hit}");
+        assert!(hit.contains("[x] 契约"), "计划状态标记缺失: {hit}");
+        assert!(hit.contains("verdict=pass"), "评价结论缺失: {hit}");
+        assert!(hit.contains("project-dev"), "人财物缺失: {hit}");
+        assert!(hit.contains("docs/x.md"), "产物缺失: {hit}");
+        assert!(hit.contains("看板要有约束"), "灵感正文缺失: {hit}");
+        assert!(!hit.contains("missing"), "不该报缺失: {hit}");
+
+        // ② 全缺失：不得注入空壳 header，改为显式提示陈旧引用
+        let miss = render_refs("看 @T-20990101-01", &board);
+        assert!(miss.contains("not on the board"), "陈旧引用应显式提示: {miss}");
+        assert!(!miss.contains("Board references (auto-loaded"), "全缺失别装成已装载: {miss}");
+
+        // ③ 无引用 → 空串（调用方决定是否退化）
+        assert_eq!(render_refs("没有引用的一句话", &board), "");
+
+        // ④ 在办摘要排除 done/cancelled
+        let digest = render_open_tasks(&board);
+        assert!(digest.contains("Open tasks on the board"), "缺摘要 header: {digest}");
+        assert!(digest.contains("T-20261107-01"), "摘要应含在办任务: {digest}");
+        assert!(!digest.contains("T-20261107-02"), "done 任务不该出现在在办摘要: {digest}");
+    }
+
+    /// C 轮：看板通道说明只在有 CLI 时出现，full 才讲评价纪律。
+    #[test]
+    fn board_ops_hint_scales_by_flag_and_cli() {
+        use super::board_ctx::board_ops_hint;
+        assert!(board_ops_hint(true, false).is_empty(), "无 CLI 不得注入");
+        let brief = board_ops_hint(false, true);
+        let full = board_ops_hint(true, true);
+        assert!(brief.contains("auto-loaded"), "brief 必须说明 @引用已自动装载");
+        assert!(!brief.contains("eval <ID>"), "brief 不得含评价纪律");
+        assert!(full.contains("eval <ID>"), "full 必须给评价执行通道");
+        assert!(full.contains("digest --skill"), "full 必须给同类归纳通道");
+        assert!(full.len() > brief.len(), "full 必须比 brief 长");
+    }
+
+    /// I-20261114-05：技能注册表失败**不得连坐**看板通道段。
+    ///
+    /// 实测故障链（2026-11-14）：`skills/project-dev/SKILL.md` 尾部混入 GBK 字节 →
+    /// assets 插件 `read_text(encoding="utf-8")` 抛 UnicodeDecodeError（**不是**
+    /// OSError，旧代码没捕）→ `skills.list` 整条 K500 → `skills_appendix` 首行
+    /// `return String::new()` → 看板纪律段 / @引用说明 / 分解 / 并行 / 三档 全部消失。
+    /// 用户能观察到的唯一症状是「新窗口的会话不把活登记进看板」，报错一个字都看不到。
+    ///
+    /// 本用例守的是「降级边界」：技能段可以整段不注入，看板段必须在。
+    /// 为什么不用 mock 去造 assets 失败：`skills_appendix` 需要 Envelope + kernel
+    /// handle（集成态才有），单测里造不出来。故把不变量拆成可纯函数验证的两半：
+    ///   ① `task_board_section` 与技能列表**无数据依赖**（技能为空也照样产出）；
+    ///   ② 失败路径上不得再出现 `return String::new()` 提前返回（源码级断言，
+    ///      与 tests 里既有的「锚点/契约」测法同款）。
+    #[test]
+    fn board_section_survives_skills_list_failure() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (old_ws, old_home) = (
+            std::env::var_os("WORKSPACE_ROOT"),
+            std::env::var_os("RSI_HOME"),
+        );
+        let dir = std::env::temp_dir().join(format!("ra-bctx-nolink-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("scripts")).expect("mkdir");
+        std::fs::write(dir.join("scripts").join("board.py"), "print('x')\n").expect("write");
+        std::env::set_var("RSI_HOME", &dir);
+        std::env::set_var("WORKSPACE_ROOT", dir.join("user-project"));
+
+        // ① 看板段不依赖技能注册表：技能为空/失败时仍必须产出。
+        assert!(!AgentLoopPlugin::task_board_section(false).is_empty());
+        assert!(!AgentLoopPlugin::task_board_section(true).is_empty());
+        assert!(super::board_ctx::board_ops_hint(false, super::board_ctx::has_board_cli())
+            .contains("auto-loaded"));
+        assert!(!super::board_ctx::decompose_hint().is_empty());
+        assert!(!super::board_ctx::parallel_hint().is_empty());
+        assert!(!super::board_ctx::routing_hint().is_empty());
+
+        // ② 源码级：skills.list 失败分支只降级技能段，不得再提前返回整段。
+        let src = include_str!("skills.rs");
+        let fail_branch = src
+            .split("Err(e) => {")
+            .find(|chunk| chunk.contains("skills.list 失败"))
+            .expect("失败分支必须存在且带可读日志");
+        let upto = &fail_branch[..fail_branch.len().min(600)];
+        assert!(
+            !upto.contains("return String::new()"),
+            "skills.list 失败时不得 return 整段空串（那会连看板段一起吞掉）: {upto}"
+        );
+
+        match old_ws {
+            Some(v) => std::env::set_var("WORKSPACE_ROOT", v),
+            None => std::env::remove_var("WORKSPACE_ROOT"),
+        }
+        match old_home {
+            Some(v) => std::env::set_var("RSI_HOME", v),
+            None => std::env::remove_var("RSI_HOME"),
+        }
+    }
+
+    /// 任务看板触发词判定：交代成规模的事才注入完整规范，闲聊不触发。
+    #[test]
+    fn want_task_plan_detection() {
+        // 命中：任务性动作词 / 显式看板语义 / @引用
+        for t in ["帮我把左栏改成任务看板", "实现单会话形态", "优化一下前端", "@T-20261107-01 继续",
+                  "@I-20261107-01 这个想法做掉", "refactor the web layer", "build a new module"] {
+            assert!(AgentLoopPlugin::user_wants_task_plan(t), "应命中: {t}");
+        }
+        // 不命中：闲聊 / 过短
+        for t in ["在吗", "谢谢", "这是什么", "hi", "   "] {
+            assert!(!AgentLoopPlugin::user_wants_task_plan(t), "不应命中: {t}");
+        }
+    }
+
+    /// 任务看板提示段：CLI 能力锚定**代码根**，与工作区无关；full 才给规范。
+    ///
+    /// v10 语义变更（本测试重写）：旧版断言「工作区没有 board.py → 不注入」，
+    /// 那条规则正是 bug 本身——用户开「新窗口」把 WORKSPACE_ROOT 换成自己的项目后，
+    /// 看板段就整段消失，于是子窗口的看板永远收不到任务。
+    /// 现在的不变量是：**换工作区不影响能力**，只要代码根有 CLI 就注入。
+    #[test]
+    fn task_board_section_requires_cli_and_scales_by_flag() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (old_ws, old_home) = (
+            std::env::var_os("WORKSPACE_ROOT"),
+            std::env::var_os("RSI_HOME"),
+        );
+        let dir = std::env::temp_dir().join(format!("ra-board-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("scripts")).expect("mkdir");
+        std::fs::write(dir.join("scripts").join("board.py"), "print('x')\n").expect("write");
+        // 代码根（带 CLI）与工作区（用户项目，无 CLI）分开摆——这就是「新窗口」形态。
+        std::env::set_var("RSI_HOME", &dir);
+        let proj = dir.join("user-project");
+        std::fs::create_dir_all(&proj).expect("mkdir project");
+        std::env::set_var("WORKSPACE_ROOT", &proj);
+
+        let brief = AgentLoopPlugin::task_board_section(false);
+        let full = AgentLoopPlugin::task_board_section(true);
+        assert!(!brief.is_empty(), "代码根有 CLI 时，换工作区也必须注入（这是 bug 的回归点）");
+        assert!(brief.contains("board.py"), "brief 必须点明 CLI 通道");
+        assert!(brief.contains(&dir.to_string_lossy().replace('\\', "/")),
+                "提示词必须给绝对路径（子窗口 cwd 里没有 scripts/board.py）: {brief}");
+        // brief 不得含 full 档独有的「四个问题」教学（BS1 修判据）：
+        // 原判据是 `!brief.contains("resourcing.model")`——用**字段名**当代理，
+        // 于是 BS1 在 brief 里合法写出 schema（`resourcing.model` 是 schema 的一部分）
+        // 就被误判成「brief 含了完整规范」。
+        //
+        // 代理判据换成**行为性**的：full 档那段教学有唯一开头标记
+        // （"### How to register a task"），brief 里不得出现它。
+        // 这才是判据本来的意思——「brief 是指针，full 是教程」。
+        assert!(!brief.contains("### How to register a task"),
+                "brief 不得含 full 档的完整写作教程（BS1：schema 可在 brief，但教程不行）");
+        assert!(full.contains("### How to register a task"), "full 必须讲人财物");
+        assert!(full.contains("resourcing.model"), "full 必须讲人财物");
+        assert!(full.contains("acceptance"), "full 必须讲验收标准");
+        assert!(full.len() > brief.len(), "full 应比 brief 长");
+
+        // 代码根没有 CLI → 不注入（别的项目工作区不该凭空多出这段提示）
+        let empty = dir.join("no-cli-root");
+        std::fs::create_dir_all(&empty).expect("mkdir");
+        std::env::set_var("RSI_HOME", &empty);
+        assert!(AgentLoopPlugin::task_board_section(true).is_empty(), "无 CLI 时不得注入");
+
+        match old_ws {
+            Some(v) => std::env::set_var("WORKSPACE_ROOT", v),
+            None => std::env::remove_var("WORKSPACE_ROOT"),
+        }
+        match old_home {
+            Some(v) => std::env::set_var("RSI_HOME", v),
+            None => std::env::remove_var("RSI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BS1（I-20261116）：brief 档必须**自带 task-upsert 的最小 schema**。
+    ///
+    /// 故障（2026-11-16 实测，用户原话「新建窗口似乎又不能自动将会话中的任务做进看板了」）：
+    /// 子窗口的 agent 连撞 4 次 `task-upsert` 的 BAD_ARG（status: 'in_progress' /
+    /// id: 'T-blind-full' / acceptance 传字符串），第 4 次才对；make-video 子窗口
+    /// 则一次都没登记成功（查了 --help 就放弃）。
+    ///
+    /// 根因不是通道（CLI 绝对路径可达、数据是一本账），而是**规格不在调用点同框**：
+    /// brief 档只给命令名，schema 只在 full 档（靠关键词命中才注入）。于是
+    /// 「用户的话没命中关键词」的那一轮，模型手里只有命令名——只能猜，猜错就重试，
+    /// 重试到放弃时用户看到的就是「任务没进看板」。
+    ///
+    /// 不变量：**brief 档（每轮都在）必须含规格**，且规格里的两套状态枚举必须
+    /// 与 CLI 的真值一致——枚举漂移会把「写对」变成「写错」，比不给规格更糟。
+    #[test]
+    fn brief_board_section_carries_task_upsert_schema() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (old_ws, old_home) = (
+            std::env::var_os("WORKSPACE_ROOT"),
+            std::env::var_os("RSI_HOME"),
+        );
+        let dir = std::env::temp_dir().join(format!("ra-board-schema-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("scripts")).expect("mkdir");
+        std::fs::write(dir.join("scripts").join("board.py"), "print('x')\n").expect("write");
+        std::env::set_var("RSI_HOME", &dir);
+        let proj = dir.join("user-project");
+        std::fs::create_dir_all(&proj).expect("mkdir project");
+        std::env::set_var("WORKSPACE_ROOT", &proj);
+
+        let brief = AgentLoopPlugin::task_board_section(false);
+
+        // ① brief 档必须带 schema 段（不是只有命令名）
+        assert!(
+            brief.contains("task-upsert JSON schema"),
+            "brief 档必须带 task-upsert schema（这是子窗口撞墙的根因）: {brief}"
+        );
+        // ② 两套状态枚举都必须在，且**分清层级**——in_progress 只属 plan 步
+        for token in [
+            "planning|doing|verifying|done|blocked|cancelled",
+            "pending|in_progress|completed|cancelled",
+        ] {
+            assert!(brief.contains(token), "brief 缺枚举 {token}: {brief}");
+        }
+        // ③ 三个高频拒因必须点名（status 层级 / id 形状 / acceptance 是数组）
+        assert!(
+            brief.contains("in_progress` is NOT a task"),
+            "brief 必须点明 in_progress 不是 task 级状态: {brief}"
+        );
+        assert!(
+            brief.contains("T-YYYYMMDD-NN"),
+            "brief 必须点明 id 形状与「省略即自动分配」: {brief}"
+        );
+        assert!(
+            brief.contains("acceptance`: an **ARRAY**"),
+            "brief 必须点明 acceptance 必须是数组: {brief}"
+        );
+
+        // ④ full 档也必须带 task 级枚举（brief 是子集，full 不得反而没有）
+        let full = AgentLoopPlugin::task_board_section(true);
+        assert!(
+            full.contains("planning|doing|verifying|done|blocked|cancelled"),
+            "full 档也必须带 task 级枚举"
+        );
+
+        match old_ws {
+            Some(v) => std::env::set_var("WORKSPACE_ROOT", v),
+            None => std::env::remove_var("WORKSPACE_ROOT"),
+        }
+        match old_home {
+            Some(v) => std::env::set_var("RSI_HOME", v),
+            None => std::env::remove_var("RSI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S 轮分流提示段：三档判据必须可判定（对象数），且**不确定时取便宜的一档**。
+    ///
+    /// 为什么这条值得被测试钉住（而不是只写在提示词里）：
+    /// 分流段最容易退化成的两种样子都是静默的——① 三档删到只剩两档（退化成原来的
+    /// 「像任务 / 不像任务」，也就是这条补丁想修的病本身）；② 判据被改成「行数/token」
+    /// 这类模型无法自估的量，写了等于没写。两者在提示词里都「看起来还行」，只有
+    /// 断言关键判据与决胜规则才能拦住。
+    #[test]
+    fn routing_hint_declares_three_tiers_and_tie_break() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (old_home,) = (std::env::var_os("RSI_HOME"),);
+        let dir = std::env::temp_dir().join(format!("ra-routing-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("scripts")).expect("mkdir");
+        std::fs::write(dir.join("scripts").join("board.py"), "print('x')\n").expect("write");
+        std::env::set_var("RSI_HOME", &dir);
+
+        let h = super::board_ctx::routing_hint();
+        assert!(!h.is_empty(), "代码根有 CLI 时必须有分流段");
+        // 三档都在，且各自绑了「不做什么」——只有档名没有禁令的提示词不会改变行为
+        for tier in ["**S — answer directly.**", "**M — small change.**", "**L — project-level.**"] {
+            assert!(h.contains(tier), "缺档位: {tier}\n{h}");
+        }
+        // 判据必须是可观测对象数，不是行数/token
+        assert!(h.contains("how many objects will change"), "判据必须落在可观测对象数上");
+        assert!(!h.to_lowercase().contains("token count"), "不得用 token 数当判据");
+        // 决胜规则：不确定时取更便宜的一档（这条决定分流是否真能省钱）
+        assert!(h.contains("CHEAPER"), "必须明确『不确定时取更便宜的一档』");
+        assert!(h.contains("escalate"), "必须给升级条件，否则会一路做薄");
+        // L 档必须指向 project-dev，否则「项目级」没有去处
+        assert!(h.contains("project-dev"), "L 档必须指定 project-dev");
+        // 两条不变量：M/L 不跳验证、不为显忙建任务
+        assert!(h.contains("never skipped"), "验证不得因降档而跳过");
+        assert!(h.contains("look busy"), "不得为显忙而建任务");
+
+        // 代码根没有 CLI → 不注入（与 decompose/parallel 同一门控）
+        let empty = dir.join("no-cli-root");
+        std::fs::create_dir_all(&empty).expect("mkdir");
+        std::env::set_var("RSI_HOME", &empty);
+        assert!(super::board_ctx::routing_hint().is_empty(), "无 CLI 时不得注入");
+
+        match old_home {
+            Some(v) => std::env::set_var("RSI_HOME", v),
+            None => std::env::remove_var("RSI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// B1 效率约束：内置提示词必须含批量/专用工具/收敛三条，且不删原有纪律。
     #[test]
     fn default_prompt_has_efficiency_discipline() {
@@ -747,5 +1196,74 @@ mod tests {
         assert!(has_acceptance_marker("Acceptance criteria checked"));
         assert!(has_acceptance_marker("todo checklist"));
         assert!(!has_acceptance_marker("已完成，结果如下"));
+    }
+
+    /// P0-C 核心断言：工作集尾部按 token 预算裁剪后，规模有界且保留 system 头。
+    ///
+    /// 实测背景：压缩后持久层留 30 条，每条工具结果可达 8K 字符 → 每轮原样发给
+    /// 模型 ≈ 120K tokens；每请求 cache_read 平台值 170–200K，而当日 77.1% 的
+    /// credits 来自 cache_read。裁剪只作用于工作集，持久层不受影响。
+    #[test]
+    fn trim_workset_bounds_tokens_and_keeps_system_head() {
+        use crate::chat::trim_workset_by_tokens;
+        let m = |role: &str, body: &str| MemoryMsg {
+            role: role.into(),
+            content: Some(body.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+        };
+        // system 头 + 20 条 8K 字符的消息（远超预算）
+        let big = "x".repeat(8000);
+        let mut msgs = vec![m("system", "SYS")];
+        for _ in 0..20 {
+            msgs.push(m("tool", &big));
+        }
+        let out = trim_workset_by_tokens(msgs.clone(), 10_000);
+        assert_eq!(out[0].content.as_deref(), Some("SYS"), "system 头必须保留");
+        assert!(out.len() < msgs.len(), "超预算时必须裁剪：{} vs {}", out.len(), msgs.len());
+        assert!(
+            crate::context::estimate_messages(&out) <= 10_000 + 8_000,
+            "裁剪后规模应回到预算附近：{:}",
+            crate::context::estimate_messages(&out)
+        );
+    }
+
+    /// 未超预算时不动（幂等）：裁剪不能改变正常规模的工作集。
+    #[test]
+    fn trim_workset_is_noop_when_within_budget() {
+        use crate::chat::trim_workset_by_tokens;
+        let m = |role: &str, body: &str| MemoryMsg {
+            role: role.into(),
+            content: Some(body.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+        };
+        let msgs = vec![m("system", "SYS"), m("user", "hello"), m("assistant", "hi")];
+        let out = trim_workset_by_tokens(msgs.clone(), 100_000);
+        assert_eq!(out.len(), msgs.len());
+        assert_eq!(out[0].content.as_deref(), Some("SYS"));
+    }
+
+    /// 前缘孤儿 tool 消息必须丢弃：其配对的 assistant(tool_calls) 已被裁掉，
+    /// 孤儿回喂会被 provider 拒收。
+    #[test]
+    fn trim_workset_drops_orphan_tool_messages() {
+        use crate::chat::trim_workset_by_tokens;
+        let m = |role: &str, body: &str| MemoryMsg {
+            role: role.into(),
+            content: Some(body.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+        };
+        let big = "y".repeat(8000);
+        // [sys, tool(孤儿), tool(孤儿), user(小)] —— 预算只够留 user
+        let msgs = vec![m("system", "SYS"), m("tool", &big), m("tool", &big), m("user", "ok")];
+        let out = trim_workset_by_tokens(msgs, 20);
+        assert_eq!(out.len(), 2, "只留 system + user：{:?}", out.iter().map(|x| x.role.clone()).collect::<Vec<_>>());
+        assert_eq!(out[0].role, "system");
+        assert_eq!(out[1].role, "user");
     }
 }

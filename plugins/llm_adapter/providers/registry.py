@@ -30,6 +30,16 @@ def _validate(name: str, spec) -> None:
             raise TypeError(f"provider '{name}': embed 必须可调用")
         if len(inspect.signature(spec["embed"]).parameters) != 1:
             raise TypeError(f"provider '{name}': embed 签名必须为 embed(payload) -> dict")
+    # capabilities 是**可选**的声明式能力表：缺失 = 能力未知（合法，不报错）。一旦声明，
+    # 必须是 {能力名: bool} 的扁平 dict——仅供 UI / 选路读取，不参与运行期分派
+    # （分派仍看 chat/embed 是否可调用）。值非 bool 视为声明笔误，导入期即拒绝。
+    caps = spec.get("capabilities")
+    if caps is not None:
+        if not isinstance(caps, dict):
+            raise TypeError(f"provider '{name}': capabilities 必须是 dict")
+        for ck, cv in caps.items():
+            if not isinstance(cv, bool):
+                raise TypeError(f"provider '{name}': capabilities[{ck!r}] 必须是 bool")
     if spec["name"] in PROVIDERS:
         raise TypeError(f"provider 重名: {spec['name']}")
 

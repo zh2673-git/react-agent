@@ -73,7 +73,8 @@ impl HostSpec {
         assets_env.push(("WORKSPACE_ROOT".into(), config::workspace_root()));
         Self {
             node_id: "react-agent".into(),
-            max_total_inflight: 32,
+            // Q 轮：全局槽位可配（缺省 32；非法值回退缺省，assemble 单测断言不变）。
+        max_total_inflight: std::env::var("AGENT_MAX_TOTAL_INFLIGHT").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n >= 8 && *n <= 1024).unwrap_or(32),
             plugins: vec![
                 PluginSpec {
                     id: "memory".into(),
@@ -102,7 +103,9 @@ impl HostSpec {
                     optional: false,
                     probe: Some(ProbeSpec {
                         payload: json!({"op": "chat", "messages": [{"role": "user", "content": "ping"}]}),
-                        timeout_secs: 120,
+                        // 软依赖：网关不可达时 8s 即降级放行（旧值 120s 会让启动/开窗干等两分钟），
+                        // 真正的 chat 请求自带超时与重试，启动探测无需等满。
+                        timeout_secs: 8,
                         label: format!("llm-adapter(py, provider={})", cfg.llm_provider),
                         soft: true,
                     }),
@@ -255,7 +258,9 @@ fn runtime_name(runtime: PluginRuntime) -> &'static str {
     }
 }
 
-/// R18：技能工具池启动预热——逐技能 assets.load → tools.install（幂等）。
+/// R18：技能工具池启动预热——从 skills.list 一次性取回工具清单路径，并发 tools.install（幂等）。
+/// 旧实现逐技能 skills.load → tools.install，18 个技能 = 36 次串行 gRPC + assets 每次重扫目录；
+/// 现在 skills.list 已带 tools_manifest_path（仅声明了 tools 的技能），省掉整轮 load 往返。
 async fn warm_skill_tools(kernel: &Kernel) -> anyhow::Result<usize> {
     let list = tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -263,42 +268,37 @@ async fn warm_skill_tools(kernel: &Kernel) -> anyhow::Result<usize> {
     )
     .await
     .map_err(|_| anyhow::anyhow!("skills.list 探测超时"))??;
-    let names: Vec<String> = list
+    let jobs: Vec<(String, String, String)> = list
         .get("skills")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|s| s.get("name").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|s| {
+            let name = s.get("name").and_then(Value::as_str)?;
+            let path = s.get("tools_manifest_path").and_then(Value::as_str)?;
+            if path.is_empty() {
+                return None;
+            }
+            let origin = s.get("origin").and_then(Value::as_str).unwrap_or("user");
+            Some((name.to_string(), path.to_string(), origin.to_string()))
+        })
         .collect();
-    let mut warmed = 0usize;
-    for name in names {
-        let loaded = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            kernel.dispatch(Envelope::new(PluginId::new("assets"), json!({"op": "skills.load", "name": name}))),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("skills.load({name}) 超时"))??;
-        if loaded.get("ok") != Some(&json!(true)) {
-            continue;
-        }
-        let Some(path) = loaded
-            .get("tools_manifest")
-            .and_then(|m| m.get("path"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        else {
-            continue;
-        };
-        let origin = loaded.get("origin").and_then(Value::as_str).unwrap_or("user");
+    // 工具插件 concurrent=true；并发 install 互不依赖，join_all 把 N×15s 串行降到单次最慢。
+    let installs = jobs.into_iter().map(|(name, path, origin)| async move {
         let r = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             kernel.dispatch(Envelope::new(PluginId::new("tools"), json!({"op": "install", "path": path, "skill": name, "origin": origin}))),
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("tools.install({name}) 超时"))??;
-        match r.get("ok") {
-            Some(&json!(true)) => warmed += 1,
-            other => tracing::warn!("技能工具预热装载失败（skill={name}）: {other:?}"),
+        .await;
+        (name, r)
+    });
+    let mut warmed = 0usize;
+    for (name, r) in join_all(installs).await {
+        match r {
+            Ok(Ok(resp)) if resp.get("ok") == Some(&json!(true)) => warmed += 1,
+            Ok(Ok(other)) => tracing::warn!("技能工具预热装载失败（skill={name}）: {other:?}"),
+            Ok(Err(e)) => tracing::warn!("技能工具预热 dispatch 失败（skill={name}）: {e}"),
+            Err(_) => tracing::warn!("技能工具预热超时（skill={name}，>15s）"),
         }
     }
     Ok(warmed)

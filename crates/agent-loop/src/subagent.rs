@@ -29,15 +29,17 @@ impl AgentLoopPlugin {
     /// 子代理（Phase 3-3）：新 session_id 复用 agent.chat 全链路（提示词组装/记忆/工具/事件日志）。
     /// 委派深度随链传播：`depth >= 1`（已在子代理内）→ 字段级拒绝再嵌套；
     /// 子会话事件日志独立（session_id 关联可追溯）。
-    /// 预算随链衰减（T4）：`budget_snap` = (剩余ms, 剩余token) 写入子 chat 请求；
-    /// 预算未启用（两者皆 None）→ 不携带，子链退化为各自的 env 缺省（同为禁用）。
+    /// 预算随链衰减（T4）+ 任务级共享账（P4b）：`budget_snap` =
+    /// `(剩余ms, 剩余token, 任务根会话id)` 写入子 chat 请求；剩余 token 由父链按本批
+    /// 派发个数切分（兄弟子代理分食同一份剩余，不再各拿满额）。
+    /// 预算未启用（两者皆 None）→ 只透传任务根，子链退化为各自的 env 缺省（同为禁用）。
     pub(super) async fn run_subagent(
         &self,
         src: &Envelope,
         parent_session: &str,
         task_text: &str,
         depth: u32,
-        budget_snap: Option<(Option<u64>, Option<u64>)>,
+        budget_snap: Option<(Option<u64>, Option<u64>, String)>,
     ) -> Value {
         if depth >= 1 {
             return json!({"ok": false, "error": {"code": "K400", "message": "task 不支持嵌套委派（子代理内不可再调用 task）"}});
@@ -47,13 +49,15 @@ impl AgentLoopPlugin {
         self.trace(src, parent_session, json!({"type": "subagent", "sub_session": sub_session, "task": task_text}))
             .await;
         let mut payload = json!({"op": "chat", "session_id": sub_session, "user_text": task_text, "depth": depth + 1});
-        if let Some((ms_left, toks_left)) = budget_snap {
+        if let Some((ms_left, toks_left, ref root)) = budget_snap {
             if let Some(ms) = ms_left {
                 payload["budget_ms_left"] = json!(ms);
             }
             if let Some(toks) = toks_left {
                 payload["tokens_left"] = json!(toks);
             }
+            // P4b：任务根会话 id 随链透传——子代理据此把用量写进同一本花费账。
+            payload["budget_root"] = json!(root);
         }
         // D2 对齐（内核 v0.1.4+）：子代理回归内核 dispatch——不再进程内直调 chat_body。
         // 收益：① 嵌套编排进入调度账本（per-plugin max_inflight / 全局闸真实计数，
@@ -63,7 +67,7 @@ impl AgentLoopPlugin {
         // 链路语义，故此处走 call_plugin；寻址按自身 PluginId，组合根装配的名字）。
         let mut env = Envelope::new(PluginId::new(ID), payload);
         env.trace_id = src.trace_id;
-        if let Some((Some(ms), _)) = budget_snap {
+        if let Some((Some(ms), _, _)) = budget_snap {
             env.deadline = Some(Duration::from_millis(ms));
         }
         let Some(host) = self.host.get() else {

@@ -224,7 +224,12 @@ def _read_file(args: dict) -> str:
     if real.is_dir():
         raise ToolError(f"'{real}' 是目录；读目录请用 list_dir", code="IS_DIR", field="path")
     if not real.exists():
-        raise ToolError(f"文件不存在: '{_display(real)}'", code="NOT_FOUND", field="path")
+        raise ToolError(
+            f"文件不存在: '{_display(real)}'——先用 list_dir 确认路径（父目录是否存在），"
+            "再决定是拼错路径还是文件确实不存在；不要用 bash 反复 dir/findstr 盲试。",
+            code="NOT_FOUND",
+            field="path",
+        )
     raw = real.read_bytes()
     kind = _sniff_binary(raw)
     if kind is not None:
@@ -375,7 +380,12 @@ def _edit_file(args: dict) -> dict:
     if old == new:
         raise ToolError("old_string 与 new_string 相同，无需编辑", code="NO_OP", field="new_string")
     if not real.exists():
-        raise ToolError(f"文件不存在: '{_display(real)}'（新建文件请用 write_file）", code="NOT_FOUND", field="path")
+        raise ToolError(
+            f"文件不存在: '{_display(real)}'（新建文件请用 write_file）——"
+            "若路径是猜的，先用 list_dir 确认；不要用 bash 反复盲试。",
+            code="NOT_FOUND",
+            field="path",
+        )
     text, _, enc = _read_text(real)
     write_enc = "utf-8" if enc == "utf-8(replace)" else enc
     mode = "exact"
@@ -501,7 +511,12 @@ def _snapshot_change(before_raw: bytes | None, after_raw: bytes | None) -> dict 
 def _list_dir(args: dict) -> str:
     real = _guard(str(args.get("path") or "."))
     if not real.exists():
-        raise ToolError(f"目录不存在: '{_display(real)}'", code="NOT_FOUND", field="path")
+        raise ToolError(
+            f"目录不存在: '{_display(real)}'——用 list_dir 列当前目录（path='.'）确认实际结构；"
+            "不要用 bash 反复 dir/where/findstr 盲试（每次盲试都多烧一轮模型调用）。",
+            code="NOT_FOUND",
+            field="path",
+        )
     if not real.is_dir():
         raise ToolError(f"'{_display(real)}' 是文件；读文件请用 read_file", code="IS_FILE", field="path")
     pattern = args.get("glob") or "*"

@@ -6,16 +6,33 @@
 //! - [`skills`]：技能 CRUD（/api/skills）与 frontmatter 校验 / origin 打标
 //! - [`misc`]：session-exists / presets / models / reveal / 多实例端点（W17）
 //! 本文件保留共享件：R3 附件校验（`/api/chat` 闸）。
+mod board;
 mod config;
+mod git_auth;
 mod misc;
+mod profile;
+mod publish;
+mod routegroups;
 mod skills;
 
+pub(super) use board::{get_board, get_board_link, post_board};
 pub(super) use config::{get_config, put_config};
 pub(super) use misc::{
     create_instance, delete_instance, get_models, get_presets, list_instances, pick_folder,
-    reveal_target, session_exists,
+    reveal_target, self_update_start, self_update_status, session_exists, upstream_accounts,
+    upstream_checkin, upstream_login, upstream_providers, upstream_start, upstream_status,
 };
+pub(super) use misc::im_sessions;
+pub(super) use git_auth::get_git_auth;
+pub(super) use profile::{get_profile, post_profile};
+pub(super) use publish::{get_publish_config, post_publish_config};
 pub(super) use skills::{delete_skill, get_skill, get_skills, put_skill};
+// 路由组 API（P2）：re-export 追加在 skills 之后，**不**按字母序插进 publish/skills 之间——
+// 既有补丁 I07-REEXPORT 的幂等判据是 publish→skills 两行连续文本，中间插行会让它永久 FAIL。
+pub(super) use routegroups::{
+    routegroups_create, routegroups_list, routegroups_options, routegroups_rm,
+    routegroups_restore, routegroups_set, routegroups_show,
+};
 
 use super::bad_request;
 use serde_json::{json, Value};

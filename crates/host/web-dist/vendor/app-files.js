@@ -61,7 +61,10 @@ function renderFileChange(ev) {
   chip.onclick = () => openFcDrawer(chip._items);
   if (!turnFcBox) { ensureTurnTail().appendChild(chip); turnFcBox = chip; scrollFeed(); }
 }
-function resetFileChanges() { fcSeen.clear(); }
+function resetFileChanges() { fcSeen.clear(); turnFcBox = null; }
+// Q 轮：文件变更登记是纯数据 Map，随会话快照恢复（DOM chip 已由 innerHTML 恢复）。
+function snapshotFileChanges() { return [...fcSeen.entries()]; }
+function restoreFileChanges(entries) { fcSeen.clear(); for (const [k, v] of entries || []) fcSeen.set(k, v); turnFcBox = null; }
 function openFcDrawer(items) {
   let d = $("fc-drawer");
   if (!d) {

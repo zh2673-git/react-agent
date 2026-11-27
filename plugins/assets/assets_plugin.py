@@ -61,7 +61,13 @@ def _scan_skills(root: Path) -> dict:
             continue
         try:
             meta = _parse_frontmatter(skill_md.read_text(encoding="utf-8")[:65536])
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
+            # 编码坏 ≠ 读不了（I-20261114-05 的真实根因）：UnicodeDecodeError **不是**
+            # OSError，原先只捕 OSError，于是单个 SKILL.md 里的 GBK 脏字节一路穿透
+            # on_event → skills.list 整条 K500。而 agent-loop 的 skills_appendix 在
+            # 调用失败时**提前 return**，连后面的看板/分解/并行/三档段一起吞掉——
+            # 用户看到的现象是「新窗口会话不登记任务」，与编码毫无可见关联。
+            # 一个技能坏掉只该少那一个技能，不该少整段提示词。
             print(f"[assets] 读取失败，跳过 {d.name}: {exc}", file=sys.stderr)
             continue
         if meta is None:
@@ -91,7 +97,7 @@ def _scan_prompts(root: Path) -> dict:
     for f in sorted(root.glob("*.md")):
         try:
             text = f.read_text(encoding="utf-8")[:65536]
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             print(f"[assets] 读取失败，跳过 {f.name}: {exc}", file=sys.stderr)
             continue
         lines = [ln.strip() for ln in text.splitlines()]
@@ -105,6 +111,28 @@ def _scan_prompts(root: Path) -> dict:
     return catalog
 
 
+def _skills_signature(root: Path) -> tuple:
+    """目录指纹：目录 mtime + 每个 SKILL.md 的 (mtime_ns, size)。
+    stat 比 read+parse 整份 SKILL.md 便宜一个数量级；用它判断缓存是否过期，
+    既保留「Web CRUD / 自扩展写盘即时可见」，又让启动预热的 18 次连读不重复扫目录。"""
+    try:
+        parts = [root.stat().st_mtime_ns]
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
+                continue
+            md = d / "SKILL.md"
+            if not md.is_file():
+                continue
+            try:
+                st = md.stat()
+                parts.append((d.name, st.st_mtime_ns, st.st_size))
+            except OSError:
+                parts.append((d.name, -1, -1))
+        return tuple(parts)
+    except OSError:
+        return ()
+
+
 class AssetsPlugin:
     def manifest(self) -> dict:
         return {"id": "assets", "version": "0.1.0", "api_version": "0.1"}
@@ -115,14 +143,24 @@ class AssetsPlugin:
         self._prompts_root = Path(os.environ.get("PROMPTS_DIR") or here / "prompts")
         self._skills_root.mkdir(parents=True, exist_ok=True)
         self._prompts_root.mkdir(parents=True, exist_ok=True)
-        self._skills = _scan_skills(self._skills_root)
+        self._skills = {}
+        self._skills_sig = None
+        self._skills_ensure()
         self._prompts = _scan_prompts(self._prompts_root)
+
+    def _skills_ensure(self) -> dict:
+        """指纹未变直接复用缓存；变了才重扫。写盘后 stat 立即变化，语义等价每次重扫。"""
+        sig = _skills_signature(self._skills_root)
+        if sig != self._skills_sig:
+            self._skills = _scan_skills(self._skills_root)
+            self._skills_sig = sig
+        return self._skills
 
     def on_event(self, envelope: dict) -> dict:
         payload = envelope.get("payload") or {}
         op = payload.get("op")
         if op == "skills.list":
-            self._skills = _scan_skills(self._skills_root)  # 每次重扫：Web CRUD / 自扩展写盘即时可见
+            self._skills = self._skills_ensure()  # 指纹变了才重扫：Web CRUD / 自扩展写盘即时可见
             return {
                 "ok": True,
                 "skills": [
@@ -130,22 +168,23 @@ class AssetsPlugin:
                     # origin 显式回传 preset|user（Phase A，老消费方忽略即兼容）
                     {"name": n, "description": s["description"], "origin": s["origin"],
                      "status": s.get("status", "draft"), "verification": s.get("verification", "unverified"),
-                     **({"tools": True} if s.get("tools") else {})}
+                     **({"tools": True, "tools_manifest_path": str(s["path"].parent / s["tools"])} if s.get("tools") else {})}
                     for n, s in self._skills.items()
                 ],
                 "root": str(self._skills_root),
             }
         if op == "skills.load":
             name = payload.get("name")
-            self._skills = _scan_skills(self._skills_root)  # 读取前重扫：刚写入的技能立即可激活
+            self._skills = self._skills_ensure()  # 指纹变了才重扫：刚写入的技能立即可激活
             entry = self._skills.get(name)
             if entry is None:
                 avail = ", ".join(sorted(self._skills)) or "（无）"
                 return _err(f"unknown skill: {name}（可用: {avail}）", code="UNKNOWN_SKILL")
             try:
                 content = entry["path"].read_text(encoding="utf-8")[:_MAX_LOAD_BYTES]
-            except OSError as exc:
-                return _err(f"skill 读取失败: {exc}")
+            except (OSError, UnicodeDecodeError) as exc:
+                # 同 _scan_skills：编码坏要给出可读错误，而不是让 KernelError 冒到前端
+                return _err(f"skill 读取失败（编码/IO）: {exc}", code="ASSET_ENCODING")
             resp = {"ok": True, "content": content, "origin": entry["origin"],
                     "status": entry.get("status", "draft"), "verification": entry.get("verification", "unverified")}
             # origin 随 load 回传（tools.install 据此自动启用出厂技能工具；缺省消费方忽略即兼容）
@@ -166,7 +205,7 @@ class AssetsPlugin:
             mode = payload.get("mode") or "full"
             if mode not in ("full", "install"):
                 return _err(f"未知 mode: {mode}（合法值: full, install）", code="K400")
-            self._skills = _scan_skills(self._skills_root)
+            self._skills = self._skills_ensure()
             entry = self._skills.get(name)
             if entry is None:
                 avail = ", ".join(sorted(self._skills)) or "（无）"
@@ -175,7 +214,7 @@ class AssetsPlugin:
         if op == "skills.state":
             # 读取优先；显式 set 走状态迁移表（不允许跳步），写入 state.json。
             name = payload.get("name")
-            self._skills = _scan_skills(self._skills_root)
+            self._skills = self._skills_ensure()
             entry = self._skills.get(name)
             if entry is None:
                 avail = ", ".join(sorted(self._skills)) or "（无）"

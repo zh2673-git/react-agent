@@ -90,6 +90,41 @@ pub(super) struct UsageAcc {
     cache_read: u64,
     reasoning: u64,
     seen: bool,
+    /// 累计的 provider 上报 HTTP 尝试次数（provider 内部重试已计入）。
+    /// None = 全部请求都未上报（旧 provider / 未接入观测），与「0 次」区分。
+    http_attempts: Option<u64>,
+}
+
+/// 计费权重：cache_read 相对 input 的单价比（env `CACHE_CREDIT_WEIGHT`，缺省 0.32）。
+///
+/// 实测口径（2026-11-16 `~/.config/magpie/usage.jsonl`，最小二乘拟合，误差 0.1%）：
+/// `credits ≈ 1.020e-05×in + 3.260e-06×cache_read + 1.223e-04×out + 0.0267`
+/// → cache_read 单价 = input 的 **32.0%**，output = input 的 **12.0 倍**。
+///
+/// 缺省 0.32 对齐实测；置 0 即刻退回旧口径（不计 cache_read）。
+/// 非法值 warn 后回退缺省（与 E3 的「消灭静默回退」纪律一致）。
+pub(super) fn cache_credit_weight() -> f64 {
+    const DEFAULT: f64 = 0.32;
+    match std::env::var("CACHE_CREDIT_WEIGHT") {
+        Ok(raw) => {
+            let v = raw.trim();
+            if v.is_empty() {
+                return DEFAULT;
+            }
+            match v.parse::<f64>() {
+                Ok(n) if n >= 0.0 => n,
+                Ok(_) => {
+                    tracing::warn!(target: crate::ID, "CACHE_CREDIT_WEIGHT={raw:?} 非法（应为非负数），回退缺省 {DEFAULT}");
+                    DEFAULT
+                }
+                Err(_) => {
+                    tracing::warn!(target: crate::ID, "CACHE_CREDIT_WEIGHT={raw:?} 非法（应为非负数），回退缺省 {DEFAULT}");
+                    DEFAULT
+                }
+            }
+        }
+        Err(_) => DEFAULT,
+    }
 }
 
 impl UsageAcc {
@@ -102,9 +137,34 @@ impl UsageAcc {
         self.reasoning += u.get("reasoning_tokens").and_then(Value::as_u64).unwrap_or(0);
     }
 
-    /// 计费口径（T4 预算）：input+output（cache_read 是折扣而非独立产出，不计入）。
+    /// 累计一次请求的 HTTP 尝试次数（P5 观测）。
+    ///
+    /// `None` = 该次请求未上报（旧 provider / 流式旁路），**不参与累计**——这样
+    /// 「未观测」既不会伪装成 0，也不会把已观测的次数冲掉。
+    pub(super) fn add_http_attempts(&mut self, n: Option<u64>) {
+        let Some(n) = n else { return };
+        self.http_attempts = Some(self.http_attempts.unwrap_or(0) + n);
+    }
+
+    /// 指标外抛用：累计 HTTP 尝试次数（None = 全部未上报 → 线契约落 null）。
+    ///
+    /// 刻意不进 `to_value()`：后者同时喂 `assistant.usage` 与 `chat_summary.tokens`，
+    /// 是既有冻结的四字段用量契约；观测指标只在 metrics / chat_summary 顶层单列。
+    pub(super) fn http_attempts_total(&self) -> Option<u64> {
+        self.http_attempts
+    }
+
+    /// 计费口径（T4 预算）：input+output+cache_read×权重。
+    ///
+    /// 为什么必须计入 cache_read：实测 provider 对 cache_read 的计费单价是 input 的
+    /// **32%**，而当日消耗的 **77.1%** 来自 cache_read——只算 input+output 等于
+    /// 只看见 1/9.4 的真实账单，token 预算闸在真实消耗面前完全失真。
+    ///
+    /// 权重可配（env `CACHE_CREDIT_WEIGHT`，缺省 0.32 = 实测单价比）：
+    /// 置 0 即刻退回旧口径（provider 若改变 cache 定价而不影响别的语义时用）。
     pub(super) fn total(&self) -> u64 {
-        self.input + self.output
+        let weight = cache_credit_weight();
+        self.input + self.output + (self.cache_read as f64 * weight) as u64
     }
 
     /// provider 未上报用量时返回 Null（前端据此不显示统计条，而非显示 0）。
@@ -156,5 +216,72 @@ impl AgentLoopPlugin {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod p0a_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn acc(input: u64, output: u64, cache_read: u64) -> UsageAcc {
+        let mut u = UsageAcc::default();
+        u.add(Some(&json!({
+            "input_tokens": input,
+            "output_tokens": output,
+            "cache_read_tokens": cache_read,
+        })));
+        u
+    }
+
+    fn weight() -> f64 {
+        cache_credit_weight()
+    }
+
+    /// P0-A 核心断言：total() 必须随 cache_read 增长——旧口径（input+output）
+    /// 完全无视 cache_read，导致 token 预算闸在真实账单面前漏 9.4 倍。
+    #[test]
+    fn total_counts_cache_read() {
+        let _g = env_lock().lock().unwrap();
+        std::env::set_var("CACHE_CREDIT_WEIGHT", "0.32");
+
+        let a = acc(1000, 100, 0);
+        let b = acc(1000, 100, 100_000);
+        assert_eq!(a.total(), 1100, "无 cache 时口径不变");
+        assert!(
+            b.total() > a.total(),
+            "cache_read 必须计入预算口径：{} vs {}",
+            b.total(),
+            a.total()
+        );
+        // 100000 × 0.32 = 32000
+        assert_eq!(b.total(), 1100 + 32_000);
+    }
+
+    /// 权重可配：置 0 即刻退回旧口径（provider 改定价时的应急开关）。
+    #[test]
+    fn weight_zero_restores_legacy_total() {
+        let _g = env_lock().lock().unwrap();
+        std::env::set_var("CACHE_CREDIT_WEIGHT", "0");
+        assert_eq!(weight(), 0.0);
+        assert_eq!(acc(1000, 100, 100_000).total(), 1100);
+        std::env::remove_var("CACHE_CREDIT_WEIGHT");
+        assert_eq!(weight(), 0.32, "缺省 = 实测单价比 32%");
+    }
+
+    /// 非法值 warn 后回退缺省（E3 纪律：消灭静默回退）。
+    #[test]
+    fn invalid_weight_falls_back_to_default() {
+        let _g = env_lock().lock().unwrap();
+        std::env::set_var("CACHE_CREDIT_WEIGHT", "not-a-number");
+        assert_eq!(weight(), 0.32);
+        std::env::set_var("CACHE_CREDIT_WEIGHT", "-1");
+        assert_eq!(weight(), 0.32, "负数非法 → 回退缺省");
+        std::env::remove_var("CACHE_CREDIT_WEIGHT");
     }
 }

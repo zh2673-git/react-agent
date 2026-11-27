@@ -138,6 +138,10 @@ impl HostConfig {
         const KEYS: &[&str] = &[
             // tools：工作区边界 / scope / 搜索链 / MCP server 声明
             "WORKSPACE_ROOT",
+            // v10：工具能力锚点 = 看板/画像 CLI 所在的**代码根**（不是工作区）。
+            // 子实例由 instances.rs 显式传入；这里透传给 tools/assets，
+            // 保证三个进程看到同一个锚点。
+            "RSI_HOME",
             "TOOLS_ENABLED",
             "ALLOW_CORE_WRITE",
             "MCP_SERVERS",
@@ -160,6 +164,12 @@ impl HostConfig {
             "AGENT_SYSTEM_PROMPT",
             "PROMPT",
             "HISTORY_LIMIT",
+            // embedding（B 通道）：技能脚本不经 agent loop，直接读 env 打 /embeddings。
+            // 与 MEDIA_* 同款持久通道语义——改后需重启 host。
+            "EMBEDDING_BASE_URL",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_KEY",
+            "EMBEDDING_EXTRA_BODY",
         ];
         KEYS
             .iter()
@@ -180,6 +190,96 @@ pub fn workspace_dir() -> PathBuf {
         .nth(2)
         .expect("host crate under workspace")
         .to_path_buf()
+}
+
+/// 代码根（能力锚点）：`scripts/board.py` / `scripts/profile.py` 所在目录。
+///
+/// 为什么必须有这个函数（NW2 的真缺陷）：
+/// `instances.rs` 注释写的是「显式给代码根，与主窗口同源」，实际传的却是
+/// `workspace_dir()`——而它的 `nth(2)` 落在 **`runtime/`**（`runtime/crates/host`
+/// 上溯两级），那里没有 `scripts/`。子实例于是拿着错锚点，
+/// `board_ctx::board_cli_path()` 的 `is_file()` 探测失败 → 提示词里看板段整段消失、
+/// CLI 也调不到 → **子窗口永远收不到任务**。
+///
+/// 主窗口之所以正常，是巧合：`run.cmd` 把 `WORKSPACE_ROOT` 设成仓库根，
+/// `rsi_home()` 的祖先探测恰好命中。子窗口把 `WORKSPACE_ROOT` 换成用户项目，
+/// 这条巧合就断了。
+///
+/// 判定顺序（与 `agent-loop/src/config.rs::rsi_home` 同源，改一侧必须改另一侧）：
+///   1. `RSI_HOME`（子实例由 instances.rs 显式传入；测试靠它隔离）
+///   2. `WORKSPACE_ROOT` 及其祖先——仅当其中真有 `scripts/` 下的 CLI
+///   3. 从 exe 与 cwd 向上找含 CLI 的祖先目录
+/// 全部落空则退化到 `workspace_dir()`（不 panic：能力可以缺，进程不能起不来）。
+pub fn rsi_home() -> PathBuf {
+    fn has_cli(p: &std::path::Path) -> bool {
+        p.join("scripts").join("board.py").is_file()
+            || p.join("scripts").join("profile.py").is_file()
+    }
+    if let Some(v) = std::env::var_os("RSI_HOME") {
+        let p = PathBuf::from(v);
+        if !p.as_os_str().is_empty() && has_cli(&p) {
+            return p;
+        }
+    }
+    if let Some(ws) = std::env::var_os("WORKSPACE_ROOT") {
+        let ws = PathBuf::from(ws);
+        if let Some(hit) = ws.ancestors().find(|p| has_cli(p)) {
+            return hit.to_path_buf();
+        }
+    }
+    let mut seeds: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            seeds.push(d.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        seeds.push(cwd);
+    }
+    seeds
+        .iter()
+        .flat_map(|s| s.ancestors())
+        .find(|p| has_cli(p))
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(workspace_dir)
+}
+
+/// rsi-agent 发行形态布局自动锚定：裸 `cargo run -p react-agent-host` 也能正确启动。
+///
+/// react-agent 的 kernel 检出与运行时同级（`../agent-kernel`），config 缺省值恰好命中；
+/// rsi-agent 把运行时与 kernel 内嵌在 `runtime/`，缺省值会落到 `runtime/` 下、且
+/// `AGENT_KERNEL_REPO` 指向不存在的 `../agent-kernel`——Python guest 找不到
+/// `agent_kernel` 模块直接退出（K700）。
+///
+/// 仅在检测到内嵌布局（`runtime/kernel/bindings/python` + 上级 `skills/` 与
+/// `config.json`）时，按「仓库根 = runtime 父目录」补齐未设置的 env；
+/// 显式 env 仍最优先。单独复制出的 react-agent 快照（无此布局）行为完全不变。
+///
+/// 返回 true = 命中内嵌布局并完成锚定。
+pub fn apply_rsi_layout_defaults() -> bool {
+    let runtime_root = workspace_dir();
+    let Some(rsi_root) = runtime_root.parent().map(PathBuf::from) else {
+        return false;
+    };
+    if !runtime_root.join("kernel").join("bindings").join("python").is_dir() {
+        return false;
+    }
+    if !rsi_root.join("skills").is_dir() || !rsi_root.join("config.json").is_file() {
+        return false;
+    }
+    let set_if_absent = |key: &str, val: PathBuf| {
+        let absent = std::env::var_os(key).map(|v| v.is_empty()).unwrap_or(true);
+        if absent {
+            std::env::set_var(key, val);
+        }
+    };
+    set_if_absent("AGENT_KERNEL_REPO", runtime_root.join("kernel"));
+    set_if_absent("PLUGINS_DIR", runtime_root.join("plugins"));
+    set_if_absent("SKILLS_DIR", rsi_root.join("skills"));
+    set_if_absent("WORKSPACE_ROOT", rsi_root.clone());
+    set_if_absent("CONFIG_FILE", rsi_root.join("config.json"));
+    set_if_absent("RSI_LEDGER_DIR", rsi_root.join("ledger"));
+    true
 }
 
 /// 流式旁路目录：llm-adapter 边生成边写增量，本进程 tail 后经 SSE 推前端。
@@ -263,6 +363,11 @@ pub const AGENT_ENV_MAP: &[(&str, &str)] = &[
     ("retry_base_ms", "LLM_RETRY_BASE_MS"),
     ("llm_context_tokens", "LLM_CONTEXT_TOKENS"),
     ("output_dir", "AGENT_OUTPUT_DIR"),
+    // Q 轮 Phase 3：并发槽位可配置（缺省仍为 8 / 32，assemble 单测断言不变）。
+    ("max_inflight", "AGENT_MAX_INFLIGHT"),
+    ("max_total_inflight", "AGENT_MAX_TOTAL_INFLIGHT"),
+    // P4c：无进展同参重复熔断阈值（缺省 0=禁用；>=4 启用）。设置面板走此映射落 env。
+    ("no_progress_repeat_limit", "NO_PROGRESS_REPEAT_LIMIT"),
 ];
 
 /// 启动时把 config.json 应用为 env（spawn 下发走既有机制）。返回应用的键数。
@@ -300,8 +405,18 @@ pub fn apply_config_file_to_env() -> usize {
     }
     // 核心写保护逃生舱（v6 自扩展安全边界）：默认关（核心路径写拒绝），显式开才放行。
     // 持久通道 → env，guest 子进程经 passthrough_env 继承——改后需重启 host。
-    if let Some(allow) = cfg.get("tools").and_then(|t| t.get("allow_core_write")).and_then(Value::as_bool) {
-        set("ALLOW_CORE_WRITE", if allow { "1".to_string() } else { "0".to_string() });
+    // tools.allow_core_write 双形态（v7 细粒度授权）：布尔 false → "0"；字符串数组 →
+    // 逗号分隔的路径前缀列表（如 ["runtime/crates/agent-loop"]）。guests 经
+    // passthrough_env 继承同一 ALLOW_CORE_WRITE 键，files.py 按前缀解释（见 P5）。
+    if let Some(v) = cfg.get("tools").and_then(|t| t.get("allow_core_write")) {
+        if let Some(paths) = v.as_array() {
+            let items: Vec<String> = paths.iter().filter_map(Value::as_str).map(str::to_string).collect();
+            if !items.is_empty() {
+                set("ALLOW_CORE_WRITE", items.join(","));
+            }
+        } else if let Some(false) = v.as_bool() {
+            set("ALLOW_CORE_WRITE", "0".to_string());
+        }
     }
     // MCP server 声明（tools PLAN §八）：整体 JSON 序列化为 MCP_SERVERS env。只走持久通道
     // （server 子进程生命周期归 tools 插件 init/destroy，热改无意义）——改后需重启 host。

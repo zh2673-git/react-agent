@@ -78,6 +78,106 @@ pub(super) fn apply_history_limit(history_limit: usize, mut msgs: Vec<MemoryMsg>
     msgs
 }
 
+
+/// 把工作集里的 system 统一规范化（P2）：**只保留一个**、取最后一条、空内容视为无，
+/// 且置顶。返回规范的 system（`None` = 无 system）与非 system 的消息（保持相对顺序）。
+///
+/// 为什么不假定 `msgs[0]` 是 system：持久化历史里的 system 可能位于任意位置（见
+/// `chat.rs` 里历史被直接追加在动态 system 之后），任何「只裁首条之外」或「固定保留
+/// `msgs[0]`」的假设都会把非 system 的头当 system 留下、把真正的 system 漏掉。
+/// 为什么只留一个：多个 system 会与动态 system 冲突、污染上下文（Memory 侧
+/// `summarize` 亦同此规则，见 memory_plugin.ts 的 M3 注释）。
+pub(super) fn split_system(msgs: Vec<MemoryMsg>) -> (Option<MemoryMsg>, Vec<MemoryMsg>) {
+    let mut sys: Option<MemoryMsg> = None;
+    let mut rest: Vec<MemoryMsg> = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        if m.role == "system" {
+            // 只采信**非空**的 system；空内容 system 等同无 system。
+            if m.content.as_deref().map(|c| !c.trim().is_empty()).unwrap_or(false) {
+                sys = Some(m); // 后出现的覆盖先出现的 = 取最后一条
+            }
+        } else {
+            rest.push(m);
+        }
+    }
+    (sys, rest)
+}
+
+/// 就地给 system 追加文本（deferred 工具摘要、同波次批处理纪律等）。P2：不假定
+/// `messages[0]` 是 system——取规范化后的唯一 system；无 system（病态）则不改。
+pub(super) fn append_to_system(messages: &mut [MemoryMsg], extra: &str) {
+    if let Some(sys) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == "system" && m.content.as_deref().map(|c| !c.trim().is_empty()).unwrap_or(false))
+    {
+        if let Some(c) = sys.content.as_mut() {
+            c.push_str(extra);
+        }
+    }
+}
+
+/// 工作集尾部裁剪（P0-C）：按 **token 预算**保留最近若干条消息，裁掉更早的。
+///
+/// 为什么需要（实测依据）：压缩后持久层留 `COMPACT_KEEP`（配置里 30）条，
+/// 而这 30 条**每轮都原样发给模型**——每条工具结果可达 8K 字符，合计约
+/// 120K tokens。于是每个请求的 cache_read 平台值高达 170–200K，而当日
+/// **77.1%** 的 credits 来自 cache_read（单价是 input 的 32%）。
+///
+/// 与 `apply_history_limit`（按条数）的区别：条数与 token 量不同步——一条
+/// 8K 字符的工具结果顶得上一百条短消息，故这里按 token 裁。
+///
+/// 纪律（与既有裁剪一致）：
+/// - 只裁**发给 LLM 的工作集**，不动持久层（memory 仍留全量，可回看/回滚）；
+/// - system 统一规范化（P2）：**只保留一个**、取最后一条非空、不假定在首位；
+///   其余多 system 一律剔除（动态 system 由调用方另置）；
+/// - 裁剪后前缘的**孤儿 tool 消息**必须丢弃（其配对的 assistant.tool_calls
+///   已被裁掉，孤儿回喂会被 provider 拒收）——同 `halve_window` 的处置。
+pub(super) fn trim_workset_by_tokens(msgs: Vec<MemoryMsg>, budget: usize) -> Vec<MemoryMsg> {
+    if budget == 0 || msgs.len() <= 1 {
+        return msgs;
+    }
+    if super::context::estimate_messages(&msgs) <= budget {
+        return msgs;
+    }
+    // system 统一规范化后再按 token 裁：不假定首条是 system、只留一个（取最后一条非空）。
+    let (sys, rest) = split_system(msgs);
+    // 从尾部往前留，累计到预算为止；system 的 token 先预扣。
+    // 单条超预算时**跳过**它继续看更小的（不 break）——否则一条巨型工具结果
+    // 会把后面所有小消息一起挤掉（实测每条工具结果可达 8K 字符，而 user 消息
+    // 只有几十字符；break 会让模型连「用户在问什么」都看不到）。
+    let mut kept: Vec<MemoryMsg> = Vec::new();
+    let mut used = sys
+        .as_ref()
+        .map(|m| super::context::estimate_tokens(m.content.as_deref().unwrap_or("")) + 4)
+        .unwrap_or(0);
+    for m in rest.iter().rev() {
+        let est = super::context::estimate_tokens(m.content.as_deref().unwrap_or("")) + 4;
+        if used + est > budget {
+            continue;
+        }
+        used += est;
+        kept.push(m.clone());
+    }
+    kept.reverse();
+    let mut out: Vec<MemoryMsg> = Vec::with_capacity(kept.len() + 1);
+    if let Some(s) = sys {
+        out.push(s);
+    }
+    out.extend(kept);
+    // 前缘孤儿 tool 消息：其 assistant(tool_calls) 载体已被裁掉 → 丢弃。
+    // 头可能是 system（占 1 条）也可能无 system（占 0 条），故从前缀长度起扫。
+    let head = if out.first().map(|m| m.role == "system").unwrap_or(false) { 1 } else { 0 };
+    if let Some(first_real) = out.iter().enumerate().skip(head).find(|(_, m)| m.role != "tool").map(|(i, _)| i) {
+        if first_real > head {
+            out.drain(head..first_real);
+        }
+    } else if out.len() > head {
+        out.truncate(head); // 病态：全剩 tool 消息 → 只留 system 头（或无 system 则清空）
+    }
+    out
+}
+
 impl AgentLoopPlugin {
     /// 感知：拉取会话**全量**历史（不做窗口裁剪）。
     /// 窗口与压缩的顺序见 `apply_history_limit`（PLAN R3：先压缩判断，后窗口裁剪）。
@@ -134,6 +234,7 @@ impl AgentLoopPlugin {
             reasoning: None,
             usage: None,
             elapsed_ms: None,
+            http_attempts: None,
         }))
     }
 
@@ -246,6 +347,8 @@ impl AgentLoopPlugin {
                 return json!({"ok": false, "error": {"code": "K409", "message": "该会话已有进行中的对话，拒绝并发 chat（会互踩取消/流式/回滚定位）；请等待完成或先停止当前回合"}});
             }
         };
+        // Q 轮：标记在途 chat（显式队列据此决定 steer 注入 / pump 延迟启动）。
+        queue::mark_active(&req.session_id, true);
         let out = self.chat_run(env, &req).await;
         // G 轮：回合交接（回填 + 终结）。
         //
@@ -255,13 +358,23 @@ impl AgentLoopPlugin {
         // 且 `chat_run` 已经把暂停写进了 turn 文件——包装层**读文件**即得真相，
         // 不必让两个函数共享可变状态。
         let mut out = out;
-        // 本轮事件已由 chat_run 全部写完，现在读到的 `next` 就是本轮终点。
-        // 失败按 0 → 退化为 `start_cursor`（补播会少给，但不会给错）。
+        // 本轮事件已由 chat_run 全部写完，现在取到的 `end_cursor` 就是本轮终点。
+        //
+        // 为什么是 `trace.meta` 而不是 `trace.read(after=0).next`（P1 修复，改前必读）：
+        // `trace.read` 是**分页**接口（单页 ≤800 条 / 约 1MB 双预算），它的 `next` 是
+        // 「本页已消费到第几条」，不是「trace 一共有多少条」。旧实现把首页 `next` 当
+        // 回合终点，于是长 trace（>800 事件）的 `end_cursor` 被永久钉在首页边界上：
+        // 补播区间变短、`turn/replay` 少给后半程事件——静默丢内容，且只在长会话里出现。
+        // 真实末尾只能由 Memory 侧的 `trace.meta.end_cursor`（= traceOffsets().length）
+        // 提供，见 memory_plugin.ts 的 trace.meta 注释。
+        //
+        // 失败（内核超时/能力缺失）→ None，由下方 `unwrap_or_else` 退化为 turn 里已记录的
+        // `end_cursor`：补播会少给，但不会给错。
         let trace_next = self
-            .call(env, CAP_MEMORY, json!({"op": "trace.read", "session_id": req.session_id, "after": 0}), MEM_DEADLINE)
+            .call(env, CAP_MEMORY, json!({"op": "trace.meta", "session_id": req.session_id}), MEM_DEADLINE)
             .await
             .ok()
-            .and_then(|v| v.get("next").and_then(Value::as_u64));
+            .and_then(|v| v.get("end_cursor").and_then(Value::as_u64));
         let turn_meta = (|| {
             let store = turn::TurnStore::open()?;
             // chat_run 里建的 turn 是**最新一条非终结态**；按 started_at 倒序取第一条即可
@@ -312,12 +425,24 @@ impl AgentLoopPlugin {
         // 跨回合 sid 不碰撞语义不变。
         self.turn_starts.lock().unwrap().remove(&req.session_id);
         self.sid_seq.lock().unwrap().remove(&req.session_id);
+        // P4b 任务账清理：只有**根调用**（depth==0 且未随链携带 budget_root）收尾时才清
+        // 整本任务账——此刻其下所有子代理都已完成并把用量写进账本，清账不丢数据。
+        // 子代理绝不能清：父链后续派发的兄弟子代理仍需读同一本账。
+        if req.depth == 0 && req.budget_root.is_none() {
+            self.spent.lock().unwrap().remove(&req.session_id);
+        }
         // 会话闸卫生（LOOP-P2/A1）：strong_count==2（表 + 本链 Arc）= 没有并发等待者，
         // 安全逐出；有等待者时留着，由最后一链的出口清理（等待中的请求自带 Arc 克隆）。
         if Arc::strong_count(&gate) == 2 {
             self.session_chats.lock().unwrap().remove(&req.session_id);
         }
         drop(_permit);
+        // Q 轮：闸释放之后再 spawn 队列消费者——pump 的第一条 chat 才不会撞 K409。
+        queue::mark_active(&req.session_id, false);
+        queue::leftover_steers_to_followup(&req.session_id); // 未赶上的 steer 不丢
+        if let Some(host) = self.host.get() {
+            queue::try_spawn(host, &req.session_id);
+        }
         out
     }
 
@@ -333,15 +458,22 @@ impl AgentLoopPlugin {
         // （`.rsi/turns/<turn_id>.json`），带 trace 游标区间。补播只读这一轮，
         // 暂停则由本记录承接用户回答（三条边界见 turn.rs 模块注释）。
         //
-        // `start_cursor` 取 `trace.read(after=0)` 的 `next`（= 已有事件条数）。
+        // `start_cursor` 取 `trace.meta` 的 `end_cursor`（= trace 里**完整**有效事件数）。
+        //
+        // 为什么不能用 `trace.read(after=0).next`（P1 修复，改前必读）：那是**分页**
+        // 接口的「本页消费位置」，单页 ≤800 条 / 约 1MB。长会话首页就停在第 800 条，
+        // 于是 `start_cursor` 恒等于 800 左右的常数——新建回合的起点被钉死在 trace
+        // 前段，补播会把这之后的所有历史事件重新算进本轮（区间错位），越长的会话越错。
+        // 真实末尾只能由 Memory 侧的 `trace.meta.end_cursor` 提供（traceOffsets().length）。
+        //
         // 拿不到就按 0：补播会多给一些旧事件但不会漏——错在多给一侧用户能自己扫过去，
         // 错在少给一侧就是静默丢内容。
         let turn_store = turn::TurnStore::open();
         let start_cursor = match self
-            .call(env, CAP_MEMORY, json!({"op": "trace.read", "session_id": req.session_id, "after": 0}), MEM_DEADLINE)
+            .call(env, CAP_MEMORY, json!({"op": "trace.meta", "session_id": req.session_id}), MEM_DEADLINE)
             .await
         {
-            Ok(v) => v.get("next").and_then(Value::as_u64).unwrap_or(0),
+            Ok(v) => v.get("end_cursor").and_then(Value::as_u64).unwrap_or(0),
             Err(_) => 0,
         };
         // 复用还是新建：给了 turn_id 且归属同会话才复用（防跨会话串回合）；
@@ -370,26 +502,77 @@ impl AgentLoopPlugin {
         }
         // 用户消息先入记忆（持久化），随后拉取全量历史。
         // R3：文本附件拼入 content，图片附件走结构化字段（llm-adapter 按 provider 映射）。
-        let user_msg = build_user_msg(&req.user_text, req.attachments.as_deref(), cfg.text_attach_limit);
-        // LOOP-P2/A2：开局用户消息都落不了盘 = 会话记录已断档，本轮跑完下一轮也接不回
-        // ——立即熔断（K503），不烧 LLM token。
-        if !self.observe(env, &req.session_id, &[user_msg.clone()]).await {
-            return json!({"ok": false, "error": {"code": "K503", "message": "memory.append 失败，已熔断本轮（持久层与工作集会静默分叉）；请检查 memory 插件后重试"}});
+        if !req.resume {
+            let user_msg = build_user_msg(&req.user_text, req.attachments.as_deref(), cfg.text_attach_limit);
+            // LOOP-P2/A2：开局用户消息都落不了盘 = 会话记录已断档，本轮跑完下一轮也接不回
+            // ——立即熔断（K503），不烧 LLM token。
+            if !self.observe(env, &req.session_id, &[user_msg.clone()]).await {
+                return json!({"ok": false, "error": {"code": "K503", "message": "memory.append 失败，已熔断本轮（持久层与工作集会静默分叉）；请检查 memory 插件后重试"}});
+            }
+            // trace 带全量原始附件（含文本 b64）：UI 重放展示缩略图/文件条，重新生成需原始 data_b64 重发
+            let mut user_event = json!({"type": "user", "text": req.user_text});
+            if let Some(att) = req.attachments.as_deref() {
+                user_event["attachments"] = json!(att);
+            }
+            // D 轮：把本轮的 @引用 落成 user 事件的**字段**（不是新事件类型）。
+            // 为什么：任务详情要能回答「这件事是在哪几轮对话里谈的」，「这一轮谈了什么任务」
+            // 就是那条 user 事件。而 @引用已经由用户明文写出，是天然的关联键——不需要
+            // 让模型再显式登记一次（它忘了就会断链）。空引用不写字段，保持旧 trace 形状。
+            // 与 Q 轮 cursor 同一先例：加字段不改 FROZEN_EVENT_TYPES，前端 render() 无需改。
+            let refs = super::board_ctx::extract_refs(&req.user_text);
+            if !refs.is_empty() {
+                user_event["refs"] = json!(refs);
+            }
+            self.trace(env, &req.session_id, user_event).await;
         }
-        // trace 带全量原始附件（含文本 b64）：UI 重放展示缩略图/文件条，重新生成需原始 data_b64 重发
-        let mut user_event = json!({"type": "user", "text": req.user_text});
-        if let Some(att) = req.attachments.as_deref() {
-            user_event["attachments"] = json!(att);
-        }
-        self.trace(env, &req.session_id, user_event).await;
 
         // 系统提示词 = 组装链（07 §2.1）+ 技能附录（软）
         // B2：技能自扩展长教程按需注入——仅当本轮用户文本明确要求造技能/打包工具。
         let want_skill_build = Self::user_wants_skill_build(&req.user_text);
+        let want_task_plan = Self::user_wants_task_plan(&req.user_text);
+        // C 轮：看板上下文装载。@T-/@I- 引用是**输入的一部分**（先解析再回答，不让模型
+        // 花一次工具往返去 show 自己刚引用的条目）；无引用但本轮像「交代一件成规模的事」时，
+        // 退化为在办任务摘要（跨任务归纳的最小落点：先知道自己手上有哪些活）。
+        // 失败静默（文件缺失/坏 JSON → 空串），绝不让看板坏掉拖垮 chat。
+        let board_ctx = super::board_ctx::refs_context(&req.user_text, want_task_plan);
+        // D 轮：习惯画像。与看板引用同一取舍——画像属于**输入**，不该让模型每轮
+        // 花一次工具往返去 `profile.py brief` 取自己的长期记忆；读一份本机 JSON 是纯 I/O。
+        // 失败静默（无文件/坏 JSON/空画像 → 空串），画像坏了不能拖垮 chat。
+        let profile_ctx = super::profile_ctx::profile_context();
+        // `AGENT_SYSTEM_PROMPT`（`system_prompt_override`）文档承诺「整体覆盖」，但下面这条
+        // format! 会把三样东西**并列拼进去**：技能附录、看板引用上下文、习惯画像。于是
+        // 「覆盖」并没有真正覆盖——运维钉死提示词后，仍会被追加「你以为的 + 你没要的」。
+        //
+        // 这不只是语义不符，还有个更硬的问题：这三段的内容取决于**本机状态**
+        // （`.rsi/profile.json` 里有多少条观察、手上在办几个任务），而按预算精确断言的
+        // 用例（token 闸那一组，预算 301）必须可预期。实测过：画像里多一条观察，
+        // 系统提示词就多一百多 token，把压缩后的工作集顶过预算 → 又触发收紧 → 窗口减半
+        // → 压缩标记被裁掉，用例报「压缩标记没进上下文」，而红的原因和画像毫无可见关联。
+        // 覆盖态下只留 override 本身，既兑现文档，也让钉死提示词的用例真正确定。
+        // G 轮：记忆 L2 时间轴。「上周那件事我们怎么定的」原本只有两个坏答案——读 trace
+        // 原文（单会话实测 17.6 MB / 29507 条事件，塞不进上下文）或读画像（只有结论，
+        // 记不住经过）。这里注入的是**最薄的一层**：最近哪几天有活、各多大；要细节让
+        // 模型按天精确打开 `.rsi/memory/L2/<YYYYMMDD>.md`。只读 index.json 一个文件。
+        // 与画像同一纪律：属于**输入**，不该让模型每轮花一次工具往返去取；
+        // override 态下同样清空（钉死提示词时不该被追加「本机状态」）。
+        let override_on = cfg.system_prompt_override.is_some();
+        let (skills_apx, board_ctx, profile_ctx, memory_ctx) = if override_on {
+            (String::new(), String::new(), String::new(), String::new())
+        } else {
+            (
+                self.skills_appendix(env, &cfg, want_skill_build, want_task_plan).await,
+                board_ctx,
+                profile_ctx,
+                super::memory_ctx::memory_context(),
+            )
+        };
         let system = format!(
-            "{}{}",
+            "{}{}{}{}{}",
             self.resolve_system_prompt(env, &cfg).await,
-            self.skills_appendix(env, &cfg, want_skill_build).await
+            skills_apx,
+            board_ctx,
+            profile_ctx,
+            memory_ctx
         );
         let mut messages: Vec<MemoryMsg> = vec![MemoryMsg {
             role: "system".into(),
@@ -398,12 +581,52 @@ impl AgentLoopPlugin {
             tool_call_id: None,
             attachments: None,
         }];
+        // 同波次多工具调用纪律（P1-D）：实测今日 3518 次工具调用 / 2397 轮 = **1.47 调用/轮**，
+        // 而内核的波次并发上限是 4（chat.rs 的 wave，`join_all` 真并发）——**内核不缺能力，
+        // 缺的是提示**：此前整条提示词从未告诉模型「一次回复可以发多个 tool_call」，
+        // 模型于是习惯性一次只发一个，每轮多烧一次 LLM 请求（每请求固定成本
+        // ≈ 170K tokens 的 cache_read，占当日 credits 的 77.1%）。
+        //
+        // 为什么放在系统提示词**末尾**：recency 位置注意力更近（同 deferred 工具摘要
+        // 的处置——追加而不重排构造顺序）。
+        //
+        // 两条纪律缺一不可：
+        // ① 「独立的调用合并进同一波次」——给模型可执行的判据；
+        // ② 「同波次结果按提交顺序回喂」——消解「并行会乱序」的误判（pi 的做法：
+        //    并行执行 + 按源顺序持久化；本仓库已有 tool_call_id 对齐，机制齐备）。
+        // P2：system 统一规范化后追加（不假定 messages[0] 是 system；取唯一 system）。
+        append_to_system(
+            &mut messages,
+            "\n### Tool-call batching (this is how you stay cheap)\n\
+Your next reply may contain **multiple tool calls at once** — they run concurrently (up to 4 per wave).\n\
+Merge independent calls into one reply: different files, different directories, different reads that\n\
+do not depend on each other, different searches. Only serialize when one call's result is another\n\
+call's input (same file written twice, a path discovered by a previous call).\n\
+Results of one wave come back **in the order you submitted them**, so parallel calls never garble\n\
+each other — there is no reason to send one call per reply.\n\
+Sending one call per reply costs one extra model request every time (each request re-sends the\n\
+whole context), so a batch of 4 independent calls is ~4x cheaper than 4 sequential replies.\n",
+        );
         match self.perceive(env, &req.session_id).await {
             Ok(h) => {
                 // 双闸顺序（PLAN R3）：先对全量历史做压缩判断（超 TRIGGER 则摘要落盘），
                 // 再对（可能已压缩的）工作集应用 HISTORY_LIMIT 窗口。
                 let compacted = self.maybe_compact(env, &req.session_id, h, &cfg).await;
-                messages.extend(apply_history_limit(cfg.history_limit, compacted));
+                // P2：先把历史里的 **所有** system 剔除，再并入工作集——工作集里唯一的 system
+                // 是上面刚构建的动态 system（在 [0]，带技能附录/看板/画像）。持久化历史里的
+                // system 可能位于任意位置（历史是直接追加在动态 system 之后的），若原样并入
+                // 就会出现「两个 system / system 不在首位」的非法工作集，且旧的持久化 system
+                // 会顶掉权威的动态 system。动态 system 权威，历史 system 一律视为陈旧丢弃。
+                let hist = apply_history_limit(cfg.history_limit, compacted);
+                messages.extend(hist.into_iter().filter(|m| m.role != "system"));
+                // 工作集尾部按 token 裁剪（P0-C）：压缩后持久层留 COMPACT_KEEP（30）条，
+                // 这 30 条每轮原样发给模型 ≈ 120K tokens——每个请求的 cache_read 平台值
+                // 因此高达 170–200K，而当日 77.1% 的 credits 来自 cache_read。
+                // 这里只裁**发给模型的工作集**，不动持久层（memory 仍留全量，可回看/回滚）。
+                if cfg.workset_budget() > 0 {
+                    let tail = std::mem::take(&mut messages);
+                    messages = trim_workset_by_tokens(tail, cfg.workset_budget());
+                }
             }
             Err(e) => {
                 self.trace(env, &req.session_id, json!({"type": "error", "where": "memory.get", "message": e.to_string()})).await;
@@ -509,9 +732,7 @@ impl AgentLoopPlugin {
             // 系统提示词在上面已经 format! 完，故此处追加而不重排构造顺序——改动面最小，
             // 且摘要天然落在提示词末尾（紧邻工具区，模型的注意力位置更合理）。
             let line = tools_defer::deferred_line(&deferred_names);
-            if let Some(sys) = messages.first_mut().and_then(|m| m.content.as_mut()) {
-                sys.push_str(&line);
-            }
+            append_to_system(&mut messages, &line);
         }
         // G 轮：ask_user 保留工具随清单下发（模型才看得见可调）。
         //
@@ -549,7 +770,15 @@ impl AgentLoopPlugin {
         let mut wrap_up: Option<StopReason> = None;
         // N1 空答案自愈闸：nudge 续跑只做一次，防网络持续故障时空转烧钱。
         let mut empty_nudged = false;
+        // P4c 无进展熔断：记上一次工具调用的 (工具名, 参数 JSON) 与连续重复次数。
+        // 只统计「同一工具 + 同参数」**连续**重复——工具或参数任一变化即清零，
+        // 因此「换着参数重试」不会被误判。阈值 cfg.no_progress_repeat_limit（缺省 0=禁用）。
+        let mut last_tool_sig: Option<(String, Value)> = None;
+        let mut repeat_streak: usize = 0;
         // 总预算（T4）：顶层取配置缺省；子代理继承父链衰减后的剩余（req.*_left）。
+        // P4b：budget_root = 整条委派链共享的累计花费账键。顶层缺省取自身 session_id，
+        // 子代理沿用父链透传的同一根；所有链按 (root, 自身 session) 写进同一本账。
+        let budget_root = req.budget_root.clone().unwrap_or_else(|| req.session_id.clone());
         let budget = ChatBudget {
             deadline: req
                 .budget_ms_left
@@ -564,6 +793,23 @@ impl AgentLoopPlugin {
             // 其次预算：token 硬停，墙钟软收敛（见 budget::StopReason）。
             if let Some(v) = self.check_cancel(env, &req.session_id).await {
                 return v;
+            }
+            // Q 轮 Phase 3：steering（软插队）——在取消检查之后、LLM 规划之前，把
+            // 队列里 target=steer 的文本作为一条 user 消息注入当前工作集，不新开 chat。
+            // 不写 trace user 事件：回滚按 trace 的 user 计数定位，注入不能污染该口径；
+            // 该消息只在本轮 messages 里对模型可见（Model-visible 原文已由队列持久化）。
+            let steers = queue::take_steers(&req.session_id);
+            if !steers.is_empty() {
+                let injected = MemoryMsg {
+                    role: "user".into(),
+                    content: Some(format!("[用户追加指令（轮次边界注入）]\n{}", steers.join("\n\n"))),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    attachments: None,
+                };
+                // 只用 messages 承载（本轮模型可见）；不写 trace 事件，避免触碰
+                // FROZEN_EVENT_TYPES 契约与任何历史重放口径。
+                messages.push(injected);
             }
             if let Some(reason) = self.check_budget(&budget, &usage) {
                 if reason.is_hard() {
@@ -603,6 +849,10 @@ impl AgentLoopPlugin {
             };
             llm_calls += 1;
             usage.add(resp.usage.as_ref());
+            // P5 观测：累计 provider 上报的 HTTP 尝试次数（None = 未上报，不参与累计）。
+            usage.add_http_attempts(resp.http_attempts);
+            // P4b：本链累计用量回写任务账（绝对值覆盖，非增量）。
+            self.record_spent(&budget_root, &req.session_id, usage.total());
             llm_ms += resp.elapsed_ms.unwrap_or(0);
             if !resp.ok {
                 let err_val = resp.error.clone().unwrap_or_else(|| json!({"code":"LLM_ERROR","message":"llm-adapter 返回失败"}));
@@ -651,6 +901,7 @@ impl AgentLoopPlugin {
                             env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms,
                             std::mem::take(&mut round_reasonings), &cfg, llm_calls, retries, tool_failures,
                             wrap_up,
+                            None,
                         )
                         .await;
                 }
@@ -689,12 +940,12 @@ impl AgentLoopPlugin {
                     if resp.finish_reason == "length" {
                         let msg = "模型输出被 max_tokens 截断且无正文（finish_reason=length）。请缩小任务或清空会话历史后重试。";
                         self.trace(env, &req.session_id, json!({"type": "error", "where": "finish", "message": msg})).await;
-                        self.summary_after_stop(env, &req.session_id, rounds, &steps, None, &usage, llm_ms, llm_calls, retries, tool_failures).await;
+                        self.summary_after_stop(env, &req.session_id, rounds, &steps, None, None, &usage, llm_ms, llm_calls, retries, tool_failures).await;
                         return json!({"ok": false, "error": {"code": "K502", "reason": "length", "message": msg}});
                     }
                     if empty_nudged {
                         self.trace(env, &req.session_id, json!({"type": "error", "where": "finish", "message": "llm 返回了空答案"})).await;
-                        self.summary_after_stop(env, &req.session_id, rounds, &steps, None, &usage, llm_ms, llm_calls, retries, tool_failures).await;
+                        self.summary_after_stop(env, &req.session_id, rounds, &steps, None, None, &usage, llm_ms, llm_calls, retries, tool_failures).await;
                         return json!({"ok": false, "error": {"code": "K502", "message": "llm 返回了空答案"}});
                     }
                     empty_nudged = true;
@@ -715,6 +966,7 @@ impl AgentLoopPlugin {
                         env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms,
                         std::mem::take(&mut round_reasonings), &cfg, llm_calls, retries, tool_failures,
                         wrap_up,
+                        None,
                     )
                     .await;
             }
@@ -723,14 +975,47 @@ impl AgentLoopPlugin {
                 round_reasonings.push((rounds, t));
             }
 
-            // 子代理预算快照（T4）：父链已用部分扣除后才传给子——随链衰减，多子代理共享同一剩余。
-            let budget_snap = if budget.deadline.is_some() || budget.tokens_left.is_some() {
-                Some((
-                    budget.deadline.map(|d| d.saturating_duration_since(Instant::now()).as_millis() as u64),
-                    budget.tokens_left.map(|t| t.saturating_sub(usage.total())),
-                ))
-            } else {
-                None
+            // 子代理预算快照（T4 + P4b 任务级公平切分）。
+            //
+            // 修复的缺陷：旧实现只把「父链当前剩余」塞给每个子代理，同一父轮派发 N 个子
+            // 代理时它们各自看到同一份剩余（且并发执行、互相看不到对方花费）→ 实际可超支
+            // N 倍。现在先读任务账得到「全体已花」，把「总额 − 已花」按**本批派发个数**
+            // 均分（依次递减，末位吃掉零头），于是本批各子代理的额度之和恰等于剩余额度。
+            // 墙钟仍按实际剩余毫秒透传（子代理 env.deadline 取用）。
+            let budget_snaps: std::collections::HashMap<String, (Option<u64>, Option<u64>, String)> = {
+                let task_ids: Vec<&str> = resp
+                    .tool_calls
+                    .iter()
+                    .filter(|t| {
+                        t.name == RESERVED_TASK
+                            && t.arguments
+                                .get("task")
+                                .and_then(Value::as_str)
+                                .map(|s| !s.trim().is_empty())
+                                .unwrap_or(false)
+                    })
+                    .map(|t| t.id.as_str())
+                    .collect();
+                let n = task_ids.len();
+                let mut out = std::collections::HashMap::new();
+                if n > 0 {
+                    let ms_left = budget
+                        .deadline
+                        .map(|d| d.saturating_duration_since(Instant::now()).as_millis() as u64);
+                    let mut left = budget.tokens_left.map(|t| t.saturating_sub(self.task_spent(&budget_root)));
+                    for (i, id) in task_ids.iter().enumerate() {
+                        let toks = match left {
+                            Some(l) => {
+                                let share = l / (n - i) as u64;
+                                left = Some(l - share);
+                                Some(share)
+                            }
+                            None => None,
+                        };
+                        out.insert((*id).to_string(), (ms_left, toks, budget_root.clone()));
+                    }
+                }
+                out
             };
 
             // 行动 + 观察（P4/T2 并行）：
@@ -759,7 +1044,15 @@ impl AgentLoopPlugin {
                     return v;
                 }
                 let execs = group.iter().map(|tc| {
-                    self.act_exec(env, &req.session_id, req.depth, tc, budget_snap, &deferred_names)
+                    // P4b：按 tool_call id 取本批切分后的额度快照（非本批 task 调用为空）。
+                    self.act_exec(
+                        env,
+                        &req.session_id,
+                        req.depth,
+                        tc,
+                        budget_snaps.get(&tc.id).cloned(),
+                        &deferred_names,
+                    )
                 });
                 let done = futures::future::join_all(execs).await;
                 let mut newly: HashSet<String> = HashSet::new();
@@ -809,6 +1102,15 @@ impl AgentLoopPlugin {
                     if result.get("ok") != Some(&json!(true)) {
                         tool_failures += 1;
                     }
+                    // P4c：更新「同工具 + 同参数」连续重复计数（不论成败——同一失败调用反复
+                    // 重放同样是无进展；真正换了参数的重试会重置计数，不受影响）。
+                    let sig = (tc.name.clone(), tc.arguments.clone());
+                    if last_tool_sig.as_ref() == Some(&sig) {
+                        repeat_streak += 1;
+                    } else {
+                        last_tool_sig = Some(sig);
+                        repeat_streak = 1;
+                    }
                     // R16：胸牌查找（含波次间并入的技能工具）——观测分派元数据化
                     let obs = tools.iter().find(|t| t.name == tc.name).and_then(|t| t.obs.as_ref());
                     self.act_end(env, &req.session_id, rounds, tc, &result, ms, &cfg, obs).await;
@@ -832,11 +1134,15 @@ impl AgentLoopPlugin {
                 // assistant 的「问题」作为本回合最终答复返回（前端据此渲染提问卡）。
                 // **不进下一轮 LLM**：那会花一次钱再让模型自己说「我在等回答」。
                 if let Some((q, call_id)) = paused_by_ask.as_ref() {
+                    // P1：暂停也要记**真实**末尾游标——恢复后 `turn/replay` 的区间以它为界。
+                    // 旧实现取 `trace.read(after=0).next`（分页首页消费位置），长 trace 上会把
+                    // 暂停点钉在首页边界，恢复补播少给后半程事件。真实末尾由 Memory 的
+                    // `trace.meta.end_cursor` 提供；失败退化为 `start_cursor`（宁可多给不漏）。
                     let end_cursor = self
-                        .call(env, CAP_MEMORY, json!({"op": "trace.read", "session_id": req.session_id, "after": 0}), MEM_DEADLINE)
+                        .call(env, CAP_MEMORY, json!({"op": "trace.meta", "session_id": req.session_id}), MEM_DEADLINE)
                         .await
                         .ok()
-                        .and_then(|v| v.get("next").and_then(Value::as_u64))
+                        .and_then(|v| v.get("end_cursor").and_then(Value::as_u64))
                         .unwrap_or(start_cursor);
                     if turn::mark_paused(&mut turn, q, call_id, end_cursor) {
                         if let Some(s) = turn_store.as_ref() {
@@ -882,13 +1188,39 @@ impl AgentLoopPlugin {
                 }
             }
             // LOOP-P2/A2：每轮工具/观察结果必须落持久层，否则下一轮 perceive 的历史缺这段；
-        // 连续失败 ≥3 才熔断（容忍偶发抖动），已产出内容仍在 trace 与前端可见。
-        if !self.observe(env, &req.session_id, &round_msgs).await
-            && self.append_fails.load(Ordering::SeqCst) >= 3
-        {
-            return json!({"ok": false, "error": {"code": "K503", "message": "memory.append 连续失败 3 次，熔断本轮（防工作集与持久层静默分叉）"}});
-        }
-        messages.extend(round_msgs);
+            // 连续失败 ≥3 才熔断（容忍偶发抖动），已产出内容仍在 trace 与前端可见。
+            if !self.observe(env, &req.session_id, &round_msgs).await
+                && self.append_fails.load(Ordering::SeqCst) >= 3
+            {
+                return json!({"ok": false, "error": {"code": "K503", "message": "memory.append 连续失败 3 次，熔断本轮（防工作集与持久层静默分叉）"}});
+            }
+            messages.extend(round_msgs);
+            // 轮内压缩闸（P0-B）：历史此前**只在 chat 开头判一次**（chat.rs:464），
+            // 于是长会话中途历史只增不减、每轮全量重发——成本 O(N²) 涨
+            // （实测单会话 371 轮累计 cache_read 47.3M，当日 77.1% 的 credits
+            // 来自 cache_read）。这里在轮末按 token 闸再判一次：超工作集预算就
+            // 把旧史摘要掉（keep 最近若干条），让下一轮的上下文回到有界大小。
+            //
+            // 为什么放在轮末而不是轮首：轮末的 messages 已含本轮全部工具结果，
+            // 此刻的估算最接近下一轮真正要发的规模；压缩后下一轮直接用新工作集。
+            // 压缩是**软动作**（失败则保持原样，不中止），且幂等——未超预算时不触发。
+            // P3 降开销：估算一次、复用。workset_budget 只算一次；压缩后（可能已缩短）
+            // 只需再判一次决定是否裁剪尾部——trim_workset_by_tokens 内部本就会再估一次
+            // （幂等：未超预算直接返回），故这里省掉一遍冗余估算。
+            let workset_budget = cfg.workset_budget();
+            if workset_budget > 0 && context::estimate_messages(&messages) > workset_budget {
+                // P3 降开销：把工作集整体 move 进压缩（std::mem::take），省掉进入前的
+                // messages.clone()——长会话里每次 clone 都要复制整段历史内容（可达数十万
+                // 字符）。压缩内部不满足条件时原样返回该 Vec，故语义等价。
+                let compacted =
+                    self.maybe_compact_with_keep(env, &req.session_id, std::mem::take(&mut messages), &cfg, 8).await;
+                messages = compacted;
+                // 工作集尾部按 token 裁剪（P0-C）：压缩后仍超预算（或未触发压缩）时收尾。
+                if context::estimate_messages(&messages) > workset_budget {
+                    let tail = std::mem::take(&mut messages);
+                    messages = trim_workset_by_tokens(tail, workset_budget);
+                }
+            }
             // 停车检查点②：工具波次完成后（不必等下一轮 LLM 调用才知道要停）
             if let Some(reason) = self.check_budget(&budget, &usage) {
                 if reason.is_hard() {
@@ -897,6 +1229,23 @@ impl AgentLoopPlugin {
                         .await;
                 }
                 self.wrap_up_once(env, &req.session_id, &mut messages, &mut wrap_up, reason).await;
+            }
+            // 停车检查点②c：无进展熔断（P4c）——同一工具 + 同参数连续重复达到阈值即收尾，
+            // 交出「已完成 / 未完成 / 下一步」，而不是继续空转烧钱、占满轮次把真进度挤掉。
+            // 只在**没有** wrap_up 时生效：预算软收敛已接管出口，不与非进展原因叠加。
+            if wrap_up.is_none()
+                && cfg.no_progress_repeat_limit > 0
+                && repeat_streak >= cfg.no_progress_repeat_limit
+            {
+                let msg = format!(
+                    "无进展熔断：同一工具 {} 连续 {} 次以相同参数重复调用（阈值 {}），已停止空转",
+                    last_tool_sig.as_ref().map(|(n, _)| n.as_str()).unwrap_or("?"),
+                    repeat_streak,
+                    cfg.no_progress_repeat_limit
+                );
+                return self
+                    .no_progress_stop(env, &req.session_id, rounds, &steps, &msg, usage, llm_ms, llm_calls, retries, tool_failures)
+                    .await;
             }
         }
 
@@ -932,6 +1281,10 @@ impl AgentLoopPlugin {
             }
         };
         usage.add(resp.usage.as_ref());
+        // P5 观测：收敛/强制轮的请求同样累计 HTTP 尝试次数（同一 usage 账）。
+        usage.add_http_attempts(resp.http_attempts);
+        // P4b：收敛/强制轮的计费同样回写任务账（同 siteA）。
+        self.record_spent(&budget_root, &req.session_id, usage.total());
         llm_ms += resp.elapsed_ms.unwrap_or(0);
         llm_calls += 1;
         if resp.ok && resp.tool_calls.is_empty() {
@@ -940,6 +1293,7 @@ impl AgentLoopPlugin {
                     env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms,
                     std::mem::take(&mut round_reasonings), &cfg, llm_calls, retries, tool_failures,
                     wrap_up,
+                    None,
                 )
                 .await;
         }
@@ -955,12 +1309,13 @@ impl AgentLoopPlugin {
                     env, &req.session_id, resp, rounds, steps, sid, usage, llm_ms,
                     std::mem::take(&mut round_reasonings), &cfg, llm_calls, retries, tool_failures,
                     wrap_up,
+                    None,
                 )
                 .await;
         }
         self.trace(env, &req.session_id, json!({"type": "error", "where": "max_rounds", "message": format!("agent loop exhausted max_rounds={max_rounds}")})).await;
         // E7-C2：轮次耗尽出口也交画像（三出口闭环：自然收敛 / 预算停 / 失败收敛）。
-        self.summary_after_stop(env, &req.session_id, rounds, &steps, None, &usage, llm_ms, llm_calls, retries, tool_failures)
+        self.summary_after_stop(env, &req.session_id, rounds, &steps, None, None, &usage, llm_ms, llm_calls, retries, tool_failures)
             .await;
         json!({"ok": false, "error": {"code": "K502", "message": format!("agent loop exhausted max_rounds={max_rounds}")}})
     }
@@ -986,9 +1341,32 @@ impl AgentLoopPlugin {
         };
         self.trace(env, session_id, json!({"type": "error", "where": "budget", "message": msg})).await;
         // E7-C1：预算硬停也要交 chat_summary——「被掐断」的回合不该在效率画像里缺段。
-        self.summary_after_stop(env, session_id, rounds, steps, Some(reason.tag()), &usage, llm_ms, llm_calls, retries, tool_failures)
+        self.summary_after_stop(env, session_id, rounds, steps, Some(reason.tag()), None, &usage, llm_ms, llm_calls, retries, tool_failures)
             .await;
         json!({"ok": false, "error": {"code": "K508", "message": msg}})
+    }
+    /// P4c 无进展熔断出口：同一工具 + 同参数连续重复达到阈值，立即停止空转。
+    /// 与 budget_stop 同构——发 error 事件 + 交 chat_summary（stopped_reason 具名）+ 返回 K502。
+    /// 错误码沿用 K502（轮次/收敛类兜底码），用扁平 `reason` 区分具体成因（不占用 K503/K508）。
+    #[allow(clippy::too_many_arguments)]
+    async fn no_progress_stop(
+        &self,
+        env: &Envelope,
+        session_id: &str,
+        rounds: u32,
+        steps: &[StepRecord],
+        msg: &str,
+        usage: UsageAcc,
+        llm_ms: u64,
+        llm_calls: u32,
+        retries: u32,
+        tool_failures: u32,
+    ) -> Value {
+        self.trace(env, session_id, json!({"type": "error", "where": "no_progress", "message": msg})).await;
+        // 熔断也要交 chat_summary：画像留段（stopped_by 沿用「非预算=null」，具名成因走 stopped_reason）。
+        self.summary_after_stop(env, session_id, rounds, steps, None, Some("no_progress"), &usage, llm_ms, llm_calls, retries, tool_failures)
+            .await;
+        json!({"ok": false, "error": {"code": "K502", "reason": "no_progress", "message": msg}})
     }
 
     /// E7-C1/C2：非收敛出口（预算硬停 / 空答案 / 轮次耗尽）的效率画像兜底。
@@ -1003,6 +1381,7 @@ impl AgentLoopPlugin {
         rounds: u32,
         steps: &[StepRecord],
         stopped_by: Option<&str>,
+        stopped_reason: Option<&str>,
         usage: &UsageAcc,
         llm_ms: u64,
         llm_calls: u32,
@@ -1027,6 +1406,9 @@ impl AgentLoopPlugin {
                 "tokens": usage.to_value(),
                 "llm_ms": llm_ms,
                 "stopped_by": stopped_by,
+                "stopped_reason": stopped_reason,
+                // P5 观测：HTTP 尝试总次数（null = provider 未上报）。
+                "http_attempts": usage.http_attempts_total(),
             }),
         )
         .await;
@@ -1120,6 +1502,7 @@ impl AgentLoopPlugin {
         retries: u32,
         tool_failures: u32,
         wrap_up: Option<StopReason>,
+        stopped_reason: Option<&str>,
     ) -> Value {
         let mut answer = resp.content.clone().unwrap_or_default();
         if answer.trim().is_empty() && wrap_up.is_some() {
@@ -1138,11 +1521,13 @@ impl AgentLoopPlugin {
             };
             self.trace(env, session_id, json!({"type": "error", "where": "finish", "message": msg})).await;
             // E7-C2：失败出口同样交画像（steps 已落地的成果数如实上报）。
-            self.summary_after_stop(env, session_id, rounds, &steps, None, &usage, llm_ms, llm_calls, retries, tool_failures)
+            self.summary_after_stop(env, session_id, rounds, &steps, None, None, &usage, llm_ms, llm_calls, retries, tool_failures)
                 .await;
             let mut err_val = json!({"code": "K502", "message": msg});
             if truncated {
-                err_val["error"]["reason"] = json!("length");
+                // P4c：统一改用扁平 reason（与主循环空答案出口同形，落在 error.reason，
+                // 而非此前误写的 error.error.reason 畸形嵌套）。
+                err_val["reason"] = json!("length");
             }
             return json!({"ok": false, "error": err_val});
         }
@@ -1189,7 +1574,13 @@ impl AgentLoopPlugin {
                 "reasonings": reasonings_json,
                 "usage": usage.to_value(),
                 "elapsed_ms": llm_ms,
-                "metrics": {"llm_calls": llm_calls, "retries": retries, "tool_failures": tool_failures},
+                // P5 观测：http_attempts = provider 上报的 HTTP 尝试总次数（null = 未上报）。
+                "metrics": {
+                    "llm_calls": llm_calls,
+                    "retries": retries,
+                    "tool_failures": tool_failures,
+                    "http_attempts": usage.http_attempts_total(),
+                },
             }),
         )
         .await;
@@ -1218,9 +1609,101 @@ impl AgentLoopPlugin {
                 // 预算停车原因（None = 自然收敛）：`tokens` 硬停 / `deadline` 软收敛。
                 // 观测口径：前端不渲染，脚本据此区分「任务做完了」与「被时长掐断」。
                 "stopped_by": wrap_up.map(|r| r.tag()),
+                "stopped_reason": stopped_reason,
+                // P5 观测：HTTP 尝试总次数（null = provider 未上报）。
+                "http_attempts": usage.http_attempts_total(),
             }),
         )
         .await;
         json!({"ok": true, "answer": answer, "rounds": rounds, "steps": steps, "session_id": session_id})
+    }
+}
+
+#[cfg(test)]
+mod p2_system_tests {
+    use super::*;
+
+    fn m(role: &str, body: &str) -> MemoryMsg {
+        MemoryMsg {
+            role: role.into(),
+            content: Some(body.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+        }
+    }
+
+    /// split_system：不假定首位、只留一个、取最后一条非空、空内容视为无。
+    #[test]
+    fn split_system_takes_last_nonempty_and_drops_all_others() {
+        let (sys, rest) = split_system(vec![
+            m("system", "OLD"),
+            m("user", "u1"),
+            m("system", ""),      // 空内容 → 视为无
+            m("assistant", "a1"),
+            m("system", "NEW"),   // 最后一条非空 → 采用
+        ]);
+        assert_eq!(sys.as_ref().and_then(|x| x.content.as_deref()), Some("NEW"));
+        let roles: Vec<_> = rest.iter().map(|x| x.role.clone()).collect();
+        assert_eq!(roles, vec!["user", "assistant"], "除唯一 system 外全部保留，顺序不变");
+        // 无 system 时返回 None
+        let (none, rest2) = split_system(vec![m("user", "u"), m("assistant", "a")]);
+        assert!(none.is_none());
+        assert_eq!(rest2.len(), 2);
+    }
+
+    /// trim_workset_by_tokens：system 不在首位时也必须被识别并保留（不再假定 msgs[0]）。
+    #[test]
+    fn trim_workset_keeps_system_not_at_head() {
+        let big = "x".repeat(8000);
+        // 病态顺序：head 是 user，system 在中段——旧实现会误把 user 当 system 头保留、把真正
+        // 的 system 当普通消息裁掉。
+        let msgs = vec![
+            m("user", "lead"),
+            m("assistant", "a0"),
+            m("system", "SYS"),
+            m("tool", &big),
+            m("tool", &big),
+            m("user", "tail"),
+        ];
+        let out = trim_workset_by_tokens(msgs, 40);
+        // 唯一 system 必留且被规范化到首位
+        assert_eq!(out.first().map(|x| x.role.as_str()), Some("system"), "{:?}", out.iter().map(|x| x.role.clone()).collect::<Vec<_>>());
+        assert_eq!(out[0].content.as_deref(), Some("SYS"));
+        // 结果里绝无第二个 system
+        assert_eq!(out.iter().filter(|x| x.role == "system").count(), 1);
+        // 前缘孤儿 tool 被丢弃
+        assert!(out.iter().skip(1).all(|x| x.role != "tool" || x.content.as_deref() == Some("SYS")));
+    }
+
+    /// trim_workset_by_tokens：出现多个 system 时只留一个（取最后一条非空、置顶）。
+    #[test]
+    fn trim_workset_keeps_single_system() {
+        // 需要超预算才会进入规范化裁剪路径（预算内直接幂等返回、不重排）；
+        // 故在两条 system 之间夹一条超预算大消息，强制走裁剪分支。
+        let big = "x".repeat(8000);
+        let msgs = vec![
+            m("system", "OLD"),
+            m("user", "u1"),
+            m("system", "NEW"),
+            m("tool", &big),
+            m("user", "u2"),
+        ];
+        let out = trim_workset_by_tokens(msgs, 60);
+        assert_eq!(out.iter().filter(|x| x.role == "system").count(), 1);
+        assert_eq!(out[0].content.as_deref(), Some("NEW"), "取最后一条 system");
+        assert_eq!(out.first().map(|x| x.role.as_str()), Some("system"));
+    }
+
+    /// append_to_system：不假定首位——对唯一 system 追加；无 system 时不 panic 不新增。
+    #[test]
+    fn append_to_system_targets_unique_system_anywhere() {
+        let mut msgs = vec![m("user", "u"), m("system", "SYS")];
+        append_to_system(&mut msgs, "-TAIL");
+        assert_eq!(msgs[1].content.as_deref(), Some("SYS-TAIL"));
+        let mut no_sys = vec![m("user", "u")];
+        append_to_system(&mut no_sys, "-X");
+        assert_eq!(no_sys.len(), 1);
+        assert_eq!(no_sys[0].content.as_deref(), Some("u"), "无 system 时静默不追加");
     }
 }

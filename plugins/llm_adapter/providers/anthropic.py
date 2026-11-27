@@ -82,4 +82,4 @@ def models(payload: dict) -> dict:
     return {"ok": True, "models": list(_ANTHROPIC_MODELS)}
 
 
-PROVIDER = {"name": "anthropic", "chat": chat, "models": models, "requires_env": ["ANTHROPIC_API_KEY"]}
+PROVIDER = {"name": "anthropic", "chat": chat, "models": models, "capabilities": {"stream": False, "tools": True, "images": True, "embed": False, "models": True}, "requires_env": ["ANTHROPIC_API_KEY"]}

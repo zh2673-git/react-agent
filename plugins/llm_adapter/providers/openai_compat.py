@@ -121,13 +121,29 @@ def _chat_once(endpoint: dict, body: dict, provider_label: str) -> dict:
             resp = httpx.post(f"{endpoint['base_url']}/chat/completions", json=body, headers=endpoint["headers"], timeout=httpx.Timeout(PROVIDER_DEADLINE, connect=10.0))
         except Exception as exc:  # noqa: BLE001 - httpx 连接异常（ConnectError 等）非 OSError；响应未到达，重试安全
             last = err(f"{provider_label} 连接失败: {type(exc).__name__}: {exc}", code="LLM_TRANSIENT")
+            # P5 观测：真实尝试次数写顶层键（agent-loop 读顶层 http_attempts）。
+            last["http_attempts"] = attempt + 1
         else:
             elapsed_ms = int((time.monotonic() - start) * 1000)
             if resp.status_code < 400:
                 data = resp.json()
                 # 原成功路径主体（原样保留，仅包进循环提前返回）
-                return _chat_once_success(endpoint, body, provider_label, data, elapsed_ms)
+                out = _chat_once_success(endpoint, body, provider_label, data, elapsed_ms, attempt + 1)
+                # 200 空正文防护：网关（账号额度耗尽/登录过期/限流页）会回 200 + 空 content，
+                # 旧实现 norm(ok=True) 让 agent-loop 拿到空答案，前端 app-stream 又丢弃空 answer
+                # 事件 → 用户只看到空白。判为瞬时错误并重试，把「空答案」转成可恢复的故障转移。
+                if (out.get("ok") and not (out.get("content") or "").strip()
+                        and not out.get("tool_calls") and not out.get("reasoning")):
+                    last = err(f"{provider_label} HTTP 200 但回复正文为空（账号额度/登录态/网关异常）: {json.dumps(data, ensure_ascii=False)[:200]}", code="LLM_TRANSIENT")
+                    last["http_attempts"] = attempt + 1
+                    if attempt < attempts - 1:
+                        time.sleep(float(2 ** attempt))
+                        continue
+                    return last
+                return out
             last = err_from_resp(provider_label, resp.status_code, resp.text)
+            # P5 观测：HTTP 层失败同样上报真实尝试次数（含本次）。
+            last["http_attempts"] = attempt + 1
             if last.get("error", {}).get("code") == "LLM_TRANSIENT" and attempt < attempts - 1:
                 retry_after = 1.0
                 try:
@@ -140,7 +156,9 @@ def _chat_once(endpoint: dict, body: dict, provider_label: str) -> dict:
     return last or err(f"{provider_label} 重试耗尽", code="LLM_TRANSIENT")
 
 
-def _chat_once_success(endpoint: dict, body: dict, provider_label: str, data: dict, elapsed_ms: int) -> dict:
+def _chat_once_success(
+    endpoint: dict, body: dict, provider_label: str, data: dict, elapsed_ms: int, http_attempts: int = 1
+) -> dict:
     """_chat_once 的成功响应归一化段（原实现原样提取，行为不变）。"""
     # 200 异常态防护：部分网关（限流/瞬时故障）会在 200 里返回非 chat 形态（null / {"error":...}），
     # 硬下标 choices 会崩成 'NoneType' object is not subscriptable——统一收敛为业务错误。
@@ -162,6 +180,7 @@ def _chat_once_success(endpoint: dict, body: dict, provider_label: str, data: di
         reasoning=reasoning,
         usage=map_usage(data["usage"]) if data.get("usage") else None,
         elapsed_ms=elapsed_ms,
+        http_attempts=http_attempts,
     )
 
 
@@ -175,13 +194,50 @@ def _chat_stream(endpoint: dict, body: dict, stream_path: str, sid, provider_lab
     """
     sink = StreamSink(stream_path, sid)
     sink.start()
+    # 瞬态重试：网关把上游 401/429/502 吞成 200+空流（LLM_EMPTY）或直接回 429/5xx
+    # （LLM_TRANSIENT）时，重新请求同一网关 = 网关重新走 smart 路由、换一个账号。
+    # 复用同一 sink：start 行只写一次、空流不写 end、重试不写 error，最终失败才写一次 error，
+    # 前端气泡全程不重开、不闪错。
+    # 尝试次数取 5：网关 auto 组可能多个账号同时故障（实测 5 个成员 4 个坏），
+    # 每次请求 = 网关重新 smart 路由换号，5 次把撞到健康号的概率从 ~49% 提到 ~67%；
+    # 退避递增让网关额度态/健康态有时间刷新。总时限受 PROVIDER_DEADLINE 守卫，不超内核 K502。
+    attempts = 5
+    last: dict | None = None
+    stream_start = time.monotonic()
     try:
-        return _stream_once(endpoint, body, sink, provider_label, include_usage=True)
+        for attempt in range(attempts):
+            out = _stream_once(endpoint, body, sink, provider_label, include_usage=True, http_attempts=attempt + 1)
+            code = (out.get("error") or {}).get("code")
+            if code not in ("LLM_EMPTY", "LLM_TRANSIENT") or attempt == attempts - 1:
+                if not out.get("ok"):
+                    sink.error(out.get("error", {}).get("message", "流式请求失败"))
+                return out
+            last = out
+            # 总时限守卫： retries 累计已接近 PROVIDER_DEADLINE 就停止重试，
+            # 返回最后一次错误（避免越过内核 120s K502 闸导致 guest 线程泄漏）。
+            if time.monotonic() - stream_start > PROVIDER_DEADLINE - 15:
+                break
+            retry_after = 1.0
+            if "429" in out.get("error", {}).get("message", ""):
+                retry_after = min(5.0, max(1.0, retry_after))
+            time.sleep(retry_after * (attempt + 1))  # 1s / 2s 轻微退避，让网关额度态刷新
+        if last is None:
+            last = err("流式重试耗尽", code="LLM_TRANSIENT")
+        if not last.get("ok"):
+            sink.error(last.get("error", {}).get("message", "流式请求失败"))
+        return last
     finally:
         sink.close()
 
 
-def _stream_once(endpoint: dict, body: dict, sink: StreamSink, provider_label: str, include_usage: bool) -> dict:
+def _stream_once(
+    endpoint: dict,
+    body: dict,
+    sink: StreamSink,
+    provider_label: str,
+    include_usage: bool,
+    http_attempts: int = 1,
+) -> dict:
     """单次流式请求。`include_usage=False` 即去掉 stream_options 的降级重试。"""
     import httpx
 
@@ -211,9 +267,12 @@ def _stream_once(endpoint: dict, body: dict, sink: StreamSink, provider_label: s
                 if include_usage:
                     # 部分兼容层（自托管网关等）不认 stream_options → 去掉重试一次。
                     # 复用同一 sink：start 行不重复写，前端不会重开气泡。
-                    return _stream_once(endpoint, body, sink, provider_label, False)
+                    # P5 观测：降级重放是**真实的第二次** HTTP 请求，尝试数记 2。
+                    return _stream_once(endpoint, body, sink, provider_label, False, http_attempts + 1)
                 payload = err_from_resp(provider_label, resp.status_code, resp.text)
-                sink.error(payload["error"]["message"])
+                payload["http_attempts"] = http_attempts
+                # 不在此写 sink.error：LLM_TRANSIENT(429/5xx) 会由 _chat_stream 重试，
+                # 多条 error 事件会让前端气泡闪错；只在最终失败时由外层写一次。
                 return payload
             for raw in resp.iter_lines():
                 # R1：逐帧取消检查——命中立即关流收敛（K499），不再消费剩余增量。
@@ -290,19 +349,29 @@ def _stream_once(endpoint: dict, body: dict, sink: StreamSink, provider_label: s
             if not v["name"] and v["arguments"]:
                 named[0]["arguments"] += v["arguments"]
 
+    full_text = "".join(content_parts)
+    full_reasoning = "".join(reasoning_parts)
+    call_list = [{"id": v["id"], "name": v["name"], "arguments": as_object(v["arguments"])} for v in calls.values() if v["name"]]
+    # 流式空正文防护：正文/思考/工具调用全空 → LLM_EMPTY，由 _chat_stream 重试
+    # （网关把上游 401/429/502 吞成 200+空流时会命中；重试=重新请求=网关重新路由）。
+    # 关键：在 sink.end() 之前判定——空流不写 end 事件，外层重试复用同一 sink 不串台。
+    if not full_text.strip() and not call_list and not full_reasoning.strip():
+        out = err(f"{provider_label} 流式响应正文为空（账号额度/登录态/网关异常）", code="LLM_EMPTY")
+        out["http_attempts"] = http_attempts
+        return out
+
     # 未上报 usage → None（前端据此不显示统计条，而不是显示一串 0）
     usage = map_usage(usage_raw) if usage_raw else None
     sink.end(usage, elapsed_ms)
-
-    call_list = [{"id": v["id"], "name": v["name"], "arguments": as_object(v["arguments"])} for v in calls.values() if v["name"]]
     return norm(
-        "".join(content_parts) or None,
+        full_text or None,
         call_list,
         model,
         "tool_calls" if call_list else finish,
-        reasoning="".join(reasoning_parts) or None,
+        reasoning=full_reasoning or None,
         usage=usage,
         elapsed_ms=elapsed_ms,
+        http_attempts=http_attempts,
     )
 
 
@@ -384,8 +453,37 @@ def models(payload: dict) -> dict:
     except Exception as exc:
         return err(f"模型列表响应非法 JSON: {exc}")
     items = data.get("data", []) if isinstance(data, dict) else []
-    ids = [m.get("id") for m in items if isinstance(m, dict) and m.get("id")]
-    return {"ok": True, "models": ids}
+    ids: list = []
+    meta: list = []
+    for m in items:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        if not mid:
+            continue
+        ids.append(mid)
+        # 平台归属：网关 /v1/models 每项带 owned_by（多平台聚合时它就是来源平台）；
+        # 通用 OpenAI 兼容站点（DeepSeek/OpenRouter…）也给 owned_by，缺省时退化为 id 前缀。
+        # 前端靠它做「按平台分组折叠」——分组本身不在前端硬编码平台名，纯数据驱动。
+        plat = m.get("owned_by") or (mid.split("/", 1)[0] if "/" in mid else "")
+        ent: dict = {"name": mid}
+        if isinstance(plat, str) and plat:
+            ent["platform"] = plat
+        dn = m.get("display_name")
+        if isinstance(dn, str) and dn and dn != mid:
+            ent["display_name"] = dn
+        ctx = m.get("context_length") or m.get("context_window")
+        if isinstance(ctx, int) and not isinstance(ctx, bool) and ctx > 0:
+            ent["ctx_limit"] = ctx
+        if mid.startswith("auto/"):
+            # 网关路由组模型（auto/<slug>）：UI 单列一个「auto（路由组）」栏，不与平台组混列
+            # （owned_by 只是它默认落到的平台，不是分组归属）
+            ent["route"] = "auto"
+        meta.append(ent)
+    out: dict = {"ok": True, "models": ids}
+    if meta:
+        out["models_meta"] = meta
+    return out
 
 
 PROVIDER = {
@@ -393,5 +491,6 @@ PROVIDER = {
     "chat": chat,
     "models": models,
     "embed": embed,
+    "capabilities": {"stream": True, "tools": True, "images": True, "embed": True, "models": True},
     "requires_env": ["OPENAI_API_KEY"],
 }

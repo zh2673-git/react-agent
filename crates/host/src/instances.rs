@@ -125,13 +125,6 @@ fn read_instance_meta(dir: &Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(dir.join("instance.json")).ok()?).ok()
 }
 
-/// TCP 探活（connect 无超时版，仅本地端口环回，开销可忽略）。
-fn port_alive(port: u16) -> bool {
-    TcpStream::connect(("127.0.0.1", port))
-        .map(|_| true)
-        .unwrap_or(false)
-}
-
 /// 身份探活：端口连通 **且** 该端口服务的 `/api/config` 回显的 instance_name 与期望一致。
 /// 仅 TCP 探活会「探到别人家」（重启后端口被其他实例/进程复用 → 假在线、复用分派
 /// 指错窗口），必须验身份——子实例启动带 REACT_INSTANCE_NAME，网关 /api/config 回显。
@@ -174,6 +167,11 @@ fn spawn_self(dir: &Path, name: &str, workspace: &str, port: u16) -> Result<u64,
         .env("AGENT_STREAM_DIR", dir.join("stream"))
         .env("CONFIG_FILE", dir.join("config.json"))
         .env("REACT_INSTANCE_NAME", name)
+        // v10：工具能力锚点。子实例把 WORKSPACE_ROOT 换成**用户项目目录**（这正是
+        // 「新窗口」的全部意义），而看板/画像 CLI 住在代码根——不显式传，三处门控
+        // 会在项目目录里找不到 scripts/board.py，于是提示词里看板段整段消失、
+        // CLI 也调不到：子窗口的看板永远收不到任务。显式给代码根，与主窗口同源。
+        .env("RSI_HOME", crate::config::rsi_home())
         .spawn()
         .map_err(|e| format!("spawn 实例进程失败: {e}"))?;
     Ok(u64::from(child.id()))
@@ -262,12 +260,15 @@ pub fn create_instance(name: Option<&str>, workspace: &str) -> Result<Value, Str
     std::fs::write(dir.join("instance.json"), serde_json::to_string_pretty(&meta).unwrap())
         .map_err(|e| format!("写 instance.json 失败: {e}"))?;
     remember_workspace(workspace); // 下次主实例启动默认恢复该工作区
-    // 等待子实例 HTTP 就绪（最多 ~15s），避免前端打开过早拿连接拒绝
-    for _ in 0..75 {
-        if port_alive(port) {
+    // 等待子实例 HTTP 就绪（最多 ~15s），避免前端打开过早拿连接拒绝。
+    // 用 identity_alive 而非纯 port_alive：TCP 连通不代表装配完成，也不代表这个端口
+    // 就是刚 spawn 的实例（端口复用会探到别人家）。/api/config 能回显 instance_name
+    // 才说明子实例已装配并监听，POST 立刻返回；每 100ms 探一次，就绪即退出。
+    for _ in 0..150 {
+        if identity_alive(port, &name) {
             break;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(100));
     }
     Ok(json!({"ok": true, "name": name, "port": port, "url": format!("http://127.0.0.1:{port}"), "pid": pid}))
 }

@@ -141,14 +141,15 @@ impl AgentLoopPlugin {
     /// 其余走 tools.exec。失败合成 ok:false 结果回喂（不中断循环）。
     /// 不含事件发射——并行执行时事件顺序由 chat_body 统一编排（声明顺序，稳定）。
     /// 返回 (工具结果, 耗时ms)。`depth` 为当前链上的委派深度（0=顶层，随链传播）；
-    /// `budget_snap` 为传给子代理的剩余预算快照 (剩余ms, 剩余token)（T4，随链衰减）。
+    /// `budget_snap` 为传给子代理的预算快照 `(剩余ms, 剩余token, 任务根会话id)`（T4 + P4b：
+    /// 剩余 token 已是按本批派发个数切分后的额度，任务根让子链把用量写进同一本花费账）。
     pub(super) async fn act_exec(
         &self,
         src: &Envelope,
         session_id: &str,
         depth: u32,
         tc: &ToolCall,
-        budget_snap: Option<(Option<u64>, Option<u64>)>,
+        budget_snap: Option<(Option<u64>, Option<u64>, String)>,
         deferred: &[String],
     ) -> (Value, u64) {
         let started = Instant::now();
@@ -258,10 +259,19 @@ impl AgentLoopPlugin {
         tracing::info!(target: "react_progress", round, tool = %tc.name, ms, "✓ round {round}: {} ({}ms)", tc.name, ms);
         // 事件日志：结果截断（防大输出撑爆审计文件），memory 侧另有按工具分化的预算
         // （effective_result_limit，与 chat.rs 回喂点口径一致）
+        // P4 降开销（序列化协议统一）：结果只 `to_string()` 一次，紧随其后的
+        // 一次扫描同时得出总字符数与截断前缀——避免全量序列化后再 `chars().count()`
+        // 与 `chars().take().collect()` 各扫一遍的重复成本（大结果上尤为明显）。
         let result_str = result.to_string();
-        let full_chars = result_str.chars().count();
         let limit = effective_result_limit(&tc.name, cfg);
-        let truncated: String = result_str.chars().take(2000).collect();
+        let mut full_chars = 0usize;
+        let mut truncated = String::new();
+        for (i, ch) in result_str.chars().enumerate() {
+            if i < 2000 {
+                truncated.push(ch);
+            }
+            full_chars = i + 1;
+        }
         self.trace(
             src,
             session_id,

@@ -71,25 +71,42 @@ pub fn estimate_messages(msgs: &[MemoryMsg]) -> usize {
 
 /// 窗口条数减半：保留 system 头 + 尾半；丢弃新窗口前缘的孤儿 tool 消息
 /// （其配对的 assistant.tool_calls 已被裁掉，孤儿回喂会被 provider 拒收）。
-/// 假定 `msgs[0]` 为 system（调用方 chat_run 保证）。
+/// P2：不假定 `msgs[0]` 为 system——先规范化出唯一 system（取最后一条非空、置顶），
+/// 只对尾部非 system 消息减半；无 system 时同样只裁非 system 部分。
 fn halve_window(mut msgs: Vec<MemoryMsg>) -> Vec<MemoryMsg> {
     if msgs.len() <= 1 {
         return msgs;
     }
-    let keep = ((msgs.len() - 1) / 2).max(1);
-    let cut = msgs.len() - keep;
-    msgs.drain(1..cut);
-    let first_real = msgs.iter().enumerate().skip(1).find(|(_, m)| m.role != "tool").map(|(i, _)| i);
-    match first_real {
-        Some(i) if i > 1 => {
-            msgs.drain(1..i);
+    // 统一规范化：多 system 只留一条（取最后一条非空），恒置于首位。
+    let mut sys: Option<MemoryMsg> = None;
+    let mut rest: Vec<MemoryMsg> = Vec::with_capacity(msgs.len());
+    for m in msgs.drain(..) {
+        if m.role == "system" {
+            if m.content.as_deref().map(|c| !c.trim().is_empty()).unwrap_or(false) {
+                sys = Some(m);
+            }
+        } else {
+            rest.push(m);
         }
-        None => {
-            msgs.truncate(1); // 病态：尾半全是 tool 消息 → 只留 system 头
-        }
-        _ => {}
     }
-    msgs
+    // 只对非 system 的「尾半」保留。
+    let keep = (rest.len() / 2).max(1);
+    let mut kept: Vec<MemoryMsg> = rest.split_off(rest.len().saturating_sub(keep));
+    // 前缘孤儿 tool 消息：其配对的 assistant 已被裁掉 → 丢弃。
+    let head = if sys.is_some() { 1 } else { 0 };
+    let mut out: Vec<MemoryMsg> = Vec::with_capacity(kept.len() + 1);
+    if let Some(s) = sys {
+        out.push(s);
+    }
+    out.append(&mut kept);
+    if let Some(first_real) = out.iter().enumerate().skip(head).find(|(_, m)| m.role != "tool").map(|(i, _)| i) {
+        if first_real > head {
+            out.drain(head..first_real);
+        }
+    } else if out.len() > head {
+        out.truncate(head); // 病态：尾半全是 tool 消息 → 只留 system 头（或无 system 则清空）
+    }
+    out
 }
 
 /// tool 消息内容按 `limit` 再截断（减半闸第二级；limit=0 即 tool_result_limit 禁用，不截）。
@@ -209,6 +226,51 @@ mod tests {
         let out = halve_window(vec![m("system", "SYS"), m("user", "u1"), m("tool", "t1")]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].role, "system");
+    }
+
+    /// P2：system 不在首位时 halve_window 也必须识别并保留唯一 system（不假定 msgs[0]）。
+    #[test]
+    fn halve_window_handles_system_not_at_head() {
+        let m = |role: &str, c: &str| MemoryMsg {
+            role: role.into(),
+            content: Some(c.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+        };
+        // head 是 user，system 在中段
+        let out = halve_window(vec![
+            m("user", "lead"),
+            m("assistant", "a0"),
+            m("system", "SYS"),
+            m("user", "u1"),
+            m("assistant", "a1"),
+            m("user", "u2"),
+        ]);
+        assert_eq!(out.first().map(|x| x.role.as_str()), Some("system"));
+        assert_eq!(out[0].content.as_deref(), Some("SYS"));
+        assert_eq!(out.iter().filter(|x| x.role == "system").count(), 1);
+    }
+
+    /// P2：多个 system 时 halve_window 只留一个（取最后一条非空）。
+    #[test]
+    fn halve_window_keeps_single_system() {
+        let m = |role: &str, c: &str| MemoryMsg {
+            role: role.into(),
+            content: Some(c.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+        };
+        let out = halve_window(vec![
+            m("system", "OLD"),
+            m("user", "u1"),
+            m("system", "NEW"),
+            m("user", "u2"),
+            m("assistant", "a2"),
+        ]);
+        assert_eq!(out.iter().filter(|x| x.role == "system").count(), 1);
+        assert_eq!(out[0].content.as_deref(), Some("NEW"));
     }
 
     // L7 回归用例已随 context_window_tokens 收编迁至 config.rs（E3）

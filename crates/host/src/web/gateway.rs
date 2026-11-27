@@ -31,6 +31,13 @@ pub(super) async fn sse_events(mut stream: TcpStream, kernel: std::sync::Arc<Ker
     // R11 子代理旁路：连接建立时刻（门闩基准）+ 逐子文件偏移表（每个子会话一个旁路文件）。
     let connected_at = std::time::SystemTime::now();
     let mut sub_offs: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // 主旁路文件门闩（首次读取时判定）：mtime 早于连接的侧流属于上一回合的陈旧内容，
+    // 直接把偏移推到文件末尾（不重放），否则每次打开页面都会把旧答案的思考/正文当成
+    // 「正在生成」再播一遍。仍在进行的生成会持续写文件（mtime > connected_at），不受影响。
+    let mut stream_seeded = false;
+    // trace.read 错误去重：同一错误在冷却窗口内只推一次——否则每次轮询（300ms）都写一帧
+    // 错误，前端会不断追加错误横幅，看起来像页面在不停刷新。
+    let mut last_err: Option<(String, tokio::time::Instant)> = None;
     loop {
         // 增量拉取
         let resp = kernel
@@ -43,8 +50,14 @@ pub(super) async fn sse_events(mut stream: TcpStream, kernel: std::sync::Arc<Ker
         match resp {
             Ok(v) if v.get("ok") == Some(&json!(true)) => {
                 if let Some(events) = v.get("events").and_then(Value::as_array) {
-                    for e in events {
-                        let line = format!("data: {e}\n\n");
+                    for (i, e) in events.iter().enumerate() {
+                        // Q 轮：精确游标随帧下发（after + 本批序号），不改事件 type、
+                        // 不新增 SSE 帧类型——前端优先用 cursor，缺省退回自增近似。
+                        let mut framed = e.clone();
+                        if let Some(obj) = framed.as_object_mut() {
+                            obj.insert("cursor".into(), json!(after + i as u64 + 1));
+                        }
+                        let line = format!("data: {framed}\n\n");
                         write_half.write_all(line.as_bytes()).await?;
                         has_new = true;
                     }
@@ -55,20 +68,15 @@ pub(super) async fn sse_events(mut stream: TcpStream, kernel: std::sync::Arc<Ker
                 if empty {
                     replaying = false;
                 }
+                last_err = None;
             }
             Ok(v) => {
-                let line = format!(
-                    "event: error\ndata: {}\n\n",
-                    json!({"type": "error", "where": "trace.read", "message": v.to_string()})
-                );
-                write_half.write_all(line.as_bytes()).await?;
+                let msg = v.to_string();
+                write_error_frame(&mut write_half, "trace.read", &msg, &mut last_err).await?;
             }
             Err(e) => {
-                let line = format!(
-                    "event: error\ndata: {}\n\n",
-                    json!({"type": "error", "where": "trace.read", "message": e.to_string()})
-                );
-                write_half.write_all(line.as_bytes()).await?;
+                let msg = e.to_string();
+                write_error_frame(&mut write_half, "trace.read", &msg, &mut last_err).await?;
             }
         }
         // 流式旁路增量：读文件新增字节（按行；未写完的半行留给下一轮补齐）。
@@ -76,6 +84,16 @@ pub(super) async fn sse_events(mut stream: TcpStream, kernel: std::sync::Arc<Ker
         let mut streaming = false;
         if !replaying {
         if let Some(path) = &stream_path {
+            if !stream_seeded {
+                stream_seeded = true;
+                // 陈旧侧流（上一回合产物，mtime 早于本连接）不重放：偏移推到文件末尾。
+                let stale = std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .map_or(true, |mt| mt <= connected_at);
+                if stale {
+                    stream_off = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                }
+            }
             if let Ok(buf) = std::fs::read(path) {
                 let len = buf.len() as u64;
                 if len < stream_off {
@@ -201,5 +219,33 @@ pub(super) async fn sse_events(mut stream: TcpStream, kernel: std::sync::Arc<Ker
             }
         }
     }
+    Ok(())
+}
+
+/// 推送 trace.read 业务错误帧。
+///
+/// 关键：不能命名为 `event: error`。SSE 规范下 EventSource 的 `onerror` 既接收连接错误，
+/// 也接收服务端名为 `error` 的事件——前端会把每条 trace.read 失败都当成断线，反复
+/// `connect()` 重建连接并清空 feed，页面表现为持续闪烁。因此这里只发普通 data 帧，
+/// 由前端按 `type=error` 渲染错误横幅。同一错误在冷却窗口内只推一次，避免 300ms 轮询刷屏。
+async fn write_error_frame(
+    write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
+    where_: &str,
+    message: &str,
+    last_err: &mut Option<(String, tokio::time::Instant)>,
+) -> std::io::Result<()> {
+    const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+    let key = format!("{where_}|{message}");
+    if let Some((prev, at)) = last_err.as_ref() {
+        if prev == &key && at.elapsed() < COOLDOWN {
+            return Ok(());
+        }
+    }
+    let line = format!(
+        "data: {}\n\n",
+        json!({"type": "error", "where": where_, "message": message})
+    );
+    write_half.write_all(line.as_bytes()).await?;
+    *last_err = Some((key, tokio::time::Instant::now()));
     Ok(())
 }

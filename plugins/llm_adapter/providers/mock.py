@@ -79,5 +79,6 @@ PROVIDER = {
     "chat": chat,
     "models": models,
     "embed": embed,
+    "capabilities": {"stream": True, "tools": True, "images": False, "embed": True, "models": True},
     "requires_env": [],
 }

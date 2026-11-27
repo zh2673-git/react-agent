@@ -44,8 +44,6 @@ pub struct ToolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred: Option<bool>,
 }
-
-/// R16 观测面声明（胸牌 schema）：声明工具结果中可被结构化观测的三类产物。
 /// 未知取值按未声明处理（向后兼容：新增枚举值不破坏旧编排层）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ToolObs {
@@ -133,9 +131,21 @@ pub struct ChatReq {
     /// 剩余 token 预算（T4）：input+output 累计口径。继承语义同上。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_left: Option<u64>,
+    /// P4b 任务根会话 id：整条委派链共享的累计花费账键。
+    ///
+    /// 顶层缺省（等价于「根 = 自身 session_id」）；子代理由父链透传同一根，于是父子所有
+    /// chat 的用量都累加到同一本账，`tokens_left` 的快照切分据此生效。缺省 None 向后
+    /// 兼容所有既有调用方（host / e2e 无需携带）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_root: Option<String>,
     /// R3 用户附件（可选）：host 已做形状/条数/体量校验，此处仅透传。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<Attachment>>,
+    /// Q6 续跑：true = 本条 user 消息此前已落库过（被插队打断后自动回头），
+    /// 不再 append memory / 重发 trace user 事件，直接基于现有工作集继续做完。
+    /// 缺省 false 向后兼容所有既有调用方。
+    #[serde(default)]
+    pub resume: bool,
     /// G 轮：回合寻址键（可选）。给了就复用该 turn（暂停后回复走这里），
     /// 没给就新开一条。缺省 None 向后兼容所有既有调用方。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,4 +197,8 @@ pub struct LlmChatResp {
     /// 该次 LLM 请求墙钟耗时（毫秒）。
     #[serde(default)]
     pub elapsed_ms: Option<u64>,
+    /// 该次请求**实际发出的 HTTP 尝试次数**（provider 内部重试已计入，如 429 退避）。
+    /// 缺省 None = provider 未上报（旧插件 / 未接入观测的 provider），与「1 次成功」区分。
+    #[serde(default)]
+    pub http_attempts: Option<u64>,
 }

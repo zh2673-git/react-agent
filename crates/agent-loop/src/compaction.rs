@@ -33,19 +33,42 @@ impl AgentLoopPlugin {
         history: Vec<MemoryMsg>,
         cfg: &AgentLoopConfig,
     ) -> Vec<MemoryMsg> {
+        self.maybe_compact_with_keep(src, session_id, history, cfg, cfg.compact_keep).await
+    }
+
+    /// 压缩（显式保留条数）。`keep_override` = 保留最近多少条；`None` 用配置缺省。
+    ///
+    /// 为什么要显式参数：chat 开头的压缩按 `COMPACT_KEEP`（默认 30）保留——那是
+    /// 「给用户回看的一段」；轮内压缩（P0-B）的目的是把**下一轮要发的上下文**
+    /// 压回有界，尾巴太大省不下多少（每条工具结果可达 8K 字符）。两种场景
+    /// 对「保留多少」的诉求不同，用同一入口 + 显式参数分开，不靠调用点猜。
+    pub(super) async fn maybe_compact_with_keep(
+        &self,
+        src: &Envelope,
+        session_id: &str,
+        history: Vec<MemoryMsg>,
+        cfg: &AgentLoopConfig,
+        keep_override: usize,
+    ) -> Vec<MemoryMsg> {
         let trigger = cfg.compact_trigger;
-        let keep = cfg.compact_keep.min(history.len());
+        let keep = keep_override.min(history.len());
         // 双闸（PLAN P7/R6）：条数闸 **或** token 闸任一命中即压缩——
         // 单条大结果在条数闸（40 条）之前就能撑爆 LLM 窗口。
         let count_gate = trigger > 0 && history.len() > trigger;
-        let budget = cfg.ctx_budget();
+        // token 闸用**工作集预算**（workset_budget）：云端 provider 的 token 闸此前
+        // 完全禁用（ctx_budget 只对本地窗口型 provider 生效），于是长会话里历史
+        // 每轮全量重发、成本 O(N²) 涨（实测单会话 371 轮累计 cache_read 47.3M，
+        // 而当日 77.1% 的 credits 来自 cache_read）。
+        // 压缩是**软动作**（摘要旧史，不中止），故用独立预算而非 ctx_budget——
+        // 后者驱动 tighten_for_context 的硬收紧（超了会减半窗口甚至报错中止）。
+        let budget = cfg.workset_budget();
         let token_gate = budget > 0 && context::estimate_messages(&history) > budget;
         if !count_gate && !token_gate {
             return history;
         }
         let split = history.len() - keep;
-        let (older, recent) = history.split_at(split);
-        let older = older.to_vec();
+        let (older, _recent) = history.split_at(split);
+
 
         // LLM 摘要旧史（不带工具）。R3：摘要输入剥离附件（图片 b64 对文本摘要模型
         // 无意义且易撑爆压缩调用；文件要点已可从 content 内嵌文本获得）。
@@ -69,6 +92,10 @@ necessity, not a fixed word cap. Output only the summary."
             content: m.content.clone(),
             tool_calls: m.tool_calls.clone(),
             tool_call_id: m.tool_call_id.clone(),
+            // R3：摘要输入剥离附件（图片 b64 对文本摘要模型无意义且易撑爆压缩调用；
+            // 文件要点已可从 content 内嵌文本获得）。
+            // P3 降开销：此逐条 owned 克隆是「摘要输入需要独立于 history 的 owned 消息」的
+            // 必要一份——上一处 `older.to_vec()` 的整段克隆已删，故总克隆量减半。
             attachments: None,
         }));
         sum_msgs.push(MemoryMsg {
@@ -113,8 +140,31 @@ necessity, not a fixed word cap. Output only the summary."
             Ok(v) if v.get("ok") == Some(&json!(true)) => {
                 tracing::info!(target: ID, "context compacted: {} older messages summarized, kept {keep}", older.len());
                 self.trace(src, session_id, json!({"type": "compaction", "summarized": older.len(), "kept": keep, "summary": summary})).await;
-                let mut compacted = vec![Self::compaction_marker(&summary)];
-                compacted.extend(recent.iter().cloned());
+                // P3 降开销：压缩已经成功（memory.summarize 持久化完成），下游只有成功路径——
+                // 此时 history 不再需要保留，可把 recent 段**按值消费**（into_iter），
+                // 省掉原先对 recent 的逐条 clone。recent 段 = 下标 >= boundary 的部分，
+                // boundary = history.len() - keep（keep 已 min 到 len）。
+                //
+                // P2：规范化 system（不假定在首位、只留一个、取最后一条非空）后置于压缩标记之前。
+                // 与 memory 插件 summarize 的合成消息同构（sys 前置 + 标记 + recent）；recent 里的
+                // 任何 system 一律剔除（只保留选定的唯一 sys）。空内容 system 视为无 system。
+                let boundary = history.len() - keep;
+                let sys_pos = history.iter().rposition(|m| {
+                    m.role == "system"
+                        && m.content.as_deref().map(|c| !c.trim().is_empty()).unwrap_or(false)
+                });
+                let mut compacted: Vec<MemoryMsg> = Vec::with_capacity(keep + 2);
+                if let Some(i) = sys_pos {
+                    compacted.push(history[i].clone());
+                }
+                compacted.push(Self::compaction_marker(&summary));
+                compacted.extend(
+                    history
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(i, m)| *i >= boundary && m.role != "system")
+                        .map(|(_, m)| m),
+                );
                 compacted
             }
             Ok(v) => {

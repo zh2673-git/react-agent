@@ -64,6 +64,8 @@ class LlmAdapterPlugin:
             return self._embed(payload)
         if op == "upstream.status":
             return self._upstream_status()
+        if op == "provider.capabilities":
+            return self._provider_capabilities(payload)
         if op != "chat":
             return _err(f"unknown op: {op}", code="K400")
         name = payload.get("provider") or os.environ.get("LLM_PROVIDER", "mock")
@@ -195,6 +197,18 @@ class LlmAdapterPlugin:
                 return {"ok": True, "up": up, "models": models, "quotas": quotas, "usage": usage}
         except Exception as exc:  # noqa: BLE001
             return {"ok": True, "up": False, "note": f"{type(exc).__name__}: {exc}"}
+
+    def _provider_capabilities(self, payload: dict) -> dict:
+        """返回某 provider 声明的能力表（capabilities，可选；缺失 = 空 dict = 未知）。
+
+        `provider` 缺省走 LLM_PROVIDER / mock。capabilities 是声明式元数据，供 UI 与
+        选路读；运行期分派仍看 chat / embed 是否可调用，与能力声明无关。
+        """
+        name = payload.get("provider") or os.environ.get("LLM_PROVIDER", "mock")
+        provider = resolve(name)
+        if provider is None:
+            return _err(f"unknown provider: {name}（可用: {', '.join(sorted_providers())}）", code="K400")
+        return {"ok": True, "provider": name, "capabilities": dict(provider.get("capabilities") or {})}
 
     def destroy(self) -> None:
         pass

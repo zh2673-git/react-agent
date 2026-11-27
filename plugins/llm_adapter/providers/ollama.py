@@ -313,4 +313,4 @@ def models(payload: dict) -> dict:
     return {"ok": True, "models": names, "models_meta": meta}
 
 
-PROVIDER = {"name": "ollama", "chat": chat, "models": models, "requires_env": []}
+PROVIDER = {"name": "ollama", "chat": chat, "models": models, "capabilities": {"stream": True, "tools": True, "images": True, "embed": False, "models": True, "num_ctx": True}, "requires_env": []}

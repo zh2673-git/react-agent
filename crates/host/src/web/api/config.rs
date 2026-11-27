@@ -386,12 +386,11 @@ pub(crate) async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[
     let tools = req.get("tools").filter(|v| v.is_object());
     let agent = req.get("agent").filter(|v| v.is_object());
     let media = req.get("media").filter(|v| v.is_object());
-    // external_channels：通用外部通道配置段（IM 网关等消费方使用），只落盘不热应用。
-    // 字段由消费方定义；host 只对已知基础类型做轻校验，避免无效持久化。
-    let external_channels = req.get("external_channels").filter(|v| v.is_object());
     // §八 MCP：仅持久通道（server 子进程生命周期归 tools 插件 init/destroy，无热通道）。
     // PUT 落盘 config.json mcp_servers，改后需重启 host 生效。
     let mcp_servers = req.get("mcp_servers").filter(|v| v.is_object());
+    // external_channels：通用外部通道配置段（IM 网关等消费方使用），只落盘不热应用。
+    let external_channels = req.get("external_channels").filter(|v| v.is_object());
     if llm.is_none() && tools.is_none() && agent.is_none() && mcp_servers.is_none() && media.is_none() && external_channels.is_none() {
         return json_resp(
             stream,
@@ -487,7 +486,7 @@ pub(crate) async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[
     }
     // external_channels merge：通用段只落盘；只接受已知基础类型字段，空串/null 不覆盖既有值，
     // 未知字段保持兼容（原样写入），由消费方自行解释。只回写不生效，消费方下次读取时生效。
-    if let Some(external) = external_channels.and_then(|e| e.as_object().cloned()) {
+    if let Some(external) = external_channels.as_ref().and_then(|e| e.as_object().cloned()) {
         for (section, spec) in external {
             let Some(spec_obj) = spec.as_object() else { continue; };
             let mut cur = cfg.get("external_channels")
@@ -562,6 +561,36 @@ pub(crate) async fn put_config(stream: &mut TcpStream, kernel: &Kernel, body: &[
             }
         }
         cfg["mcp_servers"] = cur;
+    }
+    // external_channels 段 merge（外部通道通用配置）：只接受已知键，类型严格校验，
+    // 任一非法 → 400 不落盘；空串/null = 不修改（与 media 同规则）。
+    const IM_BOOL_KEYS: &[&str] = &["enabled", "enable_dingtalk", "enable_qq"];
+    const IM_STR_KEYS: &[&str] = &["host_base", "dingtalk_client_id", "dingtalk_client_secret", "qq_appid", "qq_token", "allow_users", "allow_chats"];
+    const IM_NUM_KEYS: &[&str] = &["max_reply_chars", "chat_timeout_secs"];
+    if let Some(ec) = external_channels.and_then(|v| v.get("im")).filter(|v| v.is_object()) {
+        for (k, v) in ec.as_object().unwrap() {
+            if v.is_null() { continue; }
+            if IM_BOOL_KEYS.contains(&k.as_str()) && !v.is_boolean() {
+                return json_resp(stream, 400, bad_request(format!("external_channels.im.{k} 需为布尔"), Some("external_channels"))).await;
+            }
+            if IM_STR_KEYS.contains(&k.as_str()) && !v.is_string() {
+                return json_resp(stream, 400, bad_request(format!("external_channels.im.{k} 需为字符串"), Some("external_channels"))).await;
+            }
+            if IM_NUM_KEYS.contains(&k.as_str()) && !v.is_number() && v.as_str().map(|s| s.trim().parse::<f64>().is_ok()).unwrap_or(false) == false {
+                return json_resp(stream, 400, bad_request(format!("external_channels.im.{k} 需为数字"), Some("external_channels"))).await;
+            }
+        }
+        let mut cur = cfg.get("external_channels").cloned().unwrap_or_else(|| json!({}));
+        let mut im = cur.get("im").cloned().unwrap_or_else(|| json!({}));
+        let im_obj = im.as_object_mut().unwrap();
+        for (k, v) in ec.as_object().unwrap() {
+            let empty = v.as_str().map(str::is_empty).unwrap_or(false);
+            if !v.is_null() && !empty {
+                im_obj.insert(k.clone(), v.clone());
+            }
+        }
+        cur["im"] = im;
+        cfg["external_channels"] = cur;
     }
     match config::persist_config(&cfg) {
         Ok(()) => json_resp(

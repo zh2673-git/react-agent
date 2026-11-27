@@ -5,6 +5,10 @@
 let streamSid = null, streamCard = null, streamBody = null, streamStats = null;
 const streamBuf = { reasoning: "", text: "" };
 const doneSids = new Set(); // 已完成回合的 sid：最终 assistant 事件已渲染，后续同 sid 的重连 stream_* 帧一律忽略，避免尾部覆盖/重弹
+// X6：当前活动过程框的 MutationObserver 句柄。以前每个用户回合都 new 一个且从不
+// disconnect——旧 observer 连同它闭包里的整个 DOM 子树一起常驻，历史重放 38 个回合就
+// 攒下 38 个观察者，全部挂在 childList+subtree+characterData 上。
+let processBoxMo = null;
 
 function applyStats(node, usage, elapsedMs) {
   if (!node) return;
@@ -49,8 +53,43 @@ function resetStreamState() {
   processBox = processBody = processThink = null;
   roundCards = [];
   subBoxes.clear();
+  doneSids.clear();
 }
 
+// Q 轮：会话视图缓存的对称半边（P7 只落地了 reset）。只存纯数据，DOM 句柄引用
+// 一律丢弃——它们随 innerHTML 恢复而失效，重放/新事件由 ensureProcessBox 重建。
+function snapshotStreamState() {
+  return { reasoning: streamBuf.reasoning, text: streamBuf.text, roundCards: roundCards.length };
+}
+function restoreStreamState(s) {
+  streamBuf.reasoning = s.reasoning || "";
+  streamBuf.text = s.text || "";
+  streamSid = streamCard = streamBody = streamStats = null;
+  processBox = processBody = processThink = null;
+  roundCards = [];
+  subBoxes.clear();
+}
+
+// X6：过程框跟随的每帧合并器。原实现靠 MutationObserver 直接同步读 scrollHeight，
+// 历史重放时每个事件都触发一次 forced reflow（实测单次 0.42ms，×14811 事件 ≈ 6.3s，
+// 且全在主线程）。合并到每帧一次后语义不变（仍贴底、上滚仍暂停），只是同一帧内多次
+// 请求只执行一次。
+let processFollowQueued = false;
+let processPinned = true;
+function scheduleProcessFollow() {
+  if (processFollowQueued) return;
+  processFollowQueued = true;
+  requestAnimationFrame(() => {
+    processFollowQueued = false;
+    if (!processBody) return;
+    if (processPinned) processBody.scrollTop = processBody.scrollHeight;
+    scrollFeed();
+  });
+}
+// 思考文本增长（textContent 变更不产生 childList mutation，需要显式通知）。
+function noteProcessGrow() {
+  scheduleProcessFollow();
+}
 function ensureProcessBox() {
   if (processBox) return;
   processBox = el(`<details class="ev process" open><summary><span class="plabel">思考与工具</span><span class="chev">›</span></summary><div class="pbody"></div></details>`);
@@ -58,14 +97,26 @@ function ensureProcessBox() {
   // R11 内容自动滑动：内容追加/增长时贴底滚动显示最新（所有内容仍按序留存，可上滚回看）。
   // 用户上滚即暂停跟随，距底 <48px 视为回到底部自动恢复；MutationObserver 同时覆盖
   // 文本增长（characterData）与卡片追加（childList），一处挂接全量生效。
-  let pinned = true;
-  processBody.addEventListener("scroll", () => {
-    pinned = processBody.scrollHeight - processBody.scrollTop - processBody.clientHeight < 48;
+  processFollowQueued = false;
+  processPinned = true;
+  // 闭包必须抓**自己那个** body 元素：resetStreamState / restoreStreamState 会把模块级
+  // processBody 置 null（旧过程框随 innerHTML 一起被丢弃），而旧 body 在被清空的瞬间
+  // 还会因为 scrollTop 被 clamp 再派发一次 scroll —— 此时读模块级变量就是
+  // `null.scrollHeight`（线上实测：基线页面 6s 内必报，与是否打开设置抽屉无关）。
+  const ownBody = processBody;
+  ownBody.addEventListener("scroll", () => {
+    processPinned = ownBody.scrollHeight - ownBody.scrollTop - ownBody.clientHeight < 48;
   }, { passive: true });
-  new MutationObserver(() => {
-    if (pinned) processBody.scrollTop = processBody.scrollHeight;
-    scrollFeed(); // 框内内容增长时页面同步跟随：工具卡/思考段始终保持在视口内
-  }).observe(processBody, { childList: true, subtree: true, characterData: true });
+  // X6：改「按需触发 + 每帧合并」，语义不变（内容增长仍贴底、上滚仍暂停）。
+  // 原实现是 MutationObserver(childList+subtree+characterData) —— 历史重放时每个事件都会
+  // 产生 mutation record，回调里再同步读 scrollHeight（forced reflow），且每回合新建一个
+  // observer、旧的从不 disconnect（闭包抓着整棵 DOM 子树）。实测 CPU 采样 65.8s 里
+  // 63.5s 落在这个观察者上，页面看起来就是「转圈很久」。
+  // 现在：唯一句柄，新建过程框时先断开旧的；观察范围只留 childList（思考文本走
+  // noteProcessGrow 显式通知）；回调合并到每帧一次。
+  if (processBoxMo) { processBoxMo.disconnect(); processBoxMo = null; }
+  processBoxMo = new MutationObserver(() => scheduleProcessFollow());
+  processBoxMo.observe(processBody, { childList: true });
   feed.appendChild(processBox);
 }
 
@@ -155,6 +206,7 @@ function pushStream(ev) {
     streamBuf.reasoning += ev.text || "";
     processThink.textContent = streamBuf.reasoning;
     processBox.open = true; // 过程进行中保持展开
+    noteProcessGrow(); // X6：文本增长不产生 childList mutation，显式通知跟随
   } else {
     ensureAnswerCard();
     streamBuf.text += ev.text || "";
@@ -251,6 +303,7 @@ function renderAssistant(ev, ts) {
     if (ev.reasoning) {
       if (!processThink) processThink = newThinkBlock(); // 该轮零思考帧（网关攒帧/非流式）也要落块，否则思考被丢弃
       processThink.textContent = ev.reasoning; // 兜底：流式思考帧缺失时补全
+      noteProcessGrow(); // X6：同上
     }
     if (ev.sid) doneSids.add(ev.sid); // 标记已完成：后续同 sid 的重连 stream_* 帧忽略
     // 多轮中间卡收进过程框（中间轮文本不是最终答案）：去掉重答按钮、标注「中间轮」，

@@ -43,6 +43,49 @@ impl WebFrontend {
     }
 
     async fn run_inner(&self, kernel: Arc<Kernel>) -> anyhow::Result<()> {
+        // 自更新交接（SELF-UPDATE-1）：RSI_HANDOVER=1 = 新进程等待旧进程退出后再 bind。
+        // Windows 无 SO_REUSEPORT、运行中 exe 镜像被锁，等待-换绑（nginx USR2 的变体）是
+        // 唯一安全形态；亚秒级空窗由前端 SSE 断线 1s 防抖 + after 游标续传覆盖，浏览器无感。
+        if std::env::var("RSI_HANDOVER").map(|v| v == "1").unwrap_or(false) {
+            // 就绪 marker：能走到这里说明内核+插件装配已完成，写盘告知旧进程可以开始排水。
+            let marker = std::env::var("RSI_HANDOVER_MARKER").ok();
+            if let Some(m) = &marker {
+                let _ = std::fs::write(m, std::process::id().to_string());
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+            let mut wait = std::time::Duration::from_millis(200);
+            let listener = loop {
+                match TcpListener::bind(&self.addr).await {
+                    Ok(l) => break l,
+                    Err(e) if tokio::time::Instant::now() < deadline => {
+                        tracing::info!("self-update 等待旧进程释放 {}（{e}），{:?} 后重试", self.addr, wait);
+                        tokio::time::sleep(wait).await;
+                        wait = (wait * 2).min(std::time::Duration::from_secs(2));
+                    }
+                    Err(e) => {
+                        tracing::error!("self-update 交接失败：90s 内未拿到 {}（{e}）。请手动重启。", self.addr);
+                        return Err(e.into());
+                    }
+                }
+            };
+            // 接管成功 = commit point。清交接态：本次进程后续可再次触发自更新；marker 文件一并清理。
+            std::env::remove_var("RSI_HANDOVER");
+            std::env::remove_var("RSI_HANDOVER_MARKER");
+            if let Some(m) = marker {
+                let _ = std::fs::remove_file(&m);
+            }
+            tracing::info!("self-update 交接完成：已在 {} 接管（旧进程已退出）", self.addr);
+            return Self::serve_listener(listener, kernel).await;
+        }
+        // P1b 接力启动（自更新看门狗拉起）：完整环境继承自旧进程但无 RSI_HANDOVER 握手
+        // ——说明旧进程没有走完交接收尾，由看门狗兜底重拉。显式示警而非静默换血（否则
+        // 「这次启动为何没有交接日志」无法追溯）；清理标记后按正常启动继续，行为无差别。
+        if std::env::var("RSI_SELF_UPDATE_RELAUNCH").map(|v| v == "1").unwrap_or(false) {
+            std::env::remove_var("RSI_SELF_UPDATE_RELAUNCH");
+            tracing::warn!(
+                "RSI 启动示警：本进程由自更新接力看门狗拉起（上一次交接未正常收尾）。会话与配置经持久层延续；如状态异常请核对新进程日志。"
+            );
+        }
         let listener = TcpListener::bind(&self.addr).await?;
         Self::serve_listener(listener, kernel).await
     }
@@ -268,9 +311,67 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
             serve_static(&mut stream, r.trim_start_matches('/')).await
         }
         ("GET", "/api/events") => gateway::sse_events(stream, kernel, query).await,
+        // 任务看板 / 灵感看板（单会话形态：左侧顶栏是任务与灵感，不是会话列表）。
+        // GET 返回整块板 + 汇总；POST 只承接 UI 侧写（灵感增/改、补字段），任务写走 scripts/board.py。
+        ("GET", "/api/board") => api::get_board(&mut stream).await,
+        ("POST", "/api/board") => api::post_board(&mut stream, &body).await,
+        // D 轮：任务/灵感 ↔ 对话轮次反查（读 trace 的 refs 字段，只读、与 board.py link 同口径）。
+        ("GET", "/api/board/link") => api::get_board_link(&mut stream, query).await,
+        // F2：画像（`.rsi/profile.json`）——GET 全量读，POST 只支持删除。
+        // 「能看」解决「我记了什么看不见」，「只能删」守住「结论该由观察产生」。
+        ("GET", "/api/profile") => api::get_profile(&mut stream).await,
+        ("POST", "/api/profile") => api::post_profile(&mut stream, &body).await,
+        // T-13 / I-20261108-11：GitHub 登录态（读 gh 已有凭据，不暴露 token）。
+        // 刻意只做「读」：登录动作由用户在终端执行 gh auth login，
+        // host 拉那条阻塞式交互命令会挂到超时（历史实测 K502）。
+        ("GET", "/api/git/auth") => api::get_git_auth(&mut stream).await,
+        // I-20261108-07：内容分发平台配置（凭证单独落 config/publish.json）
+        ("GET", "/api/publish/config") => api::get_publish_config(&mut stream).await,
+        ("POST", "/api/publish/config") => api::post_publish_config(&mut stream, &body).await,
         ("GET", "/api/config") => api::get_config(&mut stream, &kernel).await,
         ("GET", "/api/models") => api::get_models(&mut stream, &kernel, query).await,
         ("GET", "/api/presets") => api::get_presets(&mut stream, &kernel).await,
+        // P2：Magpie 路由组管理（列表 / 选项 / 详情 / 新建 / 改 / 删 / 恢复）。
+        // 组状态只存在于 Magpie 自己的 providers.json，机器可读出口**只有 CLI**
+        // （`groups --json` / `group show --json` 都被忽略）——所以每个 handler 由 Host
+        // 用 `Command::args(...)` 调 CLI，前端只发 HTTP，不碰 shell。
+        // 顺序要紧：`/api/routegroups/options` 必须排在泛化的 `/api/routegroups/<id>`
+        // **之前**——Rust 的 match 首个命中即生效，反过来 `options` 会被当成组 id 去读。
+        ("GET", "/api/routegroups") => api::routegroups_list(&mut stream).await,
+        ("GET", "/api/routegroups/options") => api::routegroups_options(&mut stream, &kernel).await,
+        ("POST", "/api/routegroups") => api::routegroups_create(&mut stream, &body, &kernel).await,
+        // 恢复（把被移除的 Magpie 内置 found 组放回来）：必须排在泛化 POST 之前单独判尾缀。
+        ("POST", r) if r.starts_with("/api/routegroups/") && r.ends_with("/restore") => {
+            api::routegroups_restore(&mut stream, r.trim_start_matches("/api/routegroups/")).await
+        }
+        ("PUT", r) if r.starts_with("/api/routegroups/") => {
+            api::routegroups_set(&mut stream, r.trim_start_matches("/api/routegroups/"), &body, &kernel).await
+        }
+        ("DELETE", r) if r.starts_with("/api/routegroups/") => {
+            api::routegroups_rm(&mut stream, r.trim_start_matches("/api/routegroups/")).await
+        }
+        ("GET", r) if r.starts_with("/api/routegroups/") => {
+            api::routegroups_show(&mut stream, r.trim_start_matches("/api/routegroups/")).await
+        }
+        // 上游本地网关（magpie）：状态（探活+积分）/ 一键启动 serve
+        ("GET", "/api/upstream/status") => api::upstream_status(&mut stream, &kernel).await,
+        ("POST", "/api/upstream/start") => api::upstream_start(&mut stream).await,
+        // 登录渠道清单（P3 动态化）：装了什么插件就有什么按钮，前端不再写死渠道表。
+        ("GET", "/api/upstream/providers") => api::upstream_providers(&mut stream).await,
+        // 账号签到扩展：弹登录窗（CLI 子进程，长阻塞由每连接 tokio::spawn 吸收）/ 全量签到 / 账号清单
+        ("POST", "/api/upstream/login") => api::upstream_login(&mut stream, &query).await,
+        ("POST", "/api/upstream/checkin") => api::upstream_checkin(&mut stream).await,
+        ("GET", "/api/upstream/accounts") => api::upstream_accounts(&mut stream).await,
+        // 自更新（SELF-UPDATE-2）：GET 查进度/版本，POST 触发交接换血。交接等待中的新进程
+        // 拒绝再次自更新（409）——递归交接只会叠加等待链，没有意义。
+        ("GET", "/api/self/update") => api::self_update_status(&mut stream).await,
+        ("POST", "/api/self/update") => {
+            if std::env::var("RSI_HANDOVER").map(|v| v == "1").unwrap_or(false) {
+                json_resp(&mut stream, 409, json!({"ok": false, "error": {"code": "K409", "message": "本进程处于自更新交接等待中，拒绝再次自更新"}})).await
+            } else {
+                api::self_update_start(&mut stream).await
+            }
+        }
         ("PUT", "/api/config") => api::put_config(&mut stream, &kernel, &body).await,
         ("GET", "/api/skills") => api::get_skills(&mut stream, &kernel).await,
         ("GET", r) if r.starts_with("/api/skills/") => {
@@ -293,8 +394,67 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
         ("GET", "/api/tree") => files::list_workspace_tree(&mut stream, query).await,
         ("GET", "/api/fc-snapshot") => files::serve_undo_snapshot(&mut stream, query).await,
         ("GET", "/api/session-exists") => api::session_exists(&mut stream, query).await,
+        // IM 会话元数据（网关写 <repo>/im-gateway/data/im-sessions.json）；只读，缺失即空。
+        ("GET", "/api/im/sessions") => api::im_sessions(&mut stream).await,
         ("GET", r) if r.starts_with("/files/") => {
             files::serve_workspace_file(&mut stream, r.trim_start_matches("/files/"), query).await
+        }
+        // Q 轮 Phase 3：真实运行态 / 显式队列（纯追加端点；旧 /api/chat 的 400/404
+        // 与 K409 裸并发裁决逐字不变）。status 由 agent-loop 的 session_chats + 队列
+        // 状态派生，多标签页不再靠「自己那次 fetch 没结束」猜。
+        ("GET", "/api/chat/status") => {
+            let session = parse_query(query).get("session").cloned().unwrap_or_default();
+            if session.is_empty() {
+                return json_resp(&mut stream, 400, bad_request("缺 session 参数", Some("session"))).await;
+            }
+            let resp = kernel
+                .dispatch(Envelope::new(PluginId::new("agent-loop"), json!({"op": "queue/status", "session_id": session})))
+                .await
+                .unwrap_or_else(|e| json!({"ok": false, "error": {"code": "K500", "message": e.to_string()}}));
+            let st = resp.get("status").cloned().unwrap_or_else(|| json!({"ok": false}));
+            json_resp(&mut stream, 200, st).await
+        }
+        ("POST", "/api/queue") => {
+            let req: Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return json_resp(&mut stream, 400, json!({"ok": false, "error": {"code": "K400", "message": format!("body 非法 JSON: {e}")}})).await;
+                }
+            };
+            let Some(session) = req.get("session_id").and_then(Value::as_str) else {
+                return json_resp(&mut stream, 400, bad_request("缺 session_id", Some("session_id"))).await;
+            };
+            let Some(text) = req.get("message").and_then(Value::as_str) else {
+                return json_resp(&mut stream, 400, bad_request("缺 message", Some("message"))).await;
+            };
+            let mut payload = json!({"op": "queue/enqueue", "session_id": session, "user_text": text,
+                "target": req.get("target").and_then(Value::as_str).unwrap_or("followup")});
+            if let Some(att) = req.get("attachments") {
+                match api::validate_attachments(att) {
+                    Ok(Some(list)) => { payload["attachments"] = list; }
+                    Ok(None) => {}
+                    Err(e) => return json_resp(&mut stream, 400, e).await,
+                }
+            }
+            let resp = kernel
+                .dispatch(Envelope::new(PluginId::new("agent-loop"), payload))
+                .await
+                .unwrap_or_else(|e| json!({"ok": false, "error": {"code": "K500", "message": e.to_string()}}));
+            json_resp(&mut stream, 200, resp).await
+        }
+        ("POST", "/api/queue/remove") => {
+            let req: Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return json_resp(&mut stream, 400, json!({"ok": false, "error": {"code": "K400", "message": format!("body 非法 JSON: {e}")}})).await;
+                }
+            };
+            let payload = json!({"op": "queue/remove", "session_id": req.get("session_id").and_then(Value::as_str).unwrap_or(""), "id": req.get("id").and_then(Value::as_str).unwrap_or("")});
+            let resp = kernel
+                .dispatch(Envelope::new(PluginId::new("agent-loop"), payload))
+                .await
+                .unwrap_or_else(|e| json!({"ok": false, "error": {"code": "K500", "message": e.to_string()}}));
+            json_resp(&mut stream, 200, resp).await
         }
         ("POST", "/api/chat/cancel") => {
             // P2/T1：取消运行中的 chat。转发 agent-loop `cancel` op（置位取消标志，
@@ -411,6 +571,13 @@ async fn handle_conn(mut stream: TcpStream, kernel: Arc<Kernel>) -> anyhow::Resu
             // R3 附件（可选）：[{name, mime, data_b64}]——校验形状与体量上限后透传
             // agent-loop（构造多模态 user 消息）。非法/超限 = 确定性 K400，不静默丢弃。
             let mut chat_payload = json!({"op": "chat", "session_id": session, "user_text": message});
+            // Q6：续跑（被插队打断后自动回头）不重复落库/重放 user 消息——被打断那轮
+            // 已在 chat_run 开头 append 过 user 消息并发出 trace user 事件，重发会造成
+            // memory 多一条 user、前端多一个气泡。resume=true 让 chat_run 跳过这两步，
+            // 直接用已有工作集继续（见 chat.rs resume 分支）。
+            if req.get("resume").and_then(Value::as_bool) == Some(true) {
+                chat_payload["resume"] = json!(true);
+            }
             if let Some(att) = req.get("attachments") {
                 match api::validate_attachments(att) {
                     Ok(Some(list)) => {
