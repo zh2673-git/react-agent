@@ -692,6 +692,12 @@ class ToolsPlugin:
             )
         args = args_any
         _PARAMS_ADJUSTED.clear()  # O1：每调用一窗口——上一调用的 clamp 记录不外溢（grep 读取的必是本调用）
+        # P1 Worker isolation：子代理会话（session_id 含 "#sub-"）本调用的落盘锚到独立工作目录。
+        try:
+            from tools import set_worker_root
+            worker_token = set_worker_root(payload.get("session_id"))
+        except Exception:
+            worker_token = None
         try:
             if not isinstance(args, dict):
                 return _err(f"args 必须是对象，收到: {type(args).__name__}", code="BAD_ARGS", field="args")
@@ -700,6 +706,10 @@ class ToolsPlugin:
             return _err(str(exc), code=exc.code, field=exc.field)
         except Exception as exc:  # noqa: BLE001 - 工具失败回喂 LLM，不中断循环
             return _err(f"{type(exc).__name__}: {exc}")
+        finally:
+            if worker_token is not None:
+                from tools import _WORKER_ROOT
+                _WORKER_ROOT.reset(worker_token)
 
     def destroy(self) -> None:
         # §八：MCP server 随插件退出**逆序**回收

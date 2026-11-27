@@ -204,6 +204,17 @@ list_dir to list; use bash only when a real shell is required (tests, git, build
 (c) CONVERGE, do not thrash: if two attempts at the same goal yield no new information, change strategy \
 instead of repeating the call with cosmetic variations.";
 
+/// 子会话镜像表（sub -> parent）里 parent==sid 的全部子会话 id，排序保证确定性。
+fn collect_children(mirrors: &std::collections::HashMap<String, String>, parent: &str) -> Vec<String> {
+    let mut v: Vec<String> = mirrors
+        .iter()
+        .filter(|(_, p)| p.as_str() == parent)
+        .map(|(c, _)| c.clone())
+        .collect();
+    v.sort();
+    v
+}
+
 pub struct AgentLoopPlugin {
     max_rounds: usize,
     /// RSI 策略钩子（默认关闭；见 `LoopPolicy`）。
@@ -250,6 +261,18 @@ pub struct AgentLoopPlugin {
 }
 
 impl AgentLoopPlugin {
+    /// P1 Cancel propagation：置位取消标志，并联动其在办子会话（mirrors 表里
+    /// parent==sid 的子会话；子会话阻塞在父的工具波次里，父只在轮次边界轮询自己的
+    /// 标志，不联动就要等子会话跑完）。返回被联动的子会话 id，供 tools abort 逐个投递。
+    fn cancel_marks_children(&self, sid: &str) -> Vec<String> {
+        self.cancels.lock().unwrap().insert(sid.to_string());
+        let children = collect_children(&self.mirrors.lock().unwrap(), sid);
+        for c in &children {
+            self.cancels.lock().unwrap().insert(c.clone());
+        }
+        children
+    }
+
     /// P4b 记账：写入某条调用链在本任务内的累计花费。
     ///
     /// 语义是**绝对值覆盖**（调用方传该链的 `usage.total()`，不是增量）：同一
@@ -444,31 +467,39 @@ impl Plugin for AgentLoopPlugin {
                 if sid.is_empty() {
                     Ok(json!({"ok": false, "error": {"code": "K400", "message": "cancel 需 session_id"}}))
                 } else {
-                    self.cancels.lock().unwrap().insert(sid.to_string());
-                    tracing::info!(target: ID, session = %sid, "cancel requested");
+                    let children = self.cancel_marks_children(sid);
+                    for c in &children {
+                        tracing::info!(target: ID, session = %c, parent = %sid, "cancel propagated to sub-session");
+                    }
+                    tracing::info!(target: ID, session = %sid, children = children.len(), "cancel requested");
                     // T7/T8（v0.1.7 消费）：联动 tools `abort` op——终止该会话运行中的
                     // 工具子进程，使"点停止"对工具执行段也生效。System 优先级走专用
                     // 泳道（T8），满载 chat 下不再排队；即发即忘 + 2s 上限；失败仅
                     // 记录——轮次边界取消仍兜底。
                     if let Some(host) = self.host.get() {
-                        let host = host.clone();
-                        let payload = json!({"op": "abort", "session_id": sid});
-                        tokio::spawn(async move {
-                            if let Err(e) = host
-                                .call_capability_as(
-                                    CAP_TOOLS,
-                                    TraceId::new(),
-                                    Priority::System,
-                                    payload,
-                                    std::time::Duration::from_secs(2),
-                                )
-                                .await
-                            {
-                                tracing::debug!(target: ID, "tools abort dispatch failed: {e}");
-                            }
-                        });
+                        // 父会话 + 每个被联动的子会话各投递一次（终止技能工具子进程）。
+                        let mut targets: Vec<String> = vec![sid.to_string()];
+                        targets.extend(children.iter().cloned());
+                        for target in targets {
+                            let host = host.clone();
+                            let payload = json!({"op": "abort", "session_id": target});
+                            tokio::spawn(async move {
+                                if let Err(e) = host
+                                    .call_capability_as(
+                                        CAP_TOOLS,
+                                        TraceId::new(),
+                                        Priority::System,
+                                        payload,
+                                        std::time::Duration::from_secs(2),
+                                    )
+                                    .await
+                                {
+                                    tracing::debug!(target: ID, "tools abort dispatch failed: {e}");
+                                }
+                            });
+                        }
                     }
-                    Ok(json!({"ok": true, "session_id": sid, "note": "取消信号已置位；当前轮完成后中断"}))
+                    Ok(json!({"ok": true, "session_id": sid, "cancelled_children": children, "note": "取消信号已置位；当前轮完成后中断"}))
                 }
             }
             // G 轮：回合补播。
@@ -542,6 +573,18 @@ mod tests {
     use super::*;
 
     use crate::ENV_LOCK; // v12：跨模块共用一把锁，见 crate 根注释
+
+    // P1：取消联动只命中本父会话的在办子会话，不波及兄弟父会话的子会话。
+    #[test]
+    fn cancel_propagation_collects_only_own_children() {
+        let mut mirrors = std::collections::HashMap::new();
+        mirrors.insert("P#sub-1".to_string(), "P".to_string());
+        mirrors.insert("P#sub-2".to_string(), "P".to_string());
+        mirrors.insert("Q#sub-3".to_string(), "Q".to_string());
+        assert_eq!(collect_children(&mirrors, "P"), vec!["P#sub-1".to_string(), "P#sub-2".to_string()]);
+        assert_eq!(collect_children(&mirrors, "Q"), vec!["Q#sub-3".to_string()]);
+        assert!(collect_children(&mirrors, "Z").is_empty());
+    }
 
     // O3：env 互相污染防不住并发——三测合并串行跑（语义：缺省→覆盖→误配回退）
     #[test]

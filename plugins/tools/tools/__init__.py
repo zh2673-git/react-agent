@@ -5,7 +5,14 @@
 """
 
 import os
+import contextvars
 from pathlib import Path
+
+# P1 Worker isolation: per-call worker directory for sub-agent sessions
+# (session id contains "#sub-"). Bound by tools_plugin._call for the duration of
+# one built-in tool call; None for the main session. Reads stay rooted at
+# workspace_root(); only the shell cwd and the write guard consult worker_root().
+_WORKER_ROOT: contextvars.ContextVar[str | None] = contextvars.ContextVar("WORKER_ROOT", default=None)
 
 
 class ToolError(Exception):
@@ -19,6 +26,27 @@ class ToolError(Exception):
 
 def workspace_root() -> Path:
     return Path(os.environ.get("WORKSPACE_ROOT") or os.getcwd()).resolve()
+
+
+def worker_root() -> Path | None:
+    """Worker directory bound to the current tool call, or None (main session)."""
+    v = _WORKER_ROOT.get()
+    return Path(v).resolve() if v else None
+
+
+def set_worker_root(session_id: str | None) -> "contextvars.Token | None":
+    """Bind <WORKSPACE_ROOT>/.rsi/workers/<parent>/<sub> for the current call.
+
+    Inside the workspace on purpose: files.py's boundary check keeps working and
+    the sub-agent can still read the parent workspace (reads are not restricted).
+    """
+    if not session_id or "#sub-" not in session_id:
+        return None
+    parent, sub = session_id.split("#", 1)
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in parent)[-64:]
+    d = workspace_root() / ".rsi" / "workers" / safe / sub
+    d.mkdir(parents=True, exist_ok=True)
+    return _WORKER_ROOT.set(str(d))
 
 
 def require(args: dict, key: str) -> str:

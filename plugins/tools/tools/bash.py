@@ -31,7 +31,7 @@ import os
 import subprocess
 import uuid
 
-from . import ToolError, optional_int, require, workspace_root
+from . import ToolError, optional_int, require, worker_root, workspace_root
 from .files import _NOISE_DIRS, _UNDO_MAX_BYTES, _snapshot_change
 
 _MAX_TIMEOUT_MS = 60_000
@@ -62,7 +62,8 @@ def _shell_cwd() -> str:
     故在执行点归一：剥前缀、分隔符统一，再校验可用性；不可用即报错，
     **绝不回落到系统目录**（工具声明的 cwd=WORKSPACE_ROOT 是硬契约）。
     """
-    ws = str(workspace_root())
+    worker = worker_root()
+    ws = str(worker) if worker else str(workspace_root())
     if ws.startswith("\\\\?\\UNC\\"):  # UNC 的扩展形态 → 普通 UNC
         ws = "\\\\" + ws[len("\\\\?\\UNC\\"):]
     elif ws.startswith("\\\\?\\"):

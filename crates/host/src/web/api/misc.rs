@@ -584,12 +584,24 @@ fn self_build_time() -> Option<std::time::SystemTime> {
     std::fs::metadata(exe).and_then(|m| m.modified()).ok()
 }
 
+/// 运行时 Cargo 工程根——布局自适应：rsi-agent 内嵌在 `<repo>/runtime/`，react-agent
+/// 就是 `<repo>`。自更新三处路径（源码 mtime / 隔离构建目录 / cargo cwd）统一经此，
+/// 两仓同一份代码。判据用 `Cargo.toml` 而非目录存在：前者说明「这是工程根」。
+fn runtime_root(repo: &std::path::Path) -> std::path::PathBuf {
+    let embedded = repo.join("runtime");
+    if embedded.join("Cargo.toml").is_file() {
+        embedded
+    } else {
+        repo.to_path_buf()
+    }
+}
+
 /// GET /api/self/update：版本指纹 + 交接状态（供前端/调用方判断是否需要换血）。
 pub(crate) async fn self_update_status(stream: &mut TcpStream) -> anyhow::Result<()> {
     let handover = std::env::var("RSI_HANDOVER").map(|v| v == "1").unwrap_or(false);
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     let repo = std::path::PathBuf::from(crate::config::workspace_root());
-    let src_mtime = std::fs::metadata(repo.join("runtime/crates/host/src"))
+    let src_mtime = std::fs::metadata(runtime_root(&repo).join("crates/host/src"))
         .and_then(|m| m.modified())
         .ok()
         .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
@@ -630,11 +642,12 @@ pub(crate) async fn self_update_start(stream: &mut TcpStream) -> anyhow::Result<
     tokio::spawn(async move {
         // 1. 隔离构建：CARGO_TARGET_DIR 指 target-selfupdate，产物与运行中 exe 不同路径，
         //    避开 Windows 运行中镜像锁；同时防止动到开发中 target 目录的构建锁。
-        let out = repo.join("runtime/target-selfupdate");
+        let rt = runtime_root(&repo);
+        let out = rt.join("target-selfupdate");
         stamp("step1 隔离构建开始（cargo build --release，首次可能数分钟）");
         let build = tokio::process::Command::new("cargo")
             .args(["build", "--release", "-p", "react-agent-host"])
-            .current_dir(repo.join("runtime"))
+            .current_dir(&rt)
             .env("CARGO_TARGET_DIR", &out)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())

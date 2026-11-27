@@ -26,7 +26,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import ToolError, optional_int, require, workspace_root
+from . import ToolError, optional_int, require, worker_root, workspace_root
 
 _MAX_READ_BYTES = 256 * 1024
 _MAX_LINE_CHARS = 2000
@@ -124,9 +124,26 @@ def _is_core_path(real: Path) -> bool:
     return False
 
 
+def _is_outside_worker(real: Path) -> bool:
+    """P1 Worker isolation: a sub-agent may only write inside its worker
+    directory (worker_root()); reads are not restricted."""
+    worker = worker_root()
+    if not worker:
+        return False
+    a, b = os.path.normcase(str(real)), os.path.normcase(str(worker))
+    return not (a == b or a.startswith(b + os.path.sep))
+
+
 def _guard_write(real: Path, path_str: str) -> Path:
     """写入闸（write_file/edit_file 专用）：核心黑名单默认拒绝；env ALLOW_CORE_WRITE 为
     逗号分隔前缀列表时，命中前缀且不在永不豁免项内的路径放行（v7 细粒度授权）。"""
+    if _is_outside_worker(real):
+        raise ToolError(
+            f"子代理只能写自己的工作目录（{worker_root()}），拒绝写入: {_display(real)}。"
+            "把产物写进自己的工作目录并在结论里给出相对路径；需要改父工作区请交回主会话。",
+            code="WORKER_SCOPE",
+            field="path",
+        )
     if _is_core_path(real) and not _core_write_allowed(real):
         rel = _display(real).replace("\\", "/").lower()
         hit = next((p for p in _core_write_prefixes() if rel == p or rel.startswith(p + "/")), None)
